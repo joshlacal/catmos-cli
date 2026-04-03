@@ -6,7 +6,7 @@ resolver = "2"
 catmos-core = { path = "catmos-core" }
 catmos-tui = { path = "catmos-tui" }
 catbird-mls = { path = "../catbird-mls", package = "catbird_mls" }
-catbird-atproto = { path = "../catbird-atproto" }
+catbird-atproto = { path = "../catbird-atproto", features = ["streaming"] }
 jacquard = "0.9"
 jacquard-common = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
