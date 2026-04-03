@@ -1,0 +1,150 @@
+use std::sync::Arc;
+
+use axum::extract::{Query, State};
+use axum::response::Html;
+use axum::routing::get;
+use axum::Router;
+use tokio::sync::oneshot;
+
+use crate::error::{CatmosError, Result};
+use crate::storage::db::Database;
+
+/// Authentication via OAuth loopback flow through the nest BFF.
+pub struct OAuthAuth {
+    pub session_cookie: String,
+    pub did: String,
+    pub nest_url: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CallbackParams {
+    session: Option<String>,
+    did: Option<String>,
+}
+
+struct CallbackState {
+    tx: std::sync::Mutex<Option<oneshot::Sender<(String, String)>>>,
+}
+
+impl OAuthAuth {
+    /// Start an OAuth loopback login flow.
+    ///
+    /// 1. Bind a local TCP listener on a random port
+    /// 2. Open the browser to the nest auth URL with a redirect back to localhost
+    /// 3. Wait up to 2 minutes for the callback with session + DID
+    pub async fn login(handle: &str, nest_url: &str) -> Result<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| CatmosError::Network(format!("failed to bind loopback listener: {e}")))?;
+
+        let port = listener
+            .local_addr()
+            .map_err(|e| CatmosError::Network(e.to_string()))?
+            .port();
+
+        let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+        let auth_url = format!(
+            "{nest_url}/auth/login?handle={handle}&redirect_uri={redirect_uri}&client=catmos"
+        );
+
+        // Channel for the callback result
+        let (tx, rx) = oneshot::channel::<(String, String)>();
+        let state = Arc::new(CallbackState {
+            tx: std::sync::Mutex::new(Some(tx)),
+        });
+
+        let app = Router::new()
+            .route("/callback", get(handle_callback))
+            .with_state(state);
+
+        // Open the browser
+        tracing::info!("Opening browser for authentication...");
+        if let Err(e) = open::that(&auth_url) {
+            tracing::warn!("Failed to open browser: {e}");
+            eprintln!("Open this URL in your browser to log in:\n  {auth_url}");
+        }
+
+        // Serve the callback endpoint
+        let server = axum::serve(listener, app);
+        let timeout = tokio::time::Duration::from_secs(120);
+
+        // Race the server against a 2-minute timeout
+        let result = tokio::select! {
+            result = rx => {
+                result.map_err(|_| CatmosError::AuthFailed("callback channel closed".into()))
+            }
+            _ = async {
+                // Run server until the callback fires or timeout
+                let _ = server.await;
+            } => {
+                Err(CatmosError::AuthFailed("server exited unexpectedly".into()))
+            }
+            _ = tokio::time::sleep(timeout) => {
+                Err(CatmosError::AuthFailed("login timed out after 2 minutes".into()))
+            }
+        }?;
+
+        let (session_cookie, did) = result;
+
+        Ok(Self {
+            session_cookie,
+            did,
+            nest_url: nest_url.to_string(),
+        })
+    }
+
+    /// Persist OAuth session to the session store.
+    pub fn save(&self, db: &Database) -> Result<()> {
+        db.store_session_value("auth_method", "oauth")?;
+        db.store_session_value("session_cookie", &self.session_cookie)?;
+        db.store_session_value("did", &self.did)?;
+        db.store_session_value("nest_url", &self.nest_url)?;
+        Ok(())
+    }
+
+    /// Load previously-saved OAuth auth from the session store.
+    pub fn load(db: &Database) -> Result<Option<Self>> {
+        let method = db.get_session_value("auth_method")?;
+        if method.as_deref() != Some("oauth") {
+            return Ok(None);
+        }
+
+        let session_cookie = db.get_session_value("session_cookie")?;
+        let did = db.get_session_value("did")?;
+        let nest_url = db.get_session_value("nest_url")?;
+
+        match (session_cookie, did, nest_url) {
+            (Some(session_cookie), Some(did), Some(nest_url)) => Ok(Some(Self {
+                session_cookie,
+                did,
+                nest_url,
+            })),
+            _ => Ok(None),
+        }
+    }
+}
+
+async fn handle_callback(
+    State(state): State<Arc<CallbackState>>,
+    Query(params): Query<CallbackParams>,
+) -> Html<String> {
+    let (session, did) = match (params.session, params.did) {
+        (Some(s), Some(d)) => (s, d),
+        _ => {
+            return Html(
+                "<html><body><h1>Login failed</h1><p>Missing session or DID parameter.</p></body></html>"
+                    .to_string(),
+            );
+        }
+    };
+
+    // Send result through the channel
+    if let Some(tx) = state.tx.lock().unwrap().take() {
+        let _ = tx.send((session, did));
+    }
+
+    Html(
+        "<html><body><h1>Login successful!</h1><p>You can close this tab and return to the terminal.</p></body></html>"
+            .to_string(),
+    )
+}
