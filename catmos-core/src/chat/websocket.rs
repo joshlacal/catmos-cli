@@ -63,10 +63,15 @@ pub enum WsEvent {
 
 // ── Server-side event types ─────────────────────────────────────────────
 
+/// Thin owned wrapper for the getSubscriptionTicket response.
+/// The generated `GetSubscriptionTicketOutput` uses lifetime parameters and
+/// `CowStr<'a>`, so it cannot be used with `DeserializeOwned`-based flows.
+/// We keep this minimal owned version matching the generated field names.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SubscriptionTicketResponse {
     ticket: String,
+    endpoint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -120,20 +125,27 @@ impl ChatService {
     pub async fn subscribe(&self) -> Result<mpsc::UnboundedReceiver<WsEvent>> {
         // 1. Get a subscription ticket
         let ticket_resp: SubscriptionTicketResponse = self
-            .xrpc_query("blue.catbird.mlsChat.getSubscriptionTicket", &[])
+            .xrpc_procedure("blue.catbird.mlsChat.getSubscriptionTicket", &serde_json::json!({}))
             .await?;
         let ticket = ticket_resp.ticket;
 
-        // 2. Build WebSocket URL
-        let ws_base = self
-            .config
-            .server
-            .mls_url
-            .replace("https://", "wss://")
-            .replace("http://", "ws://");
-        let ws_url = format!(
-            "{ws_base}/xrpc/blue.catbird.mlsChat.subscribe?ticket={ticket}"
-        );
+        // 2. Build WebSocket URL from the endpoint returned by the server
+        let endpoint = ticket_resp.endpoint.unwrap_or_else(|| {
+            let base = self.config.server.mls_url.clone();
+            format!("{base}/xrpc/blue.catbird.mlsChat.subscribeEvents?ticket={ticket}")
+        });
+
+        // Ensure WSS protocol and ticket is in the URL
+        let ws_url = if endpoint.contains("ticket=") {
+            endpoint
+                .replace("https://", "wss://")
+                .replace("http://", "ws://")
+        } else {
+            let sep = if endpoint.contains('?') { "&" } else { "?" };
+            format!("{}{sep}ticket={ticket}", endpoint
+                .replace("https://", "wss://")
+                .replace("http://", "ws://"))
+        };
 
         debug!("Connecting WebSocket to {ws_url}");
 

@@ -44,22 +44,40 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let my_did = app.service.did();
     let height = area.height as usize;
 
-    // Build lines from messages
+    // Build lines from messages, filtering out decryption failures
     let mut lines: Vec<Line> = Vec::new();
+    let mut shown_join_marker = false;
 
     for msg in &app.messages {
+        // Skip decryption failures (pre-join messages we can't read)
+        match &msg.content {
+            MessageContent::System(text) if text.contains("Decryption failed") => {
+                if !shown_join_marker {
+                    shown_join_marker = true;
+                    // We'll add the join marker after skipping all old messages
+                }
+                continue;
+            }
+            MessageContent::Unknown => continue,
+            _ => {}
+        }
+
+        // Insert "joined" marker before first readable message
+        if shown_join_marker {
+            shown_join_marker = false; // only show once
+            lines.push(Line::from(Span::styled(
+                "  ── You joined this conversation ──",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
         let timestamp = msg.created_at.format("%H:%M").to_string();
         let sender = msg.sender_did.as_deref().unwrap_or("unknown");
 
         let sender_display = if sender == my_did {
             "you".to_string()
         } else {
-            // Show last segment of DID or truncated
-            sender
-                .rsplit(':')
-                .next()
-                .unwrap_or(sender)
-                .to_string()
+            app.display_name(sender)
         };
 
         let color = if sender == my_did {
@@ -71,8 +89,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         let content_text = match &msg.content {
             MessageContent::Text(text) => text.clone(),
             MessageContent::Reaction { emoji, .. } => format!("[reaction: {emoji}]"),
-            MessageContent::System(text) => format!("[system: {text}]"),
-            MessageContent::Unknown => "[unknown message]".to_string(),
+            MessageContent::System(text) => text.clone(),
+            _ => continue,
         };
 
         let line = Line::from(vec![
@@ -85,6 +103,14 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         ]);
 
         lines.push(line);
+    }
+
+    // If all messages were undecryptable, still show the join marker
+    if shown_join_marker {
+        lines.push(Line::from(Span::styled(
+            "  ── You joined this conversation ──",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     // Apply scroll offset: show lines ending at (len - scroll_offset)

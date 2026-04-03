@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 use tracing::{error, info};
 
 use catmos_core::auth::app_password::AppPasswordAuth;
+use catmos_core::auth::oauth::OAuthAuth;
 use catmos_core::auth::AuthMethod;
 use catmos_core::chat::service::ChatService;
 use catmos_core::mls::context::MlsManager;
@@ -33,28 +34,41 @@ pub async fn run() -> anyhow::Result<()> {
     // ── 1. Load config ─────────────────────────────────────────────────
     let config = Config::load()?;
 
+    let did = config
+        .default_account
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("No account configured. Run `catmos login` first."))?
+        .to_string();
+
     // ── 2. Open DB and load auth ───────────────────────────────────────
-    let data_dir = Config::data_dir()?;
-    let db_path = data_dir.join("catmos.db");
+    let account_dir = Config::account_data_dir(&did)?;
+    let db_path = account_dir.join("catmos.db");
+    let db_key = catmos_core::mls::context::get_or_create_db_key(&did)?;
+    let db = Arc::new(Database::open(&db_path, &db_key).await?);
 
-    // Use unencrypted DB for session store (auth credentials)
-    let db = Arc::new(Database::open_unencrypted(&db_path).await?);
-
-    let auth_info = AppPasswordAuth::load(&db).await?
-        .ok_or_else(|| anyhow::anyhow!("Not authenticated. Run `catmos login` first."))?;
-
-    let did = auth_info.did.clone();
-
-    let auth = AuthMethod::AppPassword {
-        handle: auth_info.handle,
-        did: auth_info.did,
-        access_jwt: auth_info.access_jwt,
-        refresh_jwt: auth_info.refresh_jwt,
-        pds_url: auth_info.pds_url,
+    // Try OAuth first, then AppPassword
+    let auth = if let Some(oauth) = OAuthAuth::load(&db).await? {
+        info!("Restored OAuth session for {did}");
+        AuthMethod::OAuth {
+            session_cookie: oauth.session_cookie,
+            did: oauth.did.clone(),
+            nest_url: oauth.nest_url,
+        }
+    } else if let Some(ap) = AppPasswordAuth::load(&db).await? {
+        info!("Restored app password session for {}", ap.handle);
+        AuthMethod::AppPassword {
+            handle: ap.handle,
+            did: ap.did,
+            access_jwt: ap.access_jwt,
+            refresh_jwt: ap.refresh_jwt,
+            pds_url: ap.pds_url,
+        }
+    } else {
+        anyhow::bail!("No saved session found. Run `catmos login` first.");
     };
 
     // ── 3. Initialize MLS ──────────────────────────────────────────────
-    let mls_dir = data_dir.join("mls");
+    let mls_dir = Config::data_dir()?.join("mls");
     let mls = Arc::new(MlsManager::new(&mls_dir, &did)?);
 
     // ── 4. Create ChatService ──────────────────────────────────────────
@@ -78,6 +92,8 @@ pub async fn run() -> anyhow::Result<()> {
     match service.fetch_conversations().await {
         Ok(convos) => {
             app.conversations = convos;
+            // Populate handle cache from service for sender display
+            app.handle_cache = service.handle_cache().await;
             // Load messages for the first conversation
             if let Some(convo) = app.active_conversation() {
                 let group_id = convo.group_id.clone();

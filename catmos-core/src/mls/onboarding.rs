@@ -297,7 +297,7 @@ impl MlsManager {
         let req: mls_chat::commit_group_change::Input =
             mls_chat::commit_group_change::InputData {
                 convo_id: convo_id.to_string(),
-                action: "processExternalCommit".to_string(),
+                action: "externalCommit".to_string(),
                 commit: Some(commit_b64),
                 device_id: None,
                 group_info: None,

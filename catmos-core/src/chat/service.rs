@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, COOKIE};
@@ -96,6 +97,8 @@ pub struct ChatService {
     pub(crate) config: Config,
     pub(crate) aliases: Arc<RwLock<AliasStore>>,
     pub(crate) conversations: Arc<RwLock<Vec<Conversation>>>,
+    /// DID -> handle cache, populated during fetch_conversations.
+    pub(crate) handle_cache: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl ChatService {
@@ -114,6 +117,7 @@ impl ChatService {
             config,
             aliases,
             conversations: Arc::new(RwLock::new(Vec::new())),
+            handle_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -130,6 +134,11 @@ impl ChatService {
         self.conversations.read().await.clone()
     }
 
+    /// Snapshot of the DID -> handle cache.
+    pub async fn handle_cache(&self) -> HashMap<String, String> {
+        self.handle_cache.read().await.clone()
+    }
+
     /// Resolve user input (alias, name, or ID prefix) to a conversation ID.
     pub async fn resolve_convo(&self, input: &str) -> Result<String> {
         let aliases = self.aliases.read().await;
@@ -137,6 +146,27 @@ impl ChatService {
         aliases
             .resolve(input, &convos)
             .ok_or_else(|| CatmosError::ConvoNotFound(input.to_string()))
+    }
+
+    /// Resolve a DID to a handle via the public Bluesky API.
+    pub async fn resolve_handle(&self, did: &str) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        struct ProfileBasic {
+            handle: Option<String>,
+        }
+        // Use public API directly — no auth needed
+        let resp = self.http
+            .get(format!("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor={did}"))
+            .send()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+        if resp.status().is_success() {
+            let profile: ProfileBasic = resp.json().await
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            Ok(profile.handle.unwrap_or_else(|| did.rsplit(':').next().unwrap_or(did).to_string()))
+        } else {
+            Ok(did.rsplit(':').next().unwrap_or(did).to_string())
+        }
     }
 
     // ── XRPC transport ──────────────────────────────────────────────────
@@ -310,7 +340,7 @@ impl ChatService {
         let req: mls_chat::commit_group_change::Input =
             mls_chat::commit_group_change::InputData {
                 convo_id: convo_id.to_string(),
-                action: "processExternalCommit".to_string(),
+                action: "externalCommit".to_string(),
                 commit: None,
                 device_id: None,
                 group_info: None,

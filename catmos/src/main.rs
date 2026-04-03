@@ -341,22 +341,49 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             svc.fetch_conversations().await?;
             let convo_id = svc.resolve_convo(&convo).await?;
             let messages = svc.fetch_messages(&convo_id, 50).await?;
+            let handle_cache = svc.handle_cache().await;
+            let my_did = svc.did().to_string();
 
             if messages.is_empty() {
                 println!("No messages.");
                 return Ok(());
             }
 
+            let mut shown_join = false;
             for m in &messages {
-                let sender = m.sender_did.as_deref().unwrap_or("unknown");
+                // Skip decryption failures
+                if let MessageContent::System(t) = &m.content {
+                    if t.contains("Decryption failed") {
+                        shown_join = true;
+                        continue;
+                    }
+                }
+                if matches!(&m.content, MessageContent::Unknown) { continue; }
+
+                if shown_join {
+                    shown_join = false;
+                    println!("  ── You joined this conversation ──");
+                }
+
+                let sender_did = m.sender_did.as_deref().unwrap_or("unknown");
+                let sender = if sender_did == my_did {
+                    "you".to_string()
+                } else if let Some(handle) = handle_cache.get(sender_did) {
+                    handle.clone()
+                } else {
+                    sender_did.rsplit(':').next().unwrap_or(sender_did).to_string()
+                };
                 let ts = m.created_at.format("%H:%M");
                 let body = match &m.content {
                     MessageContent::Text(t) => t.clone(),
                     MessageContent::Reaction { emoji, .. } => format!("[reaction: {emoji}]"),
-                    MessageContent::System(t) => format!("[system] {t}"),
-                    MessageContent::Unknown => "[unknown]".to_string(),
+                    MessageContent::System(t) => t.clone(),
+                    MessageContent::Unknown => continue,
                 };
                 println!("[{ts}] {sender}: {body}");
+            }
+            if shown_join {
+                println!("  ── You joined this conversation ──");
             }
         }
 
@@ -384,6 +411,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 return Ok(());
             }
 
+            let handle_cache = svc.handle_cache().await;
             for m in &convo_data.members {
                 let role = if m.is_admin {
                     " [admin]"
@@ -396,7 +424,11 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     .device_name
                     .as_deref()
                     .unwrap_or_else(|| m.device_id.as_deref().unwrap_or("?"));
-                println!("  {} ({device}){role}", m.user_did);
+                let display = handle_cache
+                    .get(&m.user_did)
+                    .map(|h| h.as_str())
+                    .unwrap_or(&m.user_did);
+                println!("  {display} ({device}){role}");
             }
         }
 
@@ -687,15 +719,25 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Default filter: warn for most, suppress noisy openmls internals.
+    // openmls uses the `log` crate — the tracing-log bridge converts `log`
+    // records into tracing events so `openmls=off` actually takes effect.
+    let default_filter = "warn,catmos=info,catmos_core=info,catmos_tui=info,openmls=off,openmls_rust_crypto=off,openmls_memory_storage=off";
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .init();
+
+    // Bridge `log` crate (used by openmls) into tracing so the filter above works
+    tracing_log::LogTracer::init().ok();
 
     let cli = Cli::parse();
 
     match cli.command {
         None | Some(Commands::Chat) => {
-            println!("TUI not yet implemented");
+            catmos_tui::run().await?;
         }
         Some(cmd) => {
             handle_command(cmd).await?;

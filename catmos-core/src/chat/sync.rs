@@ -1,8 +1,6 @@
 use serde::Serialize;
 use tracing::debug;
 
-use catbird_atproto::catbird::mls_chat;
-
 use super::service::ChatService;
 use crate::error::Result;
 

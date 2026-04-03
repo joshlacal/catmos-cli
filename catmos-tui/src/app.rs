@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use catmos_core::chat::service::ChatService;
@@ -45,6 +46,9 @@ pub struct App {
 
     /// When true the main loop should exit.
     pub should_quit: bool,
+
+    /// Cache of DID → handle for display.
+    pub handle_cache: HashMap<String, String>,
 }
 
 impl App {
@@ -61,6 +65,7 @@ impl App {
             member_panel_visible,
             scroll_offset: 0,
             should_quit: false,
+            handle_cache: HashMap::new(),
         }
     }
 
@@ -144,6 +149,15 @@ impl App {
                 .nth(1)
                 .map(|(i, _)| self.cursor_pos + i)
                 .unwrap_or(self.input.len());
+        }
+    }
+
+    /// Get display name for a DID: handle if cached, otherwise short DID.
+    pub fn display_name(&self, did: &str) -> String {
+        if let Some(handle) = self.handle_cache.get(did) {
+            handle.clone()
+        } else {
+            did.rsplit(':').next().unwrap_or(did).to_string()
         }
     }
 

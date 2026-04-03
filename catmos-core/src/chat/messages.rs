@@ -1,7 +1,9 @@
+use std::collections::{HashMap, HashSet};
+
 use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use catbird_atproto::catbird::mls_chat;
 
@@ -318,6 +320,9 @@ impl ChatService {
     }
 
     /// Fetch all conversations from the server, decrypt metadata, and cache locally.
+    ///
+    /// Resolves all unique member DIDs to handles and populates
+    /// `self.handle_cache` so the TUI can display friendly names.
     pub async fn fetch_conversations(&self) -> Result<Vec<Conversation>> {
         let resp: GetConvosResp = self
             .xrpc_query(mls_chat::get_convos::NSID, &[])
@@ -331,6 +336,84 @@ impl ChatService {
 
         // Attempt to decrypt MLS group metadata for richer names
         self.apply_group_metadata(&mut convos);
+
+        // ── Resolve all unique user DIDs to handles ──────────────────────
+        let my_did = self.did().to_string();
+
+        // Collect all unique user DIDs across all conversations
+        let all_user_dids: HashSet<String> = convos
+            .iter()
+            .flat_map(|c| c.members.iter().map(|m| m.user_did.clone()))
+            .filter(|d| d != &my_did)
+            .collect();
+
+        debug!("Resolving {} unique member DIDs to handles", all_user_dids.len());
+
+        // Resolve each DID to a handle (reuse existing cache entries)
+        let mut new_handles: HashMap<String, String> = HashMap::new();
+        {
+            let existing = self.handle_cache.read().await;
+            for did in &all_user_dids {
+                if let Some(cached) = existing.get(did) {
+                    new_handles.insert(did.clone(), cached.clone());
+                }
+            }
+        }
+
+        // Resolve any DIDs not already cached
+        let uncached: Vec<&String> = all_user_dids
+            .iter()
+            .filter(|d| !new_handles.contains_key(d.as_str()))
+            .collect();
+
+        for did in uncached {
+            match self.resolve_handle(did).await {
+                Ok(handle) => {
+                    new_handles.insert(did.clone(), handle);
+                }
+                Err(e) => {
+                    debug!("Failed to resolve handle for {did}: {e}");
+                    new_handles.insert(
+                        did.clone(),
+                        did.rsplit(':').next().unwrap_or(did).to_string(),
+                    );
+                }
+            }
+        }
+
+        // Update the service-wide handle cache
+        {
+            let mut cache = self.handle_cache.write().await;
+            cache.extend(new_handles.clone());
+        }
+
+        // For unnamed 1:1 conversations, use the resolved handle as the name
+        for convo in &mut convos {
+            if convo.name.is_some() {
+                continue;
+            }
+            // Find unique user DIDs (excluding our own)
+            let other_dids: Vec<&str> = convo
+                .members
+                .iter()
+                .map(|m| m.user_did.as_str())
+                .filter(|d| *d != my_did)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            if other_dids.len() == 1 {
+                let other_did = other_dids[0];
+                convo.name = Some(
+                    new_handles
+                        .get(other_did)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            other_did.rsplit(':').next().unwrap_or(other_did).to_string()
+                        }),
+                );
+            }
+        }
 
         // Persist to local DB
         for convo in &convos {
@@ -361,6 +444,12 @@ impl ChatService {
         convo_id: &str,
         limit: u32,
     ) -> Result<Vec<Message>> {
+        // Get local epoch to skip old messages we can't decrypt
+        let local_epoch = {
+            let group_id_bytes = hex::decode(convo_id).unwrap_or_default();
+            self.mls.with_context(|ctx| ctx.get_epoch(group_id_bytes)).ok()
+        };
+
         let limit_str = limit.to_string();
         let resp: GetMessagesResp = self
             .xrpc_query(
@@ -371,6 +460,13 @@ impl ChatService {
 
         let mut messages = Vec::with_capacity(resp.messages.len());
         for entry in &resp.messages {
+            // Skip messages from epochs before we joined
+            if let Some(our_epoch) = local_epoch {
+                if (entry.epoch as u64) < our_epoch {
+                    continue;
+                }
+            }
+
             let ciphertext = base64::engine::general_purpose::STANDARD
                 .decode(&entry.ciphertext.bytes)
                 .map_err(|e| CatmosError::Other(format!("Invalid base64 ciphertext: {e}")))?;

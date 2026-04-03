@@ -16,14 +16,10 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = members
         .iter()
         .map(|member| {
-            let did_short = member
-                .user_did
-                .rsplit(':')
-                .next()
-                .unwrap_or(&member.user_did);
+            let display = app.display_name(&member.user_did);
 
             let mut spans = vec![Span::styled(
-                did_short.to_string(),
+                display,
                 Style::default().fg(Color::White),
             )];
 
