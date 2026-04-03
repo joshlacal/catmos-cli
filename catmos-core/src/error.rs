@@ -28,9 +28,9 @@ pub enum CatmosError {
 
 pub type Result<T> = std::result::Result<T, CatmosError>;
 
-impl From<rusqlite::Error> for CatmosError {
-    fn from(e: rusqlite::Error) -> Self {
-        CatmosError::Storage(e.to_string())
+impl From<sqlx::Error> for CatmosError {
+    fn from(e: sqlx::Error) -> Self {
+        CatmosError::Storage(format!("{e:#}"))
     }
 }
 

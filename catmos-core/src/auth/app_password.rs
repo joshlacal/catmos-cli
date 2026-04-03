@@ -90,28 +90,28 @@ impl AppPasswordAuth {
     }
 
     /// Persist auth credentials to the session store.
-    pub fn save(&self, db: &Database) -> Result<()> {
-        db.store_session_value("auth_method", "app_password")?;
-        db.store_session_value("handle", &self.handle)?;
-        db.store_session_value("did", &self.did)?;
-        db.store_session_value("access_jwt", &self.access_jwt)?;
-        db.store_session_value("refresh_jwt", &self.refresh_jwt)?;
-        db.store_session_value("pds_url", &self.pds_url)?;
+    pub async fn save(&self, db: &Database) -> Result<()> {
+        db.store_session_value("auth_method", "app_password").await?;
+        db.store_session_value("handle", &self.handle).await?;
+        db.store_session_value("did", &self.did).await?;
+        db.store_session_value("access_jwt", &self.access_jwt).await?;
+        db.store_session_value("refresh_jwt", &self.refresh_jwt).await?;
+        db.store_session_value("pds_url", &self.pds_url).await?;
         Ok(())
     }
 
     /// Load previously-saved app password auth from the session store.
-    pub fn load(db: &Database) -> Result<Option<Self>> {
-        let method = db.get_session_value("auth_method")?;
+    pub async fn load(db: &Database) -> Result<Option<Self>> {
+        let method = db.get_session_value("auth_method").await?;
         if method.as_deref() != Some("app_password") {
             return Ok(None);
         }
 
-        let handle = db.get_session_value("handle")?;
-        let did = db.get_session_value("did")?;
-        let access_jwt = db.get_session_value("access_jwt")?;
-        let refresh_jwt = db.get_session_value("refresh_jwt")?;
-        let pds_url = db.get_session_value("pds_url")?;
+        let handle = db.get_session_value("handle").await?;
+        let did = db.get_session_value("did").await?;
+        let access_jwt = db.get_session_value("access_jwt").await?;
+        let refresh_jwt = db.get_session_value("refresh_jwt").await?;
+        let pds_url = db.get_session_value("pds_url").await?;
 
         match (handle, did, access_jwt, refresh_jwt, pds_url) {
             (Some(handle), Some(did), Some(access_jwt), Some(refresh_jwt), Some(pds_url)) => {

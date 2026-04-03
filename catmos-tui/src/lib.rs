@@ -38,9 +38,9 @@ pub async fn run() -> anyhow::Result<()> {
     let db_path = data_dir.join("catmos.db");
 
     // Use unencrypted DB for session store (auth credentials)
-    let db = Arc::new(Database::open_unencrypted(&db_path)?);
+    let db = Arc::new(Database::open_unencrypted(&db_path).await?);
 
-    let auth_info = AppPasswordAuth::load(&db)?
+    let auth_info = AppPasswordAuth::load(&db).await?
         .ok_or_else(|| anyhow::anyhow!("Not authenticated. Run `catmos login` first."))?;
 
     let did = auth_info.did.clone();
@@ -105,8 +105,8 @@ pub async fn run() -> anyhow::Result<()> {
     let (mut events, event_tx) = EventLoop::new(250);
 
     // ── 7a. Start WebSocket subscription ──────────────────────────────
-    // Call subscribe() on the current task (ChatService isn't Send due to
-    // rusqlite internals), then hand only the receiver to the spawned task.
+    // Call subscribe() on the current task, then hand only the receiver
+    // to the spawned task.
     match service.subscribe().await {
         Ok(mut ws_rx) => {
             let ws_tx = event_tx.clone();

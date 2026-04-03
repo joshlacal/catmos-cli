@@ -167,17 +167,17 @@ async fn init_service() -> anyhow::Result<ChatService> {
     let db_path = account_dir.join("catmos.db");
 
     let db_key = catmos_core::mls::context::get_or_create_db_key(did)?;
-    let db = Database::open(&db_path, &db_key)?;
+    let db = Database::open(&db_path, &db_key).await?;
 
     // Try to restore auth: OAuth first, then AppPassword
-    let auth = if let Some(oauth) = OAuthAuth::load(&db)? {
+    let auth = if let Some(oauth) = OAuthAuth::load(&db).await? {
         info!("Restored OAuth session for {did}");
         AuthMethod::OAuth {
             session_cookie: oauth.session_cookie,
             did: oauth.did.clone(),
             nest_url: oauth.nest_url,
         }
-    } else if let Some(ap) = AppPasswordAuth::load(&db)? {
+    } else if let Some(ap) = AppPasswordAuth::load(&db).await? {
         info!("Restored app password session for {}", ap.handle);
         AuthMethod::AppPassword {
             handle: ap.handle,
@@ -201,11 +201,11 @@ async fn init_service() -> anyhow::Result<ChatService> {
 
 /// Open (or create) a per-account database for a login flow where we don't yet
 /// have a ChatService. Returns the Database so auth can be saved.
-fn open_account_db(did: &str) -> anyhow::Result<Database> {
+async fn open_account_db(did: &str) -> anyhow::Result<Database> {
     let account_dir = Config::account_data_dir(did)?;
     let db_path = account_dir.join("catmos.db");
     let db_key = catmos_core::mls::context::get_or_create_db_key(did)?;
-    let db = Database::open(&db_path, &db_key)?;
+    let db = Database::open(&db_path, &db_key).await?;
     Ok(db)
 }
 
@@ -232,8 +232,8 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let session = AppPasswordAuth::login(&handle, &password).await?;
                 println!("Logged in as {} ({})", session.handle, session.did);
 
-                let db = open_account_db(&session.did)?;
-                session.save(&db)?;
+                let db = open_account_db(&session.did).await?;
+                session.save(&db).await?;
 
                 let mut config = Config::load()?;
                 config.default_account = Some(session.did);
@@ -246,8 +246,8 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let session = OAuthAuth::login(&handle, nest_url).await?;
                 println!("Logged in as {}", session.did);
 
-                let db = open_account_db(&session.did)?;
-                session.save(&db)?;
+                let db = open_account_db(&session.did).await?;
+                session.save(&db).await?;
 
                 let mut config = Config::load()?;
                 config.default_account = Some(session.did);

@@ -177,7 +177,7 @@ impl ChatService {
         };
 
         // Store locally
-        self.db.store_message(&msg)?;
+        self.db.store_message(&msg).await?;
 
         Ok(msg)
     }
@@ -287,7 +287,7 @@ impl ChatService {
             };
 
             // Persist to local DB
-            if let Err(e) = self.db.store_conversation(&convo) {
+            if let Err(e) = self.db.store_conversation(&convo).await {
                 warn!("Failed to store conversation {}: {e}", convo.group_id);
             }
 
@@ -346,7 +346,7 @@ impl ChatService {
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(Utc::now),
                     };
-                    if let Err(e) = self.db.store_message(&msg) {
+                    if let Err(e) = self.db.store_message(&msg).await {
                         warn!("Failed to store message {}: {e}", msg.id);
                     }
                     messages.push(msg);
@@ -370,7 +370,7 @@ impl ChatService {
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(Utc::now),
                     };
-                    if let Err(e) = self.db.store_message(&msg) {
+                    if let Err(e) = self.db.store_message(&msg).await {
                         warn!("Failed to store message: {e}");
                     }
                     messages.push(msg);

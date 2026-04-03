@@ -123,26 +123,26 @@ impl OAuthAuth {
     }
 
     /// Persist OAuth session to the session store.
-    pub fn save(&self, db: &Database) -> Result<()> {
-        db.store_session_value("auth_method", "oauth")?;
-        db.store_session_value("session_cookie", &self.session_cookie)?;
-        db.store_session_value("did", &self.did)?;
-        db.store_session_value("handle", &self.handle)?;
-        db.store_session_value("nest_url", &self.nest_url)?;
+    pub async fn save(&self, db: &Database) -> Result<()> {
+        db.store_session_value("auth_method", "oauth").await?;
+        db.store_session_value("session_cookie", &self.session_cookie).await?;
+        db.store_session_value("did", &self.did).await?;
+        db.store_session_value("handle", &self.handle).await?;
+        db.store_session_value("nest_url", &self.nest_url).await?;
         Ok(())
     }
 
     /// Load previously-saved OAuth auth from the session store.
-    pub fn load(db: &Database) -> Result<Option<Self>> {
-        let method = db.get_session_value("auth_method")?;
+    pub async fn load(db: &Database) -> Result<Option<Self>> {
+        let method = db.get_session_value("auth_method").await?;
         if method.as_deref() != Some("oauth") {
             return Ok(None);
         }
 
-        let session_cookie = db.get_session_value("session_cookie")?;
-        let did = db.get_session_value("did")?;
-        let handle = db.get_session_value("handle")?;
-        let nest_url = db.get_session_value("nest_url")?;
+        let session_cookie = db.get_session_value("session_cookie").await?;
+        let did = db.get_session_value("did").await?;
+        let handle = db.get_session_value("handle").await?;
+        let nest_url = db.get_session_value("nest_url").await?;
 
         match (session_cookie, did, nest_url) {
             (Some(session_cookie), Some(did), Some(nest_url)) => Ok(Some(Self {
