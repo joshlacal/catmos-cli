@@ -5,6 +5,16 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite;
 use tracing::{debug, error, info, warn};
 
+// ── DAG-CBOR frame types ──────────────────────────────────────────────
+
+/// Header portion of a DAG-CBOR WebSocket frame from mls-ds.
+#[derive(serde::Serialize, Deserialize, Debug)]
+struct FrameHeader {
+    op: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    t: Option<String>,
+}
+
 use super::service::ChatService;
 use crate::error::{CatmosError, Result};
 
@@ -144,7 +154,23 @@ impl ChatService {
         tokio::spawn(async move {
             while let Some(msg_result) = read.next().await {
                 match msg_result {
+                    Ok(tungstenite::Message::Binary(data)) => {
+                        // DAG-CBOR frame: header + payload concatenated
+                        match parse_dagcbor_frame(&data) {
+                            Ok(event) => {
+                                let ws_event = process_server_event(event, &mls);
+                                if tx.send(ws_event).is_err() {
+                                    debug!("WsEvent receiver dropped, stopping reader");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse DAG-CBOR WebSocket frame: {e}");
+                            }
+                        }
+                    }
                     Ok(tungstenite::Message::Text(text)) => {
+                        // JSON text fallback (e.g. when server sends format=json)
                         match serde_json::from_str::<ServerEvent>(&text) {
                             Ok(event) => {
                                 let ws_event = process_server_event(event, &mls);
@@ -173,7 +199,7 @@ impl ChatService {
                         let _ = tx.send(WsEvent::Error(e.to_string()));
                         break;
                     }
-                    _ => {} // Binary, Frame — ignore
+                    _ => {} // Frame — ignore
                 }
             }
         });
@@ -286,5 +312,163 @@ fn process_server_event(
             emoji,
             sender_did,
         },
+    }
+}
+
+// ── DAG-CBOR payload types ─────────────────────────────────────────────
+//
+// The mls-ds server sends events as DAG-CBOR binary frames. Each frame is
+// two concatenated CBOR objects: a header and a payload. The payload contains
+// the event fields with `ciphertext` as CBOR byte strings (not base64).
+
+/// Message view nested inside a `#messageEvent` payload.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct CborMessageView {
+    id: String,
+    convo_id: String,
+    #[serde(with = "serde_bytes")]
+    ciphertext: Vec<u8>,
+    epoch: i64,
+    seq: i64,
+    #[serde(default)]
+    message_type: Option<String>,
+}
+
+/// Payload for `#messageEvent`
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct CborMessageEventPayload {
+    message: CborMessageView,
+    #[serde(default)]
+    ephemeral: bool,
+    #[serde(default)]
+    seq: i64,
+}
+
+/// Payload for `#reactionEvent`
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct CborReactionEventPayload {
+    convo_id: String,
+    message_id: String,
+    did: String,
+    reaction: String,
+    #[serde(default)]
+    action: Option<String>,
+}
+
+/// Payload for `#typingEvent`
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct CborTypingEventPayload {
+    convo_id: String,
+    did: String,
+    is_typing: bool,
+}
+
+/// Payload for `#membershipChangeEvent`
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct CborMembershipChangePayload {
+    convo_id: Option<String>,
+    group_id: Option<String>,
+    did: Option<String>,
+    member_did: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+}
+
+/// Parse a binary DAG-CBOR frame from the mls-ds WebSocket.
+///
+/// The frame is two concatenated DAG-CBOR objects:
+/// 1. Header: `{ op: i32, t: Option<String> }` — op=1 means message, op=-1 means error
+/// 2. Payload: the event data with a `seq` field
+fn parse_dagcbor_frame(data: &[u8]) -> std::result::Result<ServerEvent, String> {
+    // Decode the header to find its size and check the op code.
+    let header: FrameHeader = serde_ipld_dagcbor::from_slice(data)
+        .map_err(|e| format!("Failed to decode DAG-CBOR header: {e}"))?;
+
+    if header.op == -1 {
+        return Err(format!("Server error frame (type: {:?})", header.t));
+    }
+
+    // Re-encode the header to determine how many bytes it occupied.
+    // DAG-CBOR is deterministic, so re-encoding yields the same bytes.
+    let header_len = serde_ipld_dagcbor::to_vec(&header)
+        .map_err(|e| format!("Failed to re-encode header for size: {e}"))?
+        .len();
+
+    if header_len >= data.len() {
+        return Err("DAG-CBOR frame too short: no payload after header".into());
+    }
+
+    let payload_bytes = &data[header_len..];
+
+    // Dispatch based on the header's type tag
+    match header.t.as_deref() {
+        Some("#messageEvent") => {
+            let p: CborMessageEventPayload = serde_ipld_dagcbor::from_slice(payload_bytes)
+                .map_err(|e| format!("Failed to decode messageEvent payload: {e}"))?;
+
+            if p.ephemeral {
+                // Skip ephemeral messages (typing indicators sent as encrypted messages)
+                return Err("ephemeral message, skipping".into());
+            }
+
+            let ciphertext_b64 = BASE64.encode(&p.message.ciphertext);
+            Ok(ServerEvent::Message {
+                group_id: p.message.convo_id,
+                message_id: p.message.id,
+                sender_did: None, // Server doesn't include sender in the outer envelope
+                ciphertext: ciphertext_b64,
+                epoch: p.message.epoch as u64,
+                seq: p.message.seq as u64,
+            })
+        }
+        Some("#reactionEvent") => {
+            let p: CborReactionEventPayload = serde_ipld_dagcbor::from_slice(payload_bytes)
+                .map_err(|e| format!("Failed to decode reactionEvent payload: {e}"))?;
+            Ok(ServerEvent::Reaction {
+                group_id: p.convo_id,
+                message_id: p.message_id,
+                emoji: p.reaction,
+                sender_did: p.did,
+            })
+        }
+        Some("#typingEvent") => {
+            let p: CborTypingEventPayload = serde_ipld_dagcbor::from_slice(payload_bytes)
+                .map_err(|e| format!("Failed to decode typingEvent payload: {e}"))?;
+            Ok(ServerEvent::Typing {
+                group_id: p.convo_id,
+                sender_did: p.did,
+                is_typing: p.is_typing,
+            })
+        }
+        Some("#membershipChangeEvent") => {
+            let p: CborMembershipChangePayload = serde_ipld_dagcbor::from_slice(payload_bytes)
+                .map_err(|e| format!("Failed to decode membershipChangeEvent payload: {e}"))?;
+            let convo = p.convo_id.or(p.group_id).unwrap_or_default();
+            let member = p.did.or(p.member_did).unwrap_or_default();
+            match p.action.as_deref() {
+                Some("left") | Some("removed") => Ok(ServerEvent::MemberLeft {
+                    group_id: convo,
+                    member_did: member,
+                }),
+                _ => Ok(ServerEvent::MemberJoined {
+                    group_id: convo,
+                    member_did: member,
+                }),
+            }
+        }
+        Some("#infoEvent") | Some("#newDeviceEvent") | Some("#groupInfoRefreshRequestedEvent")
+        | Some("#readditionRequestedEvent") => {
+            // Non-essential events — log and skip
+            Err(format!("Ignoring event type: {:?}", header.t))
+        }
+        Some(other) => Err(format!("Unknown event type: {other}")),
+        None => Err("Missing event type in header".into()),
     }
 }

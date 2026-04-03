@@ -367,24 +367,12 @@ impl ChatService {
         });
         let plaintext = serde_json::to_vec(&payload)?;
 
-        // Pad and encrypt
-        let padded = {
-            const BUCKETS: &[usize] = &[512, 1024, 2048, 4096, 8192];
-            let target = BUCKETS
-                .iter()
-                .find(|&&b| b >= plaintext.len())
-                .copied()
-                .unwrap_or(8192);
-            let mut p = plaintext;
-            p.resize(target, 0);
-            p
-        };
-
+        // Encrypt via MLS — ciphertext padding is handled by the MLS layer
         let group_id_bytes = hex::decode(convo_id)
             .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
 
         let encrypt_result = self.mls.with_context(|ctx| {
-            ctx.encrypt_message(group_id_bytes, padded)
+            ctx.encrypt_message(group_id_bytes, plaintext)
         })?;
 
         let ciphertext_b64 = BASE64.encode(&encrypt_result.ciphertext);

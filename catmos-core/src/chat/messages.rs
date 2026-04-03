@@ -31,6 +31,7 @@ struct MlsReactionPayload {
     action: String, // "add" or "remove"
 }
 
+#[allow(dead_code)]
 impl MlsMessagePayload {
     fn text(content: &str) -> Self {
         Self {
@@ -129,19 +130,6 @@ struct MessageEntry {
 
 // ── Padding ─────────────────────────────────────────────────────────────
 
-/// Pad plaintext to the next size bucket to reduce metadata leakage.
-fn pad_to_bucket(data: &[u8]) -> Vec<u8> {
-    const BUCKETS: &[usize] = &[512, 1024, 2048, 4096, 8192];
-    let target = BUCKETS
-        .iter()
-        .find(|&&b| b >= data.len())
-        .copied()
-        .unwrap_or(8192);
-    let mut padded = data.to_vec();
-    padded.resize(target, 0);
-    padded
-}
-
 /// Strip trailing zero-byte padding.
 fn unpad(data: &[u8]) -> &[u8] {
     let end = data.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
@@ -156,14 +144,13 @@ impl ChatService {
         // Build the plaintext payload (matches iOS MLSMessagePayload format)
         let payload = MlsMessagePayload::text(text);
         let plaintext = serde_json::to_vec(&payload)?;
-        let padded = pad_to_bucket(&plaintext);
 
-        // Encrypt via MLS
+        // Encrypt via MLS — ciphertext padding is handled by the MLS layer
         let group_id_bytes = hex::decode(convo_id)
             .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
 
         let encrypt_result = self.mls.with_context(|ctx| {
-            ctx.encrypt_message(group_id_bytes.clone(), padded.clone())
+            ctx.encrypt_message(group_id_bytes.clone(), plaintext.clone())
         })?;
 
         let ciphertext_b64 = BASE64.encode(&encrypt_result.ciphertext);
