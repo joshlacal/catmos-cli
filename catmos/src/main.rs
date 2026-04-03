@@ -129,6 +129,9 @@ enum DeviceCommands {
         #[arg(long)]
         name: Option<String>,
     },
+    Remove {
+        device_id: String,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -523,6 +526,17 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     "Registered device: id={}, mls_did={}",
                     info.device_id, info.mls_did
                 );
+            }
+            DeviceCommands::Remove { device_id } => {
+                let svc = init_service().await?;
+                let (deleted, kp_deleted, convos_left) = svc.remove_device(&device_id).await?;
+                if deleted {
+                    println!(
+                        "Removed device {device_id} (key_packages={kp_deleted}, conversations_left={convos_left})"
+                    );
+                } else {
+                    println!("Device {device_id} was not found or already removed.");
+                }
             }
         },
 

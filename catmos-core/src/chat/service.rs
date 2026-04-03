@@ -63,6 +63,16 @@ struct PublishResultResp {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RemoveDeviceResp {
+    deleted: bool,
+    #[serde(default)]
+    key_packages_deleted: Option<i64>,
+    #[serde(default)]
+    conversations_left: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct UploadBlobResp {
     blob_id: String,
     size: i64,
@@ -543,6 +553,25 @@ impl ChatService {
             .unwrap_or(0);
 
         Ok(accepted)
+    }
+
+    /// Remove a device by its ID. Returns (deleted, key_packages_deleted, conversations_left).
+    pub async fn remove_device(&self, device_id: &str) -> Result<(bool, i64, i64)> {
+        let req: mls_chat::remove_device::Input =
+            mls_chat::remove_device::InputData {
+                device_id: device_id.to_string(),
+            }
+            .into();
+
+        let resp: RemoveDeviceResp = self
+            .xrpc_procedure(mls_chat::remove_device::NSID, &req)
+            .await?;
+
+        Ok((
+            resp.deleted,
+            resp.key_packages_deleted.unwrap_or(0),
+            resp.conversations_left.unwrap_or(0),
+        ))
     }
 
     // ── Debug / introspection ───────────────────────────────────────────
