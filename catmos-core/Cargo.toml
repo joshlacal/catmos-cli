@@ -1,0 +1,33 @@
+[package]
+name = "catmos-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+catbird-mls = { workspace = true }
+catbird-atproto = { workspace = true }
+jacquard = { workspace = true }
+jacquard-common = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+rusqlite = { version = "0.32", default-features = false, features = ["bundled-sqlcipher"] }
+keyring = { version = "3", features = ["apple-native", "linux-native"] }
+toml = "0.8"
+dirs = "6"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+hex = "0.4"
+sha2 = "0.10"
+reqwest = { version = "0.12", features = ["json"] }
+axum = "0.8"
+open = "5"
+async-trait = "0.1"
+rand = "0.8"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"

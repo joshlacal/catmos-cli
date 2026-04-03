@@ -1,0 +1,18 @@
+[package]
+name = "catmos"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "catmos"
+path = "src/main.rs"
+
+[dependencies]
+catmos-core = { workspace = true }
+catmos-tui = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+rpassword = "7"
