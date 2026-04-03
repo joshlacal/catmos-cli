@@ -1,7 +1,9 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+use catbird_atproto::catbird::mls_chat;
 
 use super::service::ChatService;
 use crate::error::{CatmosError, Result};
@@ -56,76 +58,144 @@ impl MlsMessagePayload {
     }
 }
 
-// ── XRPC request/response structs ───────────────────────────────────────
+// ── Response deserialization helpers ────────────────────────────────────
+//
+// The Jacquard-generated output types use lifetime parameters and don't
+// implement `DeserializeOwned`, so they can't be used directly with
+// reqwest's `.json()` or `serde_json::from_str`. We deserialize responses
+// as `serde_json::Value` and extract fields manually using the correct
+// field names from the generated types.
 
-#[derive(Serialize)]
+/// Extract a `SendMessageOutput`-shaped response from JSON.
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SendMessageRequest {
-    group_id: String,
-    ciphertext: String, // base64
-    #[serde(skip_serializing_if = "Option::is_none")]
-    delivery: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    action: Option<String>,
+pub(crate) struct SendMessageResp {
+    pub message_id: String,
+    pub seq: i64,
+    pub epoch: i64,
+}
+
+/// Extract a `GetConvosOutput`-shaped response from JSON.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GetConvosResp {
+    pub conversations: Vec<ConvoViewResp>,
+}
+
+/// Thin deserialization wrapper matching the generated `ConvoView` field names.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConvoViewResp {
+    pub group_id: String,
+    pub creator: String,
+    pub epoch: i64,
+    pub cipher_suite: String,
+    pub members: Vec<MemberViewResp>,
+    pub created_at: String,
+    #[serde(default)]
+    pub last_message_at: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<ConvoMetadataResp>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SendMessageResponse {
-    message_id: String,
-    seq: u64,
-    epoch: u64,
+pub(crate) struct ConvoMetadataResp {
+    pub name: Option<String>,
+    pub description: Option<String>,
 }
 
+/// Thin deserialization wrapper matching the generated `MemberView` field names.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GetConvosResponse {
-    conversations: Vec<ConvoEntry>,
+pub(crate) struct MemberViewResp {
+    pub did: String,
+    pub user_did: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    pub is_admin: bool,
+    #[serde(default)]
+    pub is_moderator: Option<bool>,
+    pub joined_at: String,
 }
 
+/// AT Protocol `$bytes` encoding: `{"$bytes":"base64..."}`
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConvoEntry {
-    group_id: String,
-    name: Option<String>,
-    description: Option<String>,
-    creator: String,
-    epoch: u64,
-    cipher_suite: Option<String>,
-    members: Option<Vec<MemberEntry>>,
-    created_at: Option<String>,
-    last_message_at: Option<String>,
-    unread_count: Option<u32>,
+pub(crate) struct AtBytes {
+    #[serde(rename = "$bytes")]
+    pub bytes: String,
 }
 
+/// Thin deserialization wrapper matching the generated `MessageView` field names.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct MemberEntry {
-    did: String,
-    user_did: Option<String>,
-    device_id: Option<String>,
-    device_name: Option<String>,
-    is_admin: Option<bool>,
-    is_moderator: Option<bool>,
-    joined_at: Option<String>,
+pub(crate) struct MessageViewResp {
+    pub id: String,
+    pub convo_id: String,
+    pub ciphertext: AtBytes,
+    pub epoch: i64,
+    pub seq: i64,
+    pub created_at: String,
+    #[serde(default)]
+    pub message_type: Option<String>,
 }
 
+/// Extract a `GetMessagesOutput`-shaped response from JSON.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GetMessagesResponse {
-    messages: Vec<MessageEntry>,
+pub(crate) struct GetMessagesResp {
+    pub messages: Vec<MessageViewResp>,
 }
 
+/// Extract a `CreateConvoOutput`-shaped response from JSON.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct MessageEntry {
-    message_id: String,
-    group_id: String,
-    sender_did: Option<String>,
-    ciphertext: String, // base64
-    epoch: u64,
-    seq: u64,
-    created_at: Option<String>,
+pub(crate) struct CreateConvoResp {
+    pub convo: ConvoViewResp,
+}
+
+// ── Conversions from response types to domain types ─────────────────────
+
+/// Convert a `ConvoViewResp` into our domain `Conversation`.
+pub(crate) fn convo_resp_to_conversation(view: &ConvoViewResp) -> Conversation {
+    let members = view.members.iter().map(member_resp_to_member).collect();
+
+    Conversation {
+        group_id: view.group_id.clone(),
+        name: view.metadata.as_ref().and_then(|m| m.name.clone()),
+        description: view.metadata.as_ref().and_then(|m| m.description.clone()),
+        creator: view.creator.clone(),
+        epoch: view.epoch as u64,
+        cipher_suite: view.cipher_suite.clone(),
+        members,
+        created_at: chrono::DateTime::parse_from_rfc3339(&view.created_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        last_message_at: view.last_message_at.as_ref().and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        }),
+        unread_count: 0,
+        alias: None,
+    }
+}
+
+/// Convert a `MemberViewResp` into our domain `Member`.
+pub(crate) fn member_resp_to_member(view: &MemberViewResp) -> Member {
+    Member {
+        did: view.did.clone(),
+        user_did: view.user_did.clone(),
+        device_id: view.device_id.clone(),
+        device_name: view.device_name.clone(),
+        is_admin: view.is_admin,
+        is_moderator: view.is_moderator.unwrap_or(false),
+        joined_at: chrono::DateTime::parse_from_rfc3339(&view.joined_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    }
 }
 
 // ── Padding ─────────────────────────────────────────────────────────────
@@ -145,7 +215,7 @@ impl ChatService {
         let payload = MlsMessagePayload::text(text);
         let plaintext = serde_json::to_vec(&payload)?;
 
-        // Encrypt via MLS — ciphertext padding is handled by the MLS layer
+        // Encrypt via MLS -- ciphertext padding is handled by the MLS layer
         let group_id_bytes = hex::decode(convo_id)
             .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
 
@@ -153,17 +223,24 @@ impl ChatService {
             ctx.encrypt_message(group_id_bytes.clone(), plaintext.clone())
         })?;
 
-        let ciphertext_b64 = BASE64.encode(&encrypt_result.ciphertext);
+        let epoch = self.get_epoch(convo_id).unwrap_or(0);
+        let msg_id = ulid::Ulid::new().to_string();
+        let padded_size = encrypt_result.ciphertext.len() as i64;
 
-        // Send via XRPC
-        let req = SendMessageRequest {
-            group_id: convo_id.to_string(),
-            ciphertext: ciphertext_b64,
-            delivery: None,
-            action: None,
-        };
-        let resp: SendMessageResponse = self
-            .xrpc_procedure("blue.catbird.mlsChat.sendMessage", &req)
+        // Build the generated SendMessage input using the convenience wrapper
+        let req: mls_chat::send_message::Input =
+            mls_chat::send_message::InputData {
+                convo_id: convo_id.to_string(),
+                ciphertext: encrypt_result.ciphertext.clone(),
+                epoch: epoch as usize,
+                msg_id: msg_id.clone(),
+                padded_size,
+                delivery: None,
+            }
+            .into();
+
+        let resp: SendMessageResp = self
+            .xrpc_procedure(mls_chat::send_message::NSID, &req)
             .await?;
 
         let msg = Message {
@@ -171,8 +248,8 @@ impl ChatService {
             convo_id: convo_id.to_string(),
             sender_did: Some(self.did().to_string()),
             content: MessageContent::Text(text.to_string()),
-            epoch: resp.epoch,
-            seq: resp.seq,
+            epoch: resp.epoch as u64,
+            seq: resp.seq as u64,
             created_at: Utc::now(),
         };
 
@@ -219,17 +296,22 @@ impl ChatService {
 
         // Use a 512-byte no-op ciphertext for ephemeral messages
         let noop = vec![0u8; 512];
-        let ciphertext_b64 = BASE64.encode(&noop);
+        let msg_id = ulid::Ulid::new().to_string();
 
-        let req = SendMessageRequest {
-            group_id: convo_id.to_string(),
-            ciphertext: ciphertext_b64,
-            delivery: Some("ephemeral".to_string()),
-            action: Some(action.to_string()),
-        };
+        let mut req: mls_chat::send_message::Input =
+            mls_chat::send_message::InputData {
+                convo_id: convo_id.to_string(),
+                ciphertext: noop,
+                epoch: 0,
+                msg_id,
+                padded_size: 512,
+                delivery: Some("ephemeral".to_string()),
+            }
+            .into();
+        req.action = Some(action.into());
 
         let _: serde_json::Value = self
-            .xrpc_procedure("blue.catbird.mlsChat.sendMessage", &req)
+            .xrpc_procedure(mls_chat::send_message::NSID, &req)
             .await?;
 
         Ok(())
@@ -237,61 +319,21 @@ impl ChatService {
 
     /// Fetch all conversations from the server, decrypt metadata, and cache locally.
     pub async fn fetch_conversations(&self) -> Result<Vec<Conversation>> {
-        let resp: GetConvosResponse = self
-            .xrpc_query("blue.catbird.mlsChat.getConvos", &[])
+        let resp: GetConvosResp = self
+            .xrpc_query(mls_chat::get_convos::NSID, &[])
             .await?;
 
-        let mut convos = Vec::with_capacity(resp.conversations.len());
-        for entry in resp.conversations {
-            let members = entry
-                .members
-                .unwrap_or_default()
-                .into_iter()
-                .map(|m| Member {
-                    did: m.did,
-                    user_did: m.user_did.unwrap_or_default(),
-                    device_id: m.device_id,
-                    device_name: m.device_name,
-                    is_admin: m.is_admin.unwrap_or(false),
-                    is_moderator: m.is_moderator.unwrap_or(false),
-                    joined_at: m
-                        .joined_at
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(Utc::now),
-                })
-                .collect();
+        let convos: Vec<Conversation> = resp
+            .conversations
+            .iter()
+            .map(convo_resp_to_conversation)
+            .collect();
 
-            let convo = Conversation {
-                group_id: entry.group_id,
-                name: entry.name,
-                description: entry.description,
-                creator: entry.creator,
-                epoch: entry.epoch,
-                cipher_suite: entry
-                    .cipher_suite
-                    .unwrap_or_else(|| "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".into()),
-                members,
-                created_at: entry
-                    .created_at
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(Utc::now),
-                last_message_at: entry.last_message_at.and_then(|s| {
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .ok()
-                        .map(|dt| dt.with_timezone(&Utc))
-                }),
-                unread_count: entry.unread_count.unwrap_or(0),
-                alias: None,
-            };
-
-            // Persist to local DB
-            if let Err(e) = self.db.store_conversation(&convo).await {
+        // Persist to local DB
+        for convo in &convos {
+            if let Err(e) = self.db.store_conversation(convo).await {
                 warn!("Failed to store conversation {}: {e}", convo.group_id);
             }
-
-            convos.push(convo);
         }
 
         // Update cached conversations
@@ -317,34 +359,32 @@ impl ChatService {
         limit: u32,
     ) -> Result<Vec<Message>> {
         let limit_str = limit.to_string();
-        let resp: GetMessagesResponse = self
+        let resp: GetMessagesResp = self
             .xrpc_query(
-                "blue.catbird.mlsChat.getMessages",
-                &[("groupId", convo_id), ("limit", &limit_str)],
+                mls_chat::get_messages::NSID,
+                &[("convoId", convo_id), ("limit", &limit_str)],
             )
             .await?;
 
         let mut messages = Vec::with_capacity(resp.messages.len());
-        for entry in resp.messages {
-            let ciphertext = BASE64
-                .decode(&entry.ciphertext)
+        for entry in &resp.messages {
+            let ciphertext = base64::engine::general_purpose::STANDARD
+                .decode(&entry.ciphertext.bytes)
                 .map_err(|e| CatmosError::Other(format!("Invalid base64 ciphertext: {e}")))?;
 
-            match self.decrypt_message(&entry.group_id, &ciphertext) {
+            match self.decrypt_message(&entry.convo_id, &ciphertext) {
                 Ok((plaintext, sender_did)) => {
                     let content = parse_message_content(&plaintext);
                     let msg = Message {
-                        id: entry.message_id,
-                        convo_id: entry.group_id,
-                        sender_did: sender_did.or(entry.sender_did),
+                        id: entry.id.clone(),
+                        convo_id: entry.convo_id.clone(),
+                        sender_did,
                         content,
-                        epoch: entry.epoch,
-                        seq: entry.seq,
-                        created_at: entry
-                            .created_at
-                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        epoch: entry.epoch as u64,
+                        seq: entry.seq as u64,
+                        created_at: chrono::DateTime::parse_from_rfc3339(&entry.created_at)
                             .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(Utc::now),
+                            .unwrap_or_else(|_| Utc::now()),
                     };
                     if let Err(e) = self.db.store_message(&msg).await {
                         warn!("Failed to store message {}: {e}", msg.id);
@@ -354,21 +394,19 @@ impl ChatService {
                 Err(e) => {
                     warn!(
                         "Failed to decrypt message {} in {}: {e}",
-                        entry.message_id, entry.group_id
+                        entry.id, entry.convo_id
                     );
                     // Store as unknown content so we don't lose the message record
                     let msg = Message {
-                        id: entry.message_id,
-                        convo_id: entry.group_id,
-                        sender_did: entry.sender_did,
+                        id: entry.id.clone(),
+                        convo_id: entry.convo_id.clone(),
+                        sender_did: None,
                         content: MessageContent::System(format!("[Decryption failed: {e}]")),
-                        epoch: entry.epoch,
-                        seq: entry.seq,
-                        created_at: entry
-                            .created_at
-                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        epoch: entry.epoch as u64,
+                        seq: entry.seq as u64,
+                        created_at: chrono::DateTime::parse_from_rfc3339(&entry.created_at)
                             .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(Utc::now),
+                            .unwrap_or_else(|_| Utc::now()),
                     };
                     if let Err(e) = self.db.store_message(&msg).await {
                         warn!("Failed to store message: {e}");
@@ -388,7 +426,7 @@ impl ChatService {
 /// legacy catmos format (field `type`) for backwards compatibility.
 fn parse_message_content(plaintext: &str) -> MessageContent {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(plaintext) {
-        // Determine message type — iOS uses "messageType", legacy used "type"
+        // Determine message type -- iOS uses "messageType", legacy used "type"
         let msg_type = v
             .get("messageType")
             .or_else(|| v.get("type"))

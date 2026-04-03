@@ -1,13 +1,16 @@
 use serde::Serialize;
 use tracing::debug;
 
+use catbird_atproto::catbird::mls_chat;
+
 use super::service::ChatService;
 use crate::error::Result;
 
+/// Owned request body matching the generated `UpdateCursor` field names.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UpdateCursorRequest {
-    group_id: String,
+struct UpdateCursorReq {
+    convo_id: String,
     cursor: String,
 }
 
@@ -22,8 +25,8 @@ impl ChatService {
 
     /// Update the read cursor for a conversation on the server.
     pub async fn update_cursor(&self, convo_id: &str, cursor: &str) -> Result<()> {
-        let req = UpdateCursorRequest {
-            group_id: convo_id.to_string(),
+        let req = UpdateCursorReq {
+            convo_id: convo_id.to_string(),
             cursor: cursor.to_string(),
         };
         let _: serde_json::Value = self

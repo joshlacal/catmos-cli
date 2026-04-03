@@ -15,7 +15,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
-rusqlite = { version = "0.32", default-features = false, features = ["bundled-sqlcipher"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+libsqlite3-sys = { version = "0.30", features = ["bundled-sqlcipher"], default-features = false }
 keyring = { version = "3", features = ["apple-native", "linux-native"] }
 toml = "0.8"
 dirs = "6"
@@ -23,6 +24,7 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 hex = "0.4"
+ulid = { workspace = true }
 sha2 = "0.10"
 reqwest = { version = "0.12", features = ["json"] }
 axum = "0.8"

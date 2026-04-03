@@ -17,3 +17,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
 anyhow = "1"
 bytes = { version = "1", features = ["serde"] }
+ulid = "1"
