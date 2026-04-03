@@ -215,27 +215,58 @@ impl MlsManager {
         convo_id: &str,
         did: &str,
     ) -> Result<()> {
-        info!("try_external_commit: fetching groupInfo for convo {}", &convo_id[..12.min(convo_id.len())]);
+        self.try_external_commit_with_retry(service, convo_id, did, 1).await
+    }
 
-        // 1. Fetch group info
-        let group_state: serde_json::Value = service
-            .xrpc_query(
-                mls_chat::get_group_state::NSID,
-                &[("convoId", convo_id), ("include", "groupInfo")],
-            )
-            .await?;
+    async fn try_external_commit_with_retry(
+        &self,
+        service: &ChatService,
+        convo_id: &str,
+        did: &str,
+        max_retries: u32,
+    ) -> Result<()> {
+        let convo_label = &convo_id[..12.min(convo_id.len())];
+        info!("try_external_commit: fetching groupInfo for convo {convo_label}");
 
-        debug!("try_external_commit: getGroupState response keys: {:?}",
-            group_state.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+        // 1. Fetch group info (with retry on GroupInfoUnavailable)
+        let group_info_b64 = match self.fetch_group_info(service, convo_id).await {
+            Ok(info) => info,
+            Err(e) if Self::is_group_info_unavailable(&e) && max_retries > 0 => {
+                warn!(
+                    "try_external_commit: GroupInfo unavailable for {convo_label}, \
+                     requesting refresh and retrying ({max_retries} retries left)"
+                );
 
-        let group_info_b64 = group_state
-            .get("groupInfo")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                CatmosError::Other(format!(
-                    "getGroupState response missing groupInfo for {convo_id}"
-                ))
-            })?;
+                // Request a GroupInfo refresh from other devices via SSE
+                if let Err(refresh_err) = self.request_group_info_refresh(service, convo_id).await {
+                    warn!(
+                        "try_external_commit: failed to request GroupInfo refresh for {convo_label}: {refresh_err}"
+                    );
+                    return Err(e);
+                }
+
+                info!(
+                    "try_external_commit: GroupInfo refresh requested for {convo_label}, \
+                     waiting 5s for iOS devices to publish"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                // Retry fetch
+                match self.fetch_group_info(service, convo_id).await {
+                    Ok(info) => {
+                        info!("try_external_commit: GroupInfo now available for {convo_label} after refresh");
+                        info
+                    }
+                    Err(retry_err) => {
+                        warn!(
+                            "try_external_commit: GroupInfo still unavailable for {convo_label} after refresh: {retry_err}"
+                        );
+                        return Err(retry_err);
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
 
         let group_info_bytes = BASE64.decode(group_info_b64).map_err(|e| {
             CatmosError::Other(format!("Invalid base64 groupInfo: {e}"))
@@ -300,6 +331,67 @@ impl MlsManager {
                 Err(e)
             }
         }
+    }
+
+    /// Fetch the base64-encoded GroupInfo for a conversation from the server.
+    async fn fetch_group_info(
+        &self,
+        service: &ChatService,
+        convo_id: &str,
+    ) -> Result<String> {
+        let group_state: serde_json::Value = service
+            .xrpc_query(
+                mls_chat::get_group_state::NSID,
+                &[("convoId", convo_id), ("include", "groupInfo")],
+            )
+            .await?;
+
+        debug!(
+            "fetch_group_info: getGroupState response keys: {:?}",
+            group_state
+                .as_object()
+                .map(|o| o.keys().collect::<Vec<_>>())
+        );
+
+        group_state
+            .get("groupInfo")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                CatmosError::Other(format!(
+                    "GroupInfoUnavailable: getGroupState response missing groupInfo for {convo_id}"
+                ))
+            })
+    }
+
+    /// Check whether an error indicates that GroupInfo is unavailable
+    /// (404 from the server or missing groupInfo field in the response).
+    fn is_group_info_unavailable(err: &CatmosError) -> bool {
+        let msg = err.to_string();
+        msg.contains("GroupInfoUnavailable")
+            || msg.contains("missing groupInfo")
+            || msg.contains("returned 404")
+    }
+
+    /// Ask the server to request a GroupInfo refresh from other devices.
+    /// This sends an SSE event so that iOS clients can publish fresh GroupInfo.
+    async fn request_group_info_refresh(
+        &self,
+        service: &ChatService,
+        convo_id: &str,
+    ) -> Result<()> {
+        let req = serde_json::json!({
+            "convoId": convo_id,
+            "action": "refreshGroupInfo"
+        });
+        let _: serde_json::Value = service
+            .xrpc_procedure(mls_chat::commit_group_change::NSID, &req)
+            .await?;
+        info!(
+            "request_group_info_refresh: sent refreshGroupInfo for {}",
+            &convo_id[..12.min(convo_id.len())]
+        );
+        Ok(())
     }
 
     /// Decrypt group metadata from MLS group context extensions.
