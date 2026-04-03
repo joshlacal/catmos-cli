@@ -398,26 +398,33 @@ struct CborMembershipChangePayload {
 /// The frame is two concatenated DAG-CBOR objects:
 /// 1. Header: `{ op: i32, t: Option<String> }` — op=1 means message, op=-1 means error
 /// 2. Payload: the event data with a `seq` field
+///
+/// We use `ciborium::de::from_reader` with a `Cursor` so it reads exactly one
+/// CBOR object and advances the cursor, letting us parse the payload from the
+/// remaining bytes. `serde_ipld_dagcbor::from_slice` cannot be used for the
+/// header because it expects to consume the entire input and fails with
+/// `TrailingData` when the payload follows.
 fn parse_dagcbor_frame(data: &[u8]) -> std::result::Result<ServerEvent, String> {
-    // Decode the header to find its size and check the op code.
-    let header: FrameHeader = serde_ipld_dagcbor::from_slice(data)
-        .map_err(|e| format!("Failed to decode DAG-CBOR header: {e}"))?;
+    use std::io::Cursor;
+
+    let mut cursor = Cursor::new(data);
+
+    // Parse header (first CBOR object) — ciborium reads exactly one value.
+    let header: FrameHeader = ciborium::de::from_reader(&mut cursor)
+        .map_err(|e| format!("Failed to decode CBOR header: {e}"))?;
 
     if header.op == -1 {
         return Err(format!("Server error frame (type: {:?})", header.t));
     }
 
-    // Re-encode the header to determine how many bytes it occupied.
-    // DAG-CBOR is deterministic, so re-encoding yields the same bytes.
-    let header_len = serde_ipld_dagcbor::to_vec(&header)
-        .map_err(|e| format!("Failed to re-encode header for size: {e}"))?
-        .len();
-
-    if header_len >= data.len() {
-        return Err("DAG-CBOR frame too short: no payload after header".into());
+    let pos = cursor.position() as usize;
+    if pos >= data.len() {
+        return Err("CBOR frame too short: no payload after header".into());
     }
 
-    let payload_bytes = &data[header_len..];
+    // The payload is the second CBOR object — a single, self-contained value,
+    // so `serde_ipld_dagcbor::from_slice` works fine on the remaining bytes.
+    let payload_bytes = &data[pos..];
 
     // Dispatch based on the header's type tag
     match header.t.as_deref() {
