@@ -598,7 +598,7 @@ impl ChatService {
         let resp: serde_json::Value = self
             .xrpc_query(
                 mls_chat::get_group_state::NSID,
-                &[("groupId", convo_id)],
+                &[("convoId", convo_id)],
             )
             .await?;
         Ok(resp)

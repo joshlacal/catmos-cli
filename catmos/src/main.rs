@@ -206,6 +206,17 @@ async fn init_service() -> anyhow::Result<ChatService> {
     match mls.ensure_registered(&service, &did, &db).await {
         Ok(device_info) => {
             info!("MLS device ready: {}", device_info.device_id);
+
+            // Fetch conversations and join any that lack local MLS state
+            match service.fetch_conversations().await {
+                Ok(convos) => {
+                    info!("Fetched {} conversations, joining missing groups...", convos.len());
+                    service.join_missing_conversations(&did).await;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch conversations for group joining: {e}");
+                }
+            }
         }
         Err(e) => {
             // Non-fatal: the user can still use non-MLS commands

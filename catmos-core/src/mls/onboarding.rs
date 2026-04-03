@@ -215,6 +215,8 @@ impl MlsManager {
         convo_id: &str,
         did: &str,
     ) -> Result<()> {
+        info!("try_external_commit: fetching groupInfo for convo {}", &convo_id[..12.min(convo_id.len())]);
+
         // 1. Fetch group info
         let group_state: serde_json::Value = service
             .xrpc_query(
@@ -222,6 +224,9 @@ impl MlsManager {
                 &[("convoId", convo_id), ("include", "groupInfo")],
             )
             .await?;
+
+        debug!("try_external_commit: getGroupState response keys: {:?}",
+            group_state.as_object().map(|o| o.keys().collect::<Vec<_>>()));
 
         let group_info_b64 = group_state
             .get("groupInfo")
@@ -235,6 +240,12 @@ impl MlsManager {
         let group_info_bytes = BASE64.decode(group_info_b64).map_err(|e| {
             CatmosError::Other(format!("Invalid base64 groupInfo: {e}"))
         })?;
+
+        info!(
+            "try_external_commit: decoded groupInfo for {} — {} bytes",
+            &convo_id[..12.min(convo_id.len())],
+            group_info_bytes.len()
+        );
 
         // 2. Create external commit
         let identity = did.as_bytes().to_vec();
@@ -436,11 +447,28 @@ impl ChatService {
     /// MLS state for, via external commit.
     pub async fn join_missing_conversations(&self, did: &str) {
         let convos = self.conversations.read().await.clone();
+        info!(
+            "join_missing_conversations: checking {} conversations for missing local MLS state",
+            convos.len()
+        );
+
+        let mut joined = 0u32;
+        let mut skipped = 0u32;
+        let mut failed = 0u32;
+
         for convo in &convos {
+            let convo_label = convo
+                .name
+                .as_deref()
+                .unwrap_or(&convo.group_id[..12.min(convo.group_id.len())]);
+
             // Check if we already have local state by trying to get the epoch
             let group_id_bytes = match hex::decode(&convo.group_id) {
                 Ok(b) => b,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!("join_missing_conversations: invalid hex group_id for {convo_label}: {e}");
+                    continue;
+                }
             };
 
             let has_local_state = self
@@ -448,23 +476,33 @@ impl ChatService {
                 .with_context(|ctx| ctx.get_epoch(group_id_bytes))
                 .is_ok();
 
-            if !has_local_state {
-                info!(
-                    "No local MLS state for convo {}, attempting external commit",
-                    &convo.group_id[..12.min(convo.group_id.len())]
-                );
-                match self
-                    .mls
-                    .join_via_external_commit(self, &convo.group_id, did)
-                    .await
-                {
-                    Ok(()) => info!("Joined {} via external commit", convo.group_id),
-                    Err(e) => warn!(
-                        "Failed to join {} via external commit: {e}",
-                        &convo.group_id[..12.min(convo.group_id.len())]
-                    ),
+            if has_local_state {
+                skipped += 1;
+                debug!("join_missing_conversations: {convo_label} — already have local state");
+                continue;
+            }
+
+            info!(
+                "join_missing_conversations: {convo_label} — no local MLS state, attempting external commit"
+            );
+            match self
+                .mls
+                .join_via_external_commit(self, &convo.group_id, did)
+                .await
+            {
+                Ok(()) => {
+                    joined += 1;
+                    info!("join_missing_conversations: {convo_label} — joined via external commit");
+                }
+                Err(e) => {
+                    failed += 1;
+                    warn!("join_missing_conversations: {convo_label} — external commit failed: {e}");
                 }
             }
         }
+
+        info!(
+            "join_missing_conversations: done — joined={joined}, skipped={skipped} (already had state), failed={failed}"
+        );
     }
 }
