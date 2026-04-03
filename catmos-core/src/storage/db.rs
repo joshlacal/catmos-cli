@@ -19,7 +19,7 @@ impl Database {
         let options = SqliteConnectOptions::from_str(&url)
             .map_err(|e| CatmosError::Storage(format!("Invalid DB path: {e}")))?
             .create_if_missing(true)
-            .pragma("key", encryption_key.to_string())
+            .pragma("key", format!("'{encryption_key}'"))
             .pragma("cipher_page_size", "4096".to_string())
             .pragma("journal_mode", "WAL".to_string());
 

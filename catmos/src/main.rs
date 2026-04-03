@@ -161,12 +161,13 @@ async fn init_service() -> anyhow::Result<ChatService> {
     let did = config
         .default_account
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("No account configured. Run `catmos login` first."))?;
+        .ok_or_else(|| anyhow::anyhow!("No account configured. Run `catmos login` first."))?
+        .to_string();
 
-    let account_dir = Config::account_data_dir(did)?;
+    let account_dir = Config::account_data_dir(&did)?;
     let db_path = account_dir.join("catmos.db");
 
-    let db_key = catmos_core::mls::context::get_or_create_db_key(did)?;
+    let db_key = catmos_core::mls::context::get_or_create_db_key(&did)?;
     let db = Database::open(&db_path, &db_key).await?;
 
     // Try to restore auth: OAuth first, then AppPassword
@@ -191,11 +192,24 @@ async fn init_service() -> anyhow::Result<ChatService> {
     };
 
     let mls_dir = Config::data_dir()?.join("mls");
-    let mls = Arc::new(MlsManager::new(&mls_dir, did)?);
+    let mls = Arc::new(MlsManager::new(&mls_dir, &did)?);
 
     let aliases = Arc::new(RwLock::new(AliasStore::load()?));
 
-    let service = ChatService::new(auth, mls, Arc::new(db), config, aliases);
+    let db = Arc::new(db);
+    let service = ChatService::new(auth, mls.clone(), db.clone(), config, aliases);
+
+    // Auto-register MLS device on startup (idempotent — skips if already registered)
+    match mls.ensure_registered(&service, &did, &db).await {
+        Ok(device_info) => {
+            info!("MLS device ready: {}", device_info.device_id);
+        }
+        Err(e) => {
+            // Non-fatal: the user can still use non-MLS commands
+            tracing::warn!("MLS device registration skipped: {e}");
+        }
+    }
+
     Ok(service)
 }
 
@@ -500,10 +514,14 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             }
             DeviceCommands::Register { name } => {
                 let svc = init_service().await?;
-                let device = svc.register_device(name.as_deref()).await?;
+                // Device is auto-registered in init_service, just report status
+                let did = svc.did().to_string();
+                let db = svc.db.clone();
+                let device_name = name.as_deref().unwrap_or("catmos-cli");
+                let info = svc.mls.register_device(&svc, &did, device_name, &db).await?;
                 println!(
-                    "Registered device: {} (id={})",
-                    device.device_name, device.device_id
+                    "Registered device: id={}, mls_did={}",
+                    info.device_id, info.mls_did
                 );
             }
         },

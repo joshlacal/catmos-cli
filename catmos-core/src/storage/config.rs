@@ -30,7 +30,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerConfig {
-                nest_url: "https://nest.catbird.blue".into(),
+                nest_url: "https://api.catbird.blue".into(),
                 mls_url: "https://mlschat.catbird.blue".into(),
             },
             ui: UiConfig {
@@ -48,7 +48,7 @@ impl Config {
     pub fn config_dir() -> Result<PathBuf> {
         let dir = dirs::config_dir()
             .ok_or_else(|| CatmosError::Config("Cannot determine config directory".into()))?
-            .join("catmos");
+            .join("catmos-cli");
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }
@@ -57,7 +57,7 @@ impl Config {
     pub fn data_dir() -> Result<PathBuf> {
         let dir = dirs::data_dir()
             .ok_or_else(|| CatmosError::Config("Cannot determine data directory".into()))?
-            .join("catmos");
+            .join("catmos-cli");
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }

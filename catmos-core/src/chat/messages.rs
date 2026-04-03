@@ -323,11 +323,14 @@ impl ChatService {
             .xrpc_query(mls_chat::get_convos::NSID, &[])
             .await?;
 
-        let convos: Vec<Conversation> = resp
+        let mut convos: Vec<Conversation> = resp
             .conversations
             .iter()
             .map(convo_resp_to_conversation)
             .collect();
+
+        // Attempt to decrypt MLS group metadata for richer names
+        self.apply_group_metadata(&mut convos);
 
         // Persist to local DB
         for convo in &convos {

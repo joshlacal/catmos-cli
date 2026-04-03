@@ -81,8 +81,8 @@ struct GetBlobUsageResp {
 pub struct ChatService {
     pub(crate) http: reqwest::Client,
     pub(crate) auth: AuthMethod,
-    pub(crate) mls: Arc<MlsManager>,
-    pub(crate) db: Arc<Database>,
+    pub mls: Arc<MlsManager>,
+    pub db: Arc<Database>,
     pub(crate) config: Config,
     pub(crate) aliases: Arc<RwLock<AliasStore>>,
     pub(crate) conversations: Arc<RwLock<Vec<Conversation>>>,
