@@ -7,6 +7,54 @@ use super::service::ChatService;
 use crate::error::{CatmosError, Result};
 use crate::types::{Conversation, Member, Message, MessageContent};
 
+// ── MLS message payload (matches iOS MLSMessagePayload) ─────────────────
+
+/// Encrypted message payload structure matching the iOS `MLSMessagePayload`.
+/// Encoded to JSON before MLS encryption.
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct MlsMessagePayload {
+    version: u32,
+    message_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reaction: Option<MlsReactionPayload>,
+    // embed, readReceipt, typing, adminRoster, adminAction omitted for now
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct MlsReactionPayload {
+    message_id: String,
+    emoji: String,
+    action: String, // "add" or "remove"
+}
+
+impl MlsMessagePayload {
+    fn text(content: &str) -> Self {
+        Self {
+            version: 1,
+            message_type: "text".to_string(),
+            text: Some(content.to_string()),
+            reaction: None,
+        }
+    }
+
+    fn reaction(message_id: &str, emoji: &str, action: &str) -> Self {
+        Self {
+            version: 1,
+            message_type: "reaction".to_string(),
+            text: None,
+            reaction: Some(MlsReactionPayload {
+                message_id: message_id.to_string(),
+                emoji: emoji.to_string(),
+                action: action.to_string(),
+            }),
+        }
+    }
+}
+
 // ── XRPC request/response structs ───────────────────────────────────────
 
 #[derive(Serialize)]
@@ -105,11 +153,8 @@ fn unpad(data: &[u8]) -> &[u8] {
 impl ChatService {
     /// Encrypt and send a text message to a conversation.
     pub async fn send_message(&self, convo_id: &str, text: &str) -> Result<Message> {
-        // Build the plaintext payload
-        let payload = serde_json::json!({
-            "type": "text",
-            "text": text,
-        });
+        // Build the plaintext payload (matches iOS MLSMessagePayload format)
+        let payload = MlsMessagePayload::text(text);
         let plaintext = serde_json::to_vec(&payload)?;
         let padded = pad_to_bucket(&plaintext);
 
@@ -351,9 +396,18 @@ impl ChatService {
 }
 
 /// Parse a decrypted JSON payload into a `MessageContent`.
+///
+/// Supports the iOS `MLSMessagePayload` format (field `messageType`) and the
+/// legacy catmos format (field `type`) for backwards compatibility.
 fn parse_message_content(plaintext: &str) -> MessageContent {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(plaintext) {
-        match v.get("type").and_then(|t| t.as_str()) {
+        // Determine message type — iOS uses "messageType", legacy used "type"
+        let msg_type = v
+            .get("messageType")
+            .or_else(|| v.get("type"))
+            .and_then(|t| t.as_str());
+
+        match msg_type {
             Some("text") => {
                 let text = v
                     .get("text")
@@ -363,18 +417,41 @@ fn parse_message_content(plaintext: &str) -> MessageContent {
                 MessageContent::Text(text)
             }
             Some("reaction") => {
-                let target = v
-                    .get("targetMessageId")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let emoji = v
-                    .get("emoji")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let action = match v.get("action").and_then(|a| a.as_str()) {
-                    Some("remove") => crate::types::ReactionAction::Remove,
+                // iOS nests reaction data under a "reaction" key
+                let reaction_obj = v.get("reaction");
+                let (target, emoji, action_str) = if let Some(r) = reaction_obj {
+                    (
+                        r.get("messageId")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        r.get("emoji")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        r.get("action")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("add"),
+                    )
+                } else {
+                    // Legacy flat format fallback
+                    (
+                        v.get("targetMessageId")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        v.get("emoji")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        v.get("action")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("add"),
+                    )
+                };
+
+                let action = match action_str {
+                    "remove" => crate::types::ReactionAction::Remove,
                     _ => crate::types::ReactionAction::Add,
                 };
                 MessageContent::Reaction {

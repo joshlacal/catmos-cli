@@ -69,3 +69,11 @@ pub struct KeyPackageStatus {
     pub target: u64,
     pub needs_replenish: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobUsage {
+    pub used_bytes: i64,
+    pub quota_bytes: i64,
+    pub blob_count: i64,
+}

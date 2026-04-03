@@ -174,6 +174,7 @@ async fn init_service() -> anyhow::Result<ChatService> {
         info!("Restored OAuth session for {did}");
         AuthMethod::OAuth {
             session_cookie: oauth.session_cookie,
+            did: oauth.did.clone(),
             nest_url: oauth.nest_url,
         }
     } else if let Some(ap) = AppPasswordAuth::load(&db)? {
@@ -607,10 +608,31 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             }
         },
 
-        // ── Blob (not yet implemented) ───────────────────────────────────
-        Commands::Blob(_) => {
-            println!("Blob commands not yet implemented");
-        }
+        // ── Blob ─────────────────────────────────────────────────────────
+        Commands::Blob(sub) => match sub {
+            BlobCommands::Upload { convo, file } => {
+                let svc = init_service().await?;
+                svc.fetch_conversations().await?;
+                let convo_id = svc.resolve_convo(&convo).await?;
+                let blob_id = svc.upload_blob(&convo_id, &file).await?;
+                println!("{blob_id}");
+            }
+            BlobCommands::Download { blob_id, output } => {
+                let svc = init_service().await?;
+                svc.download_blob(&blob_id, &output).await?;
+                println!("Downloaded blob {blob_id} -> {output}");
+            }
+            BlobCommands::Usage => {
+                let svc = init_service().await?;
+                let usage = svc.get_blob_usage().await?;
+                let used_mb = usage.used_bytes as f64 / (1024.0 * 1024.0);
+                let quota_mb = usage.quota_bytes as f64 / (1024.0 * 1024.0);
+                println!(
+                    "Blobs: {} ({:.1} / {:.1} MB used)",
+                    usage.blob_count, used_mb, quota_mb
+                );
+            }
+        },
 
         Commands::Chat => {
             unreachable!("handled in main");

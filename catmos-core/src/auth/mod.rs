@@ -5,6 +5,7 @@ pub mod oauth;
 pub enum AuthMethod {
     OAuth {
         session_cookie: String,
+        did: String,
         nest_url: String,
     },
     AppPassword {

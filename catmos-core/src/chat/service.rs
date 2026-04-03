@@ -11,7 +11,7 @@ use crate::mls::MlsManager;
 use crate::storage::aliases::AliasStore;
 use crate::storage::config::Config;
 use crate::storage::db::Database;
-use crate::types::{Conversation, Device, KeyPackageStatus};
+use crate::types::{BlobUsage, Conversation, Device, KeyPackageStatus};
 
 /// Central coordinator for chat operations: XRPC calls, message encryption,
 /// WebSocket subscriptions, and local storage.
@@ -47,7 +47,7 @@ impl ChatService {
     /// The authenticated user's DID.
     pub fn did(&self) -> &str {
         match &self.auth {
-            AuthMethod::OAuth { .. } => "",
+            AuthMethod::OAuth { did, .. } => did,
             AuthMethod::AppPassword { did, .. } => did,
         }
     }
@@ -355,11 +355,15 @@ impl ChatService {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
         let action = if remove { "remove" } else { "add" };
+        // Match the iOS MLSMessagePayload format with nested reaction object
         let payload = serde_json::json!({
-            "type": "reaction",
-            "targetMessageId": message_id,
-            "emoji": emoji,
-            "action": action,
+            "version": 1,
+            "messageType": "reaction",
+            "reaction": {
+                "messageId": message_id,
+                "emoji": emoji,
+                "action": action,
+            }
         });
         let plaintext = serde_json::to_vec(&payload)?;
 
@@ -491,6 +495,97 @@ impl ChatService {
         Ok(resp)
     }
 
+    // ── Blob operations ─────────────────────────────────────────────────
+
+    /// Upload a file as an encrypted blob associated with a conversation.
+    /// Returns the server-assigned blob ID.
+    pub async fn upload_blob(&self, convo_id: &str, file_path: &str) -> Result<String> {
+        let data = tokio::fs::read(file_path)
+            .await
+            .map_err(|e| CatmosError::Other(format!("Failed to read file {file_path}: {e}")))?;
+
+        let nsid = "blue.catbird.mlsChat.uploadBlob";
+        let (url, headers) = self.build_request(nsid)?;
+        debug!("XRPC POST {nsid} -> {url}");
+
+        let resp = self
+            .http
+            .post(&url)
+            .headers(headers)
+            .query(&[("convoId", convo_id)])
+            .header("content-type", "application/octet-stream")
+            .body(data)
+            .send()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(CatmosError::Xrpc(format!(
+                "{nsid} returned {status}: {body}"
+            )));
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct UploadResp {
+            blob_id: String,
+            size: i64,
+        }
+
+        let resp: UploadResp = resp
+            .json()
+            .await
+            .map_err(|e| CatmosError::Xrpc(format!("Failed to parse {nsid} response: {e}")))?;
+
+        debug!("Uploaded blob {} ({} bytes)", resp.blob_id, resp.size);
+        Ok(resp.blob_id)
+    }
+
+    /// Download a blob by ID and write it to the given output path.
+    pub async fn download_blob(&self, blob_id: &str, output_path: &str) -> Result<()> {
+        let nsid = "blue.catbird.mlsChat.getBlob";
+        let (url, headers) = self.build_request(nsid)?;
+        debug!("XRPC GET {nsid} -> {url}");
+
+        let resp = self
+            .http
+            .get(&url)
+            .headers(headers)
+            .query(&[("blobId", blob_id)])
+            .send()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(CatmosError::Xrpc(format!(
+                "{nsid} returned {status}: {body}"
+            )));
+        }
+
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        tokio::fs::write(output_path, &bytes)
+            .await
+            .map_err(|e| CatmosError::Other(format!("Failed to write {output_path}: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Get the authenticated user's blob storage usage stats.
+    pub async fn get_blob_usage(&self) -> Result<BlobUsage> {
+        let usage: BlobUsage = self
+            .xrpc_query("blue.catbird.mlsChat.getBlobUsage", &[])
+            .await?;
+        Ok(usage)
+    }
+
     /// Build the target URL and auth headers for an XRPC call.
     ///
     /// - OAuth: routes through nest (confidential client proxy)
@@ -502,11 +597,12 @@ impl ChatService {
             AuthMethod::OAuth {
                 session_cookie,
                 nest_url,
+                ..
             } => {
                 let url = format!("{nest_url}/xrpc/{nsid}");
                 headers.insert(
                     COOKIE,
-                    HeaderValue::from_str(&format!("session={session_cookie}"))
+                    HeaderValue::from_str(&format!("catbird_session={session_cookie}"))
                         .map_err(|e| CatmosError::AuthFailed(e.to_string()))?,
                 );
                 Ok((url, headers))

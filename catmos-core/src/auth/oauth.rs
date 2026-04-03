@@ -13,17 +13,25 @@ use crate::storage::db::Database;
 pub struct OAuthAuth {
     pub session_cookie: String,
     pub did: String,
+    pub handle: String,
     pub nest_url: String,
 }
 
+/// The callback from nest redirects to `http://127.0.0.1:{port}/callback?session_id={UUID}`.
 #[derive(serde::Deserialize)]
 struct CallbackParams {
-    session: Option<String>,
-    did: Option<String>,
+    session_id: Option<String>,
+}
+
+/// Response from `GET {nest_url}/auth/session` with the session cookie.
+#[derive(serde::Deserialize)]
+struct SessionResponse {
+    did: String,
+    handle: String,
 }
 
 struct CallbackState {
-    tx: std::sync::Mutex<Option<oneshot::Sender<(String, String)>>>,
+    tx: std::sync::Mutex<Option<oneshot::Sender<String>>>,
 }
 
 impl OAuthAuth {
@@ -31,7 +39,8 @@ impl OAuthAuth {
     ///
     /// 1. Bind a local TCP listener on a random port
     /// 2. Open the browser to the nest auth URL with a redirect back to localhost
-    /// 3. Wait up to 2 minutes for the callback with session + DID
+    /// 3. Wait up to 2 minutes for the callback with session_id
+    /// 4. Exchange session_id for DID and handle via `GET /auth/session`
     pub async fn login(handle: &str, nest_url: &str) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -42,13 +51,13 @@ impl OAuthAuth {
             .map_err(|e| CatmosError::Network(e.to_string()))?
             .port();
 
-        let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+        let redirect_to = format!("http://127.0.0.1:{port}/callback");
         let auth_url = format!(
-            "{nest_url}/auth/login?handle={handle}&redirect_uri={redirect_uri}&client=catmos"
+            "{nest_url}/auth/login?identifier={handle}&client=catmos-web&redirect_to={redirect_to}"
         );
 
-        // Channel for the callback result
-        let (tx, rx) = oneshot::channel::<(String, String)>();
+        // Channel for the callback result (just the session_id)
+        let (tx, rx) = oneshot::channel::<String>();
         let state = Arc::new(CallbackState {
             tx: std::sync::Mutex::new(Some(tx)),
         });
@@ -69,7 +78,7 @@ impl OAuthAuth {
         let timeout = tokio::time::Duration::from_secs(120);
 
         // Race the server against a 2-minute timeout
-        let result = tokio::select! {
+        let session_id = tokio::select! {
             result = rx => {
                 result.map_err(|_| CatmosError::AuthFailed("callback channel closed".into()))
             }
@@ -84,11 +93,31 @@ impl OAuthAuth {
             }
         }?;
 
-        let (session_cookie, did) = result;
+        // Exchange session_id for DID + handle via GET /auth/session
+        let http = reqwest::Client::new();
+        let session_resp = http
+            .get(format!("{nest_url}/auth/session"))
+            .header("Cookie", format!("catbird_session={session_id}"))
+            .send()
+            .await
+            .map_err(|e| CatmosError::Network(format!("failed to fetch session: {e}")))?;
+
+        if !session_resp.status().is_success() {
+            let body = session_resp.text().await.unwrap_or_default();
+            return Err(CatmosError::AuthFailed(format!(
+                "session endpoint returned error: {body}"
+            )));
+        }
+
+        let session_info: SessionResponse = session_resp
+            .json()
+            .await
+            .map_err(|e| CatmosError::AuthFailed(format!("failed to parse session response: {e}")))?;
 
         Ok(Self {
-            session_cookie,
-            did,
+            session_cookie: session_id,
+            did: session_info.did,
+            handle: session_info.handle,
             nest_url: nest_url.to_string(),
         })
     }
@@ -98,6 +127,7 @@ impl OAuthAuth {
         db.store_session_value("auth_method", "oauth")?;
         db.store_session_value("session_cookie", &self.session_cookie)?;
         db.store_session_value("did", &self.did)?;
+        db.store_session_value("handle", &self.handle)?;
         db.store_session_value("nest_url", &self.nest_url)?;
         Ok(())
     }
@@ -111,12 +141,14 @@ impl OAuthAuth {
 
         let session_cookie = db.get_session_value("session_cookie")?;
         let did = db.get_session_value("did")?;
+        let handle = db.get_session_value("handle")?;
         let nest_url = db.get_session_value("nest_url")?;
 
         match (session_cookie, did, nest_url) {
             (Some(session_cookie), Some(did), Some(nest_url)) => Ok(Some(Self {
                 session_cookie,
                 did,
+                handle: handle.unwrap_or_default(),
                 nest_url,
             })),
             _ => Ok(None),
@@ -128,19 +160,19 @@ async fn handle_callback(
     State(state): State<Arc<CallbackState>>,
     Query(params): Query<CallbackParams>,
 ) -> Html<String> {
-    let (session, did) = match (params.session, params.did) {
-        (Some(s), Some(d)) => (s, d),
-        _ => {
+    let session_id = match params.session_id {
+        Some(s) => s,
+        None => {
             return Html(
-                "<html><body><h1>Login failed</h1><p>Missing session or DID parameter.</p></body></html>"
+                "<html><body><h1>Login failed</h1><p>Missing session_id parameter.</p></body></html>"
                     .to_string(),
             );
         }
     };
 
-    // Send result through the channel
+    // Send session_id through the channel
     if let Some(tx) = state.tx.lock().unwrap().take() {
-        let _ = tx.send((session, did));
+        let _ = tx.send(session_id);
     }
 
     Html(
