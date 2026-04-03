@@ -421,8 +421,63 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 println!("Unread:       {}", c.unread_count);
             }
 
-            _ => {
-                println!("Not yet implemented");
+            ConvoCommands::Join { convo_id } => {
+                let svc = init_service().await?;
+                svc.join_conversation(&convo_id).await?;
+                println!("Joined conversation {}", &convo_id[..12.min(convo_id.len())]);
+            }
+
+            ConvoCommands::Update {
+                convo,
+                name,
+                description,
+            } => {
+                let svc = init_service().await?;
+                svc.fetch_conversations().await?;
+                let convo_id = svc.resolve_convo(&convo).await?;
+                svc.update_conversation(
+                    &convo_id,
+                    name.as_deref(),
+                    description.as_deref(),
+                )
+                .await?;
+                println!("Updated conversation {convo}");
+            }
+
+            ConvoCommands::AddMember { convo, did } => {
+                let svc = init_service().await?;
+                svc.fetch_conversations().await?;
+                let convo_id = svc.resolve_convo(&convo).await?;
+                svc.add_member(&convo_id, &did).await?;
+                println!("Added {did} to {convo}");
+            }
+
+            ConvoCommands::RemoveMember { convo, did } => {
+                let svc = init_service().await?;
+                svc.fetch_conversations().await?;
+                let convo_id = svc.resolve_convo(&convo).await?;
+                svc.remove_member(&convo_id, &did).await?;
+                println!("Removed {did} from {convo}");
+            }
+
+            ConvoCommands::Promote {
+                convo,
+                did,
+                admin,
+                moderator,
+            } => {
+                let svc = init_service().await?;
+                svc.fetch_conversations().await?;
+                let convo_id = svc.resolve_convo(&convo).await?;
+                svc.promote_member(&convo_id, &did, admin, moderator).await?;
+                let role = if admin {
+                    "admin"
+                } else if moderator {
+                    "moderator"
+                } else {
+                    "member"
+                };
+                println!("Promoted {did} to {role} in {convo}");
             }
         },
 
@@ -442,8 +497,13 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     }
                 }
             }
-            _ => {
-                println!("Not yet implemented");
+            DeviceCommands::Register { name } => {
+                let svc = init_service().await?;
+                let device = svc.register_device(name.as_deref()).await?;
+                println!(
+                    "Registered device: {} (id={})",
+                    device.device_name, device.device_id
+                );
             }
         },
 
@@ -457,8 +517,10 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     status.available, status.target, status.needs_replenish
                 );
             }
-            _ => {
-                println!("Not yet implemented");
+            KeyPackageCommands::Replenish => {
+                let svc = init_service().await?;
+                let accepted = svc.replenish_key_packages().await?;
+                println!("Published key packages: {accepted} accepted");
             }
         },
 
@@ -489,12 +551,65 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             }
         },
 
-        // ── Not yet implemented ──────────────────────────────────────────
-        Commands::React { .. }
-        | Commands::Unreact { .. }
-        | Commands::Debug(_)
-        | Commands::Blob(_) => {
-            println!("Not yet implemented");
+        // ── Reactions ─────────────────────────────────────────────────────
+        Commands::React {
+            convo,
+            message_id,
+            emoji,
+        } => {
+            let svc = init_service().await?;
+            svc.fetch_conversations().await?;
+            let convo_id = svc.resolve_convo(&convo).await?;
+            svc.send_reaction(&convo_id, &message_id, &emoji, false)
+                .await?;
+            println!("Reacted {emoji} to {message_id}");
+        }
+
+        Commands::Unreact {
+            convo,
+            message_id,
+            emoji,
+        } => {
+            let svc = init_service().await?;
+            svc.fetch_conversations().await?;
+            let convo_id = svc.resolve_convo(&convo).await?;
+            svc.send_reaction(&convo_id, &message_id, &emoji, true)
+                .await?;
+            println!("Removed reaction {emoji} from {message_id}");
+        }
+
+        // ── Debug ────────────────────────────────────────────────────────
+        Commands::Debug(sub) => match sub {
+            DebugCommands::Epoch { convo } => {
+                let svc = init_service().await?;
+                svc.fetch_conversations().await?;
+                let convo_id = svc.resolve_convo(&convo).await?;
+                match svc.get_epoch(&convo_id) {
+                    Ok(epoch) => println!("Local MLS epoch: {epoch}"),
+                    Err(e) => println!("Failed to read local epoch: {e}"),
+                }
+            }
+            DebugCommands::GroupState { convo } => {
+                let svc = init_service().await?;
+                svc.fetch_conversations().await?;
+                let convo_id = svc.resolve_convo(&convo).await?;
+                let state = svc.get_group_state(&convo_id).await?;
+                println!("{}", serde_json::to_string_pretty(&state)?);
+            }
+            DebugCommands::TreeHash { convo } => {
+                let svc = init_service().await?;
+                svc.fetch_conversations().await?;
+                let convo_id = svc.resolve_convo(&convo).await?;
+                match svc.get_tree_hash(&convo_id) {
+                    Ok(hash) => println!("Tree hash: {}", hex::encode(&hash)),
+                    Err(e) => println!("Failed to read tree hash: {e}"),
+                }
+            }
+        },
+
+        // ── Blob (not yet implemented) ───────────────────────────────────
+        Commands::Blob(_) => {
+            println!("Blob commands not yet implemented");
         }
 
         Commands::Chat => {

@@ -102,7 +102,60 @@ pub async fn run() -> anyhow::Result<()> {
     terminal.clear()?;
 
     // ── 7. Event loop ──────────────────────────────────────────────────
-    let (mut events, _event_tx) = EventLoop::new(250);
+    let (mut events, event_tx) = EventLoop::new(250);
+
+    // ── 7a. Start WebSocket subscription ──────────────────────────────
+    // Call subscribe() on the current task (ChatService isn't Send due to
+    // rusqlite internals), then hand only the receiver to the spawned task.
+    match service.subscribe().await {
+        Ok(mut ws_rx) => {
+            let ws_tx = event_tx.clone();
+            tokio::spawn(async move {
+                info!("WebSocket subscription active");
+                while let Some(ws_event) = ws_rx.recv().await {
+                    match ws_event {
+                        catmos_core::chat::WsEvent::Message {
+                            convo_id,
+                            plaintext,
+                            sender_did,
+                            message_id,
+                            epoch,
+                            seq,
+                        } => {
+                            let content = parse_ws_plaintext(&plaintext);
+                            let msg = catmos_core::types::Message {
+                                id: message_id,
+                                convo_id,
+                                sender_did,
+                                content,
+                                epoch,
+                                seq,
+                                created_at: chrono::Utc::now(),
+                            };
+                            if ws_tx.send(AppEvent::ChatMessage(msg)).is_err() {
+                                break;
+                            }
+                        }
+                        catmos_core::chat::WsEvent::Error(e) => {
+                            error!("WebSocket error: {e}");
+                            let _ = ws_tx.send(AppEvent::Error(e));
+                        }
+                        catmos_core::chat::WsEvent::Reconnecting => {
+                            info!("WebSocket reconnecting...");
+                        }
+                        _ => {
+                            // Typing, MemberJoined, MemberLeft, EpochAdvanced,
+                            // Reaction — future enhancements
+                        }
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            error!("Failed to start WebSocket subscription: {e}");
+            // Non-fatal: TUI still works without live updates
+        }
+    }
 
     let result = main_loop(&mut terminal, &mut app, &mut events).await;
 
@@ -250,5 +303,53 @@ async fn reload_messages(app: &mut App) {
             Ok(msgs) => app.messages = msgs,
             Err(e) => error!("Failed to fetch messages: {e}"),
         }
+    }
+}
+
+/// Parse a WebSocket plaintext JSON payload into a `MessageContent`.
+fn parse_ws_plaintext(plaintext: &str) -> catmos_core::types::MessageContent {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(plaintext) {
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                let text = v
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                catmos_core::types::MessageContent::Text(text)
+            }
+            Some("reaction") => {
+                let target = v
+                    .get("targetMessageId")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let emoji = v
+                    .get("emoji")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let action = match v.get("action").and_then(|a| a.as_str()) {
+                    Some("remove") => catmos_core::types::ReactionAction::Remove,
+                    _ => catmos_core::types::ReactionAction::Add,
+                };
+                catmos_core::types::MessageContent::Reaction {
+                    target_message_id: target,
+                    emoji,
+                    action,
+                }
+            }
+            Some("system") => {
+                let text = v
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                catmos_core::types::MessageContent::System(text)
+            }
+            _ => catmos_core::types::MessageContent::Unknown,
+        }
+    } else {
+        catmos_core::types::MessageContent::Text(plaintext.to_string())
     }
 }
