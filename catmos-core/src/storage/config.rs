@@ -8,6 +8,9 @@ use crate::error::{CatmosError, Result};
 pub struct Config {
     pub server: ServerConfig,
     pub ui: UiConfig,
+    /// DID of the currently active account (e.g. "did:plc:abc123").
+    #[serde(default)]
+    pub default_account: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +38,7 @@ impl Default for Config {
                 member_panel_visible: false,
                 timestamp_format: "%H:%M".into(),
             },
+            default_account: None,
         }
     }
 }

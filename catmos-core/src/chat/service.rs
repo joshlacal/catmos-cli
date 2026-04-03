@@ -11,7 +11,7 @@ use crate::mls::MlsManager;
 use crate::storage::aliases::AliasStore;
 use crate::storage::config::Config;
 use crate::storage::db::Database;
-use crate::types::Conversation;
+use crate::types::{Conversation, Device, KeyPackageStatus};
 
 /// Central coordinator for chat operations: XRPC calls, message encryption,
 /// WebSocket subscriptions, and local storage.
@@ -128,6 +128,80 @@ impl ChatService {
         resp.json::<R>()
             .await
             .map_err(|e| CatmosError::Xrpc(format!("Failed to parse {nsid} response: {e}")))
+    }
+
+    // ── Conversation management ──────────────────────────────────────────
+
+    /// Create a new MLS group conversation on the server.
+    pub async fn create_conversation(
+        &self,
+        name: &str,
+        members: &[String],
+        description: Option<&str>,
+    ) -> Result<Conversation> {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Req {
+            name: String,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            members: Vec<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            description: Option<String>,
+        }
+
+        let req = Req {
+            name: name.to_string(),
+            members: members.to_vec(),
+            description: description.map(String::from),
+        };
+
+        let convo: Conversation = self
+            .xrpc_procedure("blue.catbird.mlsChat.createConvo", &req)
+            .await?;
+
+        Ok(convo)
+    }
+
+    /// Leave (remove self from) a conversation.
+    pub async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Req {
+            group_id: String,
+        }
+
+        let req = Req {
+            group_id: convo_id.to_string(),
+        };
+
+        let _: serde_json::Value = self
+            .xrpc_procedure("blue.catbird.mlsChat.leaveConvo", &req)
+            .await?;
+
+        Ok(())
+    }
+
+    /// List devices registered for the authenticated user.
+    pub async fn list_devices(&self) -> Result<Vec<Device>> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            devices: Vec<Device>,
+        }
+
+        let resp: Resp = self
+            .xrpc_query("blue.catbird.mlsChat.getDevices", &[])
+            .await?;
+
+        Ok(resp.devices)
+    }
+
+    /// Get the current key package availability status.
+    pub async fn get_key_package_status(&self) -> Result<KeyPackageStatus> {
+        let status: KeyPackageStatus = self
+            .xrpc_query("blue.catbird.mlsChat.getKeyPackageStatus", &[])
+            .await?;
+
+        Ok(status)
     }
 
     /// Build the target URL and auth headers for an XRPC call.
