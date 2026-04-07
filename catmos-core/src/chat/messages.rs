@@ -4,6 +4,7 @@ use std::time::Instant;
 use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use catbird_atproto::catbird::mls_chat;
@@ -236,6 +237,15 @@ impl ChatService {
         let encrypt_result = self
             .mls
             .with_context(|ctx| ctx.encrypt_message(group_id_bytes.clone(), plaintext.clone()))?;
+
+        // Track own commit for dedup (spec §5.4)
+        {
+            let hash: [u8; 32] = Sha256::digest(&encrypt_result.ciphertext).into();
+            let mut own = self.own_commits.lock().await;
+            own.insert(hash, Instant::now());
+            // Expire entries older than 5 minutes
+            own.retain(|_, ts| ts.elapsed() < std::time::Duration::from_secs(300));
+        }
 
         let epoch = self.get_epoch(convo_id).unwrap_or(0);
         let msg_id = ulid::Ulid::new().to_string();
@@ -641,6 +651,14 @@ impl ChatService {
                 let ciphertext = base64::engine::general_purpose::STANDARD
                     .decode(&entry.ciphertext.bytes)
                     .map_err(|e| CatmosError::Other(format!("Invalid base64 ciphertext: {e}")))?;
+
+                // Own-commit dedup (spec §5.4): skip commits we sent ourselves
+                let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
+                if self.own_commits.lock().await.remove(&hash).is_some() {
+                    debug!("sync: skipping own commit {} epoch={}", entry.id, entry.epoch);
+                    total_processed += 1;
+                    continue;
+                }
 
                 match self
                     .mls
