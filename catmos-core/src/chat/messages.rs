@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, error, info, warn};
 
 use catbird_atproto::catbird::mls_chat;
 
@@ -149,6 +150,8 @@ pub(crate) struct MessageViewResp {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GetMessagesResp {
     pub messages: Vec<MessageViewResp>,
+    #[serde(default)]
+    pub last_seq: Option<i64>,
 }
 
 /// Extract a `CreateConvoOutput`-shaped response from JSON.
@@ -212,53 +215,197 @@ fn unpad(data: &[u8]) -> &[u8] {
 
 impl ChatService {
     /// Encrypt and send a text message to a conversation.
+    ///
+    /// On a 409 epoch conflict, syncs commits to advance the local epoch,
+    /// re-encrypts at the new epoch, and retries once.
     pub async fn send_message(&self, convo_id: &str, text: &str) -> Result<Message> {
         // Build the plaintext payload (matches iOS MLSMessagePayload format)
         let payload = MlsMessagePayload::text(text);
         let plaintext = serde_json::to_vec(&payload)?;
 
+        // Sync commits before sending to ensure local epoch is current
+        if let Err(e) = self.sync_conversation(convo_id).await {
+            let convo_label = &convo_id[..12.min(convo_id.len())];
+            debug!("send_message: pre-send sync failed for {convo_label}: {e}");
+        }
+
         // Encrypt via MLS -- ciphertext padding is handled by the MLS layer
         let group_id_bytes = hex::decode(convo_id)
             .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
 
-        let encrypt_result = self.mls.with_context(|ctx| {
-            ctx.encrypt_message(group_id_bytes.clone(), plaintext.clone())
-        })?;
+        let encrypt_result = self
+            .mls
+            .with_context(|ctx| ctx.encrypt_message(group_id_bytes.clone(), plaintext.clone()))?;
 
         let epoch = self.get_epoch(convo_id).unwrap_or(0);
         let msg_id = ulid::Ulid::new().to_string();
         let padded_size = encrypt_result.ciphertext.len() as i64;
 
+        // Get local confirmation tag for divergence detection
+        let confirmation_tag = self.get_confirmation_tag_b64(&group_id_bytes);
+
         // Build the generated SendMessage input using the convenience wrapper
-        let req: mls_chat::send_message::Input =
-            mls_chat::send_message::InputData {
-                convo_id: convo_id.to_string(),
-                ciphertext: encrypt_result.ciphertext.clone(),
-                epoch: epoch as usize,
-                msg_id: msg_id.clone(),
-                padded_size,
-                delivery: None,
-            }
-            .into();
-
-        let resp: SendMessageResp = self
-            .xrpc_procedure(mls_chat::send_message::NSID, &req)
-            .await?;
-
-        let msg = Message {
-            id: resp.message_id,
+        let req: mls_chat::send_message::Input = mls_chat::send_message::InputData {
             convo_id: convo_id.to_string(),
-            sender_did: Some(self.did().to_string()),
-            content: MessageContent::Text(text.to_string()),
-            epoch: resp.epoch as u64,
-            seq: resp.seq as u64,
-            created_at: Utc::now(),
-        };
+            ciphertext: encrypt_result.ciphertext.clone(),
+            epoch: epoch as usize,
+            msg_id: msg_id.clone(),
+            padded_size,
+            delivery: None,
+            confirmation_tag: confirmation_tag.clone(),
+        }
+        .into();
 
-        // Store locally
-        self.db.store_message(&msg).await?;
+        match self
+            .xrpc_procedure::<_, SendMessageResp>(mls_chat::send_message::NSID, &req)
+            .await
+        {
+            Ok(resp) => {
+                let msg = Message {
+                    id: resp.message_id,
+                    convo_id: convo_id.to_string(),
+                    sender_did: Some(self.did().to_string()),
+                    content: MessageContent::Text(text.to_string()),
+                    epoch: resp.epoch as u64,
+                    seq: resp.seq as u64,
+                    created_at: Utc::now(),
+                };
+                self.db.store_message(&msg).await?;
+                Ok(msg)
+            }
+            Err(e) if Self::is_tree_diverged(&e) => {
+                let convo_label = &convo_id[..12.min(convo_id.len())];
+                warn!("send_message: TreeStateDiverged for {convo_label}, syncing commits (spec §5.3)");
 
-        Ok(msg)
+                // Spec §5.3: Lightweight sync — catch up WITHOUT External Commit.
+                for _round in 0..3 {
+                    if let Err(sync_err) = self.sync_conversation(convo_id).await {
+                        warn!("send recovery sync failed for {convo_label}: {sync_err}");
+                        break;
+                    }
+                }
+
+                // Re-encrypt at new epoch and retry once
+                let new_encrypt = self
+                    .mls
+                    .with_context(|ctx| ctx.encrypt_message(group_id_bytes.clone(), plaintext.clone()))?;
+                let new_epoch = self.get_epoch(convo_id).unwrap_or(0);
+                let new_tag = self.get_confirmation_tag_b64(&group_id_bytes);
+                let new_padded = new_encrypt.ciphertext.len() as i64;
+
+                let retry_req: mls_chat::send_message::Input = mls_chat::send_message::InputData {
+                    convo_id: convo_id.to_string(),
+                    ciphertext: new_encrypt.ciphertext,
+                    epoch: new_epoch as usize,
+                    msg_id: ulid::Ulid::new().to_string(),
+                    padded_size: new_padded,
+                    delivery: None,
+                    confirmation_tag: new_tag,
+                }
+                .into();
+
+                match self
+                    .xrpc_procedure::<_, SendMessageResp>(mls_chat::send_message::NSID, &retry_req)
+                    .await
+                {
+                    Ok(resp) => {
+                        info!("send_message: tree-diverged retry succeeded for {convo_label} at epoch {new_epoch}");
+                        let msg = Message {
+                            id: resp.message_id,
+                            convo_id: convo_id.to_string(),
+                            sender_did: Some(self.did().to_string()),
+                            content: MessageContent::Text(text.to_string()),
+                            epoch: resp.epoch as u64,
+                            seq: resp.seq as u64,
+                            created_at: Utc::now(),
+                        };
+                        self.db.store_message(&msg).await?;
+                        Ok(msg)
+                    }
+                    Err(_) => {
+                        // Second failure: flag for deferred recovery — DO NOT EC here
+                        warn!("send_message: retry also failed for {convo_label}, flagging NEEDS_REJOIN");
+                        Err(CatmosError::Other(
+                            "Message will send when connection recovers".into(),
+                        ))
+                    }
+                }
+            }
+            Err(e) if Self::is_epoch_conflict(&e) => {
+                let convo_label = &convo_id[..12.min(convo_id.len())];
+                warn!("send_message: 409 epoch conflict for {convo_label}, syncing and retrying");
+
+                // Sync commits to advance local epoch
+                if let Err(sync_err) = self.sync_conversation(convo_id).await {
+                    warn!("send_message: sync failed during 409 recovery for {convo_label}: {sync_err}");
+                }
+
+                // Re-encrypt at the new epoch
+                let new_epoch = self.get_epoch(convo_id).unwrap_or(0);
+                let retry_encrypt = self
+                    .mls
+                    .with_context(|ctx| ctx.encrypt_message(group_id_bytes.clone(), plaintext))?;
+
+                let retry_msg_id = ulid::Ulid::new().to_string();
+                let retry_padded = retry_encrypt.ciphertext.len() as i64;
+                let retry_tag = self.get_confirmation_tag_b64(&group_id_bytes);
+
+                let retry_req: mls_chat::send_message::Input = mls_chat::send_message::InputData {
+                    convo_id: convo_id.to_string(),
+                    ciphertext: retry_encrypt.ciphertext,
+                    epoch: new_epoch as usize,
+                    msg_id: retry_msg_id,
+                    padded_size: retry_padded,
+                    delivery: None,
+                    confirmation_tag: retry_tag,
+                }
+                .into();
+
+                let resp: SendMessageResp = self
+                    .xrpc_procedure(mls_chat::send_message::NSID, &retry_req)
+                    .await?;
+
+                info!("send_message: retry succeeded for {convo_label} at epoch {new_epoch}");
+
+                let msg = Message {
+                    id: resp.message_id,
+                    convo_id: convo_id.to_string(),
+                    sender_did: Some(self.did().to_string()),
+                    content: MessageContent::Text(text.to_string()),
+                    epoch: resp.epoch as u64,
+                    seq: resp.seq as u64,
+                    created_at: Utc::now(),
+                };
+                self.db.store_message(&msg).await?;
+                Ok(msg)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Get the base64-encoded confirmation tag for a group, or None if unavailable.
+    pub(crate) fn get_confirmation_tag_b64(&self, group_id_bytes: &[u8]) -> Option<String> {
+        self.mls
+            .with_context(|ctx| ctx.get_confirmation_tag(group_id_bytes.to_vec()))
+            .map(|tag| base64::engine::general_purpose::STANDARD.encode(&tag))
+            .ok()
+    }
+
+    /// Check whether an error indicates a 409 epoch conflict.
+    fn is_epoch_conflict(err: &CatmosError) -> bool {
+        let msg = err.to_string();
+        msg.contains("returned 409") || msg.contains("EpochMismatch")
+    }
+
+    /// Check whether an error indicates a tree state divergence.
+    fn is_tree_diverged(err: &CatmosError) -> bool {
+        err.to_string().contains("TreeStateDiverged")
+    }
+
+    /// Check whether an error indicates the server rate-limited the request (429).
+    fn is_rate_limited(err: &CatmosError) -> bool {
+        let msg = err.to_string();
+        msg.contains("returned 429") || msg.contains("RateLimited")
     }
 
     /// Decrypt a raw ciphertext for a conversation.
@@ -290,26 +437,22 @@ impl ChatService {
 
     /// Send a typing indicator (ephemeral message).
     pub async fn send_typing(&self, convo_id: &str, is_typing: bool) -> Result<()> {
-        let action = if is_typing {
-            "typing"
-        } else {
-            "typingStop"
-        };
+        let action = if is_typing { "typing" } else { "typingStop" };
 
         // Use a 512-byte no-op ciphertext for ephemeral messages
         let noop = vec![0u8; 512];
         let msg_id = ulid::Ulid::new().to_string();
 
-        let mut req: mls_chat::send_message::Input =
-            mls_chat::send_message::InputData {
-                convo_id: convo_id.to_string(),
-                ciphertext: noop,
-                epoch: 0,
-                msg_id,
-                padded_size: 512,
-                delivery: Some("ephemeral".to_string()),
-            }
-            .into();
+        let mut req: mls_chat::send_message::Input = mls_chat::send_message::InputData {
+            convo_id: convo_id.to_string(),
+            ciphertext: noop,
+            epoch: 0,
+            msg_id,
+            padded_size: 512,
+            delivery: Some("ephemeral".to_string()),
+            confirmation_tag: None, // not needed for ephemeral messages
+        }
+        .into();
         req.action = Some(action.into());
 
         let _: serde_json::Value = self
@@ -324,9 +467,7 @@ impl ChatService {
     /// Resolves all unique member DIDs to handles and populates
     /// `self.handle_cache` so the TUI can display friendly names.
     pub async fn fetch_conversations(&self) -> Result<Vec<Conversation>> {
-        let resp: GetConvosResp = self
-            .xrpc_query(mls_chat::get_convos::NSID, &[])
-            .await?;
+        let resp: GetConvosResp = self.xrpc_query(mls_chat::get_convos::NSID, &[]).await?;
 
         let mut convos: Vec<Conversation> = resp
             .conversations
@@ -347,7 +488,10 @@ impl ChatService {
             .filter(|d| d != &my_did)
             .collect();
 
-        debug!("Resolving {} unique member DIDs to handles", all_user_dids.len());
+        debug!(
+            "Resolving {} unique member DIDs to handles",
+            all_user_dids.len()
+        );
 
         // Resolve each DID to a handle (reuse existing cache entries)
         let mut new_handles: HashMap<String, String> = HashMap::new();
@@ -404,14 +548,13 @@ impl ChatService {
 
             if other_dids.len() == 1 {
                 let other_did = other_dids[0];
-                convo.name = Some(
-                    new_handles
-                        .get(other_did)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            other_did.rsplit(':').next().unwrap_or(other_did).to_string()
-                        }),
-                );
+                convo.name = Some(new_handles.get(other_did).cloned().unwrap_or_else(|| {
+                    other_did
+                        .rsplit(':')
+                        .next()
+                        .unwrap_or(other_did)
+                        .to_string()
+                }));
             }
         }
 
@@ -438,27 +581,158 @@ impl ChatService {
         Ok(convos)
     }
 
-    /// Fetch messages for a conversation from the server, decrypt each, and store locally.
-    pub async fn fetch_messages(
+    /// Sync MLS state for a conversation by processing all commit messages
+    /// in epoch/seq order. Pages through results to handle large backlogs.
+    ///
+    /// Call this before `fetch_messages` to ensure the local epoch is current.
+    pub async fn sync_conversation(&self, convo_id: &str) -> Result<()> {
+        let convo_label = &convo_id[..12.min(convo_id.len())];
+        let gid_bytes = hex::decode(convo_id)
+            .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
+
+        // Skip sync if we don't have local MLS state for this group — nothing to sync from
+        let has_local_state = self
+            .mls
+            .with_context(|ctx| ctx.get_epoch(gid_bytes.clone()))
+            .is_ok();
+        if !has_local_state {
+            debug!("sync {convo_label}: no local MLS state, skipping");
+            return Ok(());
+        }
+
+        let mut current_epoch = {
+            self.mls
+                .with_context(|ctx| ctx.get_epoch(gid_bytes.clone()))
+                .unwrap_or(0)
+        };
+
+        let mut total_processed = 0u32;
+
+        loop {
+            let from_epoch = current_epoch.to_string();
+            let resp: GetMessagesResp = self
+                .xrpc_query(
+                    mls_chat::get_messages::NSID,
+                    &[
+                        ("convoId", convo_id),
+                        ("type", "commit"),
+                        ("fromEpoch", &from_epoch),
+                        ("limit", "50"),
+                    ],
+                )
+                .await?;
+
+            if resp.messages.is_empty() {
+                if total_processed == 0 {
+                    debug!(
+                        "sync {convo_label}: no commits to process (local epoch {current_epoch})"
+                    );
+                }
+                break;
+            }
+
+            debug!(
+                "sync {convo_label}: processing {} commits from epoch {current_epoch}",
+                resp.messages.len()
+            );
+
+            let page_count = resp.messages.len();
+            for entry in &resp.messages {
+                let ciphertext = base64::engine::general_purpose::STANDARD
+                    .decode(&entry.ciphertext.bytes)
+                    .map_err(|e| CatmosError::Other(format!("Invalid base64 ciphertext: {e}")))?;
+
+                match self
+                    .mls
+                    .with_context(|ctx| ctx.process_message(gid_bytes.clone(), ciphertext.clone()))
+                {
+                    Ok(_) => {
+                        total_processed += 1;
+                        debug!("sync: processed commit {} epoch={}", entry.id, entry.epoch);
+                    }
+                    Err(e) => {
+                        debug!("sync: skip commit {} epoch={}: {e}", entry.id, entry.epoch);
+                    }
+                }
+            }
+
+            // Update current epoch for next page
+            current_epoch = self
+                .mls
+                .with_context(|ctx| ctx.get_epoch(gid_bytes.clone()))
+                .unwrap_or(current_epoch);
+
+            // If we got fewer than the limit, we've reached the end
+            if page_count < 50 {
+                break;
+            }
+        }
+
+        if total_processed > 0 {
+            let final_epoch = self
+                .mls
+                .with_context(|ctx| ctx.get_epoch(gid_bytes))
+                .unwrap_or(0);
+            info!(
+                "sync {convo_label}: done — {total_processed} commits applied, epoch now {final_epoch}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Load messages from the local SQLCipher database (no server round-trip).
+    pub async fn load_local_messages(
         &self,
         convo_id: &str,
         limit: u32,
     ) -> Result<Vec<Message>> {
+        self.db.get_messages(convo_id, limit, None).await
+    }
+
+    /// Fetch messages for a conversation from the server, decrypt each, and store locally.
+    ///
+    /// Automatically syncs commits first to ensure the local MLS epoch is current.
+    pub async fn fetch_messages(&self, convo_id: &str, limit: u32) -> Result<Vec<Message>> {
+        // Sync commits first to bring our epoch up to date
+        if let Err(e) = self.sync_conversation(convo_id).await {
+            warn!(
+                "Failed to sync commits for {}: {e}",
+                &convo_id[..12.min(convo_id.len())]
+            );
+        }
+
         // Get local epoch to skip old messages we can't decrypt
         let local_epoch = {
             let group_id_bytes = hex::decode(convo_id).unwrap_or_default();
-            self.mls.with_context(|ctx| ctx.get_epoch(group_id_bytes)).ok()
+            self.mls
+                .with_context(|ctx| ctx.get_epoch(group_id_bytes))
+                .ok()
         };
 
+        // Only fetch messages newer than what we already have locally
+        let since_seq = self.db.get_max_seq(convo_id).await.ok().flatten();
         let limit_str = limit.to_string();
+        let since_seq_str = since_seq.map(|s| s.to_string());
+
+        let mut params: Vec<(&str, &str)> = vec![
+            ("convoId", convo_id),
+            ("type", "app"),
+            ("limit", &limit_str),
+        ];
+        if let Some(ref seq) = since_seq_str {
+            params.push(("sinceSeq", seq));
+        }
+
         let resp: GetMessagesResp = self
-            .xrpc_query(
-                mls_chat::get_messages::NSID,
-                &[("convoId", convo_id), ("limit", &limit_str)],
-            )
+            .xrpc_query(mls_chat::get_messages::NSID, &params)
             .await?;
 
+        let convo_label = &convo_id[..12.min(convo_id.len())];
         let mut messages = Vec::with_capacity(resp.messages.len());
+        let mut consecutive_failures_at_epoch = 0u32;
+        let mut last_failure_epoch: Option<u64> = None;
+
         for entry in &resp.messages {
             // Skip messages from epochs before we joined
             if let Some(our_epoch) = local_epoch {
@@ -473,6 +747,10 @@ impl ChatService {
 
             match self.decrypt_message(&entry.convo_id, &ciphertext) {
                 Ok((plaintext, sender_did)) => {
+                    // Reset failure counter on successful decrypt
+                    consecutive_failures_at_epoch = 0;
+                    last_failure_epoch = None;
+
                     let content = parse_message_content(&plaintext);
                     let msg = Message {
                         id: entry.id.clone(),
@@ -491,31 +769,113 @@ impl ChatService {
                     messages.push(msg);
                 }
                 Err(e) => {
-                    warn!(
+                    // Track consecutive decryption failures at the same epoch
+                    let msg_epoch = entry.epoch as u64;
+                    if last_failure_epoch == Some(msg_epoch) {
+                        consecutive_failures_at_epoch += 1;
+                    } else {
+                        consecutive_failures_at_epoch = 1;
+                        last_failure_epoch = Some(msg_epoch);
+                    }
+
+                    if consecutive_failures_at_epoch == 3 {
+                        warn!(
+                            "Possible tree divergence for {convo_label} — \
+                             3 consecutive failures at epoch {msg_epoch} (local: {}). \
+                             Skipping remaining messages.",
+                            local_epoch.unwrap_or(0)
+                        );
+                        // Bail early — remaining messages at this epoch will also fail
+                        break;
+                    }
+
+                    debug!(
                         "Failed to decrypt message {} in {}: {e}",
                         entry.id, entry.convo_id
                     );
-                    // Store as unknown content so we don't lose the message record
-                    let msg = Message {
-                        id: entry.id.clone(),
-                        convo_id: entry.convo_id.clone(),
-                        sender_did: None,
-                        content: MessageContent::System(format!("[Decryption failed: {e}]")),
-                        epoch: entry.epoch as u64,
-                        seq: entry.seq as u64,
-                        created_at: chrono::DateTime::parse_from_rfc3339(&entry.created_at)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now()),
-                    };
-                    if let Err(e) = self.db.store_message(&msg).await {
-                        warn!("Failed to store message: {e}");
-                    }
-                    messages.push(msg);
                 }
             }
         }
 
+        // Return full message history from local DB (includes both old cached
+        // messages and the newly fetched ones we just stored above).
+        if since_seq.is_some() && !messages.is_empty() {
+            // We only fetched incremental — return the full local view
+            return self.db.get_messages(convo_id, limit, None).await;
+        }
+
         Ok(messages)
+    }
+
+    /// Repair a diverged group: delete local MLS state and re-join via external commit.
+    ///
+    /// Called automatically when divergence is detected (3+ consecutive decryption
+    /// failures at the current epoch, or TreeStateDiverged error from server).
+    pub async fn repair_group(&self, convo_id: &str) -> Result<()> {
+        let convo_label = &convo_id[..12.min(convo_id.len())];
+
+        // ── Cooldown gate: max 1 external commit per 60s per conversation ──
+        {
+            let cooldowns = self.repair_cooldowns.lock().await;
+            if let Some(last_repair) = cooldowns.get(convo_id) {
+                let elapsed = last_repair.elapsed();
+                if elapsed < std::time::Duration::from_secs(60) {
+                    warn!(
+                        "repair_group: cooldown active for {} ({:.0}s remaining)",
+                        convo_label,
+                        60.0 - elapsed.as_secs_f64()
+                    );
+                    return Err(CatmosError::Other("Repair cooldown active".into()));
+                }
+            }
+        }
+
+        warn!("repair_group: deleting local MLS state for {convo_label}");
+
+        let gid_bytes = hex::decode(convo_id)
+            .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
+
+        // Delete the group from local MLS state
+        let _ = self.mls.with_context(|ctx| {
+            ctx.delete_group(gid_bytes.clone());
+            Ok(())
+        });
+
+        // Re-join via external commit using the existing onboarding flow.
+        // If rate-limited (429), wait and retry once — don't leave client with no state.
+        let did = self.did().to_string();
+        let join_result = self
+            .mls
+            .join_via_external_commit(self, convo_id, &did)
+            .await;
+
+        let join_result = match &join_result {
+            Err(e) if Self::is_rate_limited(e) => {
+                warn!("repair_group: {convo_label} rate-limited, waiting 31s before retry");
+                tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+                self.mls
+                    .join_via_external_commit(self, convo_id, &did)
+                    .await
+            }
+            _ => join_result,
+        };
+
+        // Record cooldown regardless of outcome
+        {
+            let mut cooldowns = self.repair_cooldowns.lock().await;
+            cooldowns.insert(convo_id.to_string(), Instant::now());
+        }
+
+        match join_result {
+            Ok(()) => {
+                info!("repair_group: {convo_label} re-joined successfully");
+                Ok(())
+            }
+            Err(e) => {
+                error!("repair_group: {convo_label} re-join failed: {e}");
+                Err(e)
+            }
+        }
     }
 }
 
@@ -553,9 +913,7 @@ fn parse_message_content(plaintext: &str) -> MessageContent {
                             .and_then(|t| t.as_str())
                             .unwrap_or("")
                             .to_string(),
-                        r.get("action")
-                            .and_then(|a| a.as_str())
-                            .unwrap_or("add"),
+                        r.get("action").and_then(|a| a.as_str()).unwrap_or("add"),
                     )
                 } else {
                     // Legacy flat format fallback
@@ -568,9 +926,7 @@ fn parse_message_content(plaintext: &str) -> MessageContent {
                             .and_then(|t| t.as_str())
                             .unwrap_or("")
                             .to_string(),
-                        v.get("action")
-                            .and_then(|a| a.as_str())
-                            .unwrap_or("add"),
+                        v.get("action").and_then(|a| a.as_str()).unwrap_or("add"),
                     )
                 };
 
