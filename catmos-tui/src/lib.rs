@@ -14,7 +14,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use catmos_core::auth::app_password::AppPasswordAuth;
 use catmos_core::auth::oauth::OAuthAuth;
@@ -75,11 +75,37 @@ pub async fn run() -> anyhow::Result<()> {
     let aliases = Arc::new(RwLock::new(AliasStore::load()?));
     let service = Arc::new(ChatService::new(
         auth,
-        mls,
-        db,
+        mls.clone(),
+        db.clone(),
         config.clone(),
         aliases,
     ));
+
+    // ── 4a. MLS device registration + join missing conversations ──────
+    match mls.ensure_registered(&service, &did, &db).await {
+        Ok(device_info) => {
+            info!("MLS device ready: {}", device_info.device_id);
+            // Fetch conversations first so join_missing knows what groups exist
+            match service.fetch_conversations().await {
+                Ok(_) => {
+                    info!("Joining missing conversations (10s timeout)...");
+                    // Timeout to avoid blocking startup on GroupInfo refresh waits
+                    let did_clone = did.clone();
+                    let svc = Arc::clone(&service);
+                    let join_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        svc.join_missing_conversations(&did_clone),
+                    )
+                    .await;
+                    if join_result.is_err() {
+                        info!("Join phase timed out — will retry in background");
+                    }
+                }
+                Err(e) => error!("Failed to fetch conversations for joining: {e}"),
+            }
+        }
+        Err(e) => error!("MLS registration failed: {e}"),
+    }
 
     // ── 5. Initial sync ────────────────────────────────────────────────
     let mut app = App::new(
@@ -94,12 +120,45 @@ pub async fn run() -> anyhow::Result<()> {
             app.conversations = convos;
             // Populate handle cache from service for sender display
             app.handle_cache = service.handle_cache().await;
-            // Load messages for the first conversation
+
+            // Load cached messages for the active conversation immediately
             if let Some(convo) = app.active_conversation() {
                 let group_id = convo.group_id.clone();
-                match service.fetch_messages(&group_id, 50).await {
-                    Ok(msgs) => app.messages = msgs,
-                    Err(e) => error!("Failed to fetch messages: {e}"),
+                if let Ok(cached) = service.load_local_messages(&group_id, 50).await {
+                    if !cached.is_empty() {
+                        app.messages = cached;
+                    }
+                }
+            }
+
+            // Pre-fetch messages for ALL conversations in parallel (populates SQLCipher cache)
+            let group_ids: Vec<String> = app
+                .conversations
+                .iter()
+                .map(|c| c.group_id.clone())
+                .collect();
+            let active_gid = app.active_conversation().map(|c| c.group_id.clone());
+
+            let mut handles = Vec::with_capacity(group_ids.len());
+            for gid in group_ids {
+                let svc = Arc::clone(&service);
+                handles.push(tokio::spawn(async move {
+                    match svc.fetch_messages(&gid, 50).await {
+                        Ok(msgs) => Some((gid, msgs)),
+                        Err(e) => {
+                            debug!("Pre-fetch failed for {}: {e}", &gid[..12.min(gid.len())]);
+                            None
+                        }
+                    }
+                }));
+            }
+
+            // Collect results — update active conversation's messages if we got fresh data
+            for handle in handles {
+                if let Ok(Some((gid, msgs))) = handle.await {
+                    if Some(&gid) == active_gid.as_ref() {
+                        app.messages = msgs;
+                    }
                 }
             }
         }
@@ -152,6 +211,24 @@ pub async fn run() -> anyhow::Result<()> {
                                 break;
                             }
                         }
+                        catmos_core::chat::WsEvent::EpochAdvanced {
+                            convo_id,
+                            new_epoch,
+                        } => {
+                            info!(
+                                "WS epoch advanced: convo={} epoch={new_epoch}",
+                                &convo_id[..12.min(convo_id.len())]
+                            );
+                            if ws_tx
+                                .send(AppEvent::EpochAdvanced {
+                                    convo_id,
+                                    new_epoch,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                         catmos_core::chat::WsEvent::Error(e) => {
                             error!("WebSocket error: {e}");
                             let _ = ws_tx.send(AppEvent::Error(e));
@@ -159,8 +236,43 @@ pub async fn run() -> anyhow::Result<()> {
                         catmos_core::chat::WsEvent::Reconnecting => {
                             info!("WebSocket reconnecting...");
                         }
+                        catmos_core::chat::WsEvent::TreeChanged {
+                            convo_id,
+                            confirmation_tag: _,
+                            epoch,
+                        } => {
+                            // Forward to TUI for silent repair.
+                            // The convert_event already compared tags and logged.
+                            info!(
+                                "WS treeChanged: convo={} epoch={epoch}",
+                                &convo_id[..12.min(convo_id.len())]
+                            );
+                            let _ = ws_tx.send(AppEvent::TreeDiverged { convo_id });
+                        }
+                        catmos_core::chat::WsEvent::GroupReset {
+                            convo_id,
+                            new_group_id,
+                            reset_generation,
+                            ..
+                        } => {
+                            info!(
+                                "WS group reset: convo={} new_group={} gen={reset_generation}",
+                                &convo_id[..12.min(convo_id.len())],
+                                &new_group_id[..12.min(new_group_id.len())]
+                            );
+                            if ws_tx
+                                .send(AppEvent::GroupReset {
+                                    convo_id,
+                                    new_group_id,
+                                    reset_generation,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                         _ => {
-                            // Typing, MemberJoined, MemberLeft, EpochAdvanced,
+                            // Typing, MemberJoined, MemberLeft,
                             // Reaction — future enhancements
                         }
                     }
@@ -172,6 +284,22 @@ pub async fn run() -> anyhow::Result<()> {
             // Non-fatal: TUI still works without live updates
         }
     }
+
+    // ── 7b. Background sync loop — 5s interval (spec §6.1) ────────────
+    let _sync_handle = {
+        let svc = Arc::clone(&service);
+        let tx = event_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if let Err(e) = svc.full_sync().await {
+                    tracing::debug!("Background sync error: {:?}", e);
+                }
+                // Notify TUI to refresh conversation list
+                let _ = tx.send(AppEvent::SyncCompleted);
+            }
+        })
+    };
 
     let result = main_loop(&mut terminal, &mut app, &mut events).await;
 
@@ -224,15 +352,70 @@ async fn main_loop(
                     // Nothing to do on tick for now (future: refresh, animate)
                 }
                 AppEvent::ChatMessage(msg) => {
-                    // If message belongs to the active conversation, append it
+                    // Persist to SQLCipher so it survives conversation switches
+                    if let Err(e) = app.service.db.store_message(&msg).await {
+                        error!("Failed to store WS message {}: {e}", msg.id);
+                    }
+                    // Append to in-memory list if it belongs to the active conversation
                     if let Some(convo) = app.active_conversation() {
                         if msg.convo_id == convo.group_id {
                             app.messages.push(msg);
                         }
                     }
                 }
+                AppEvent::EpochAdvanced {
+                    convo_id,
+                    new_epoch,
+                } => {
+                    info!(
+                        "Epoch advanced for {} to {new_epoch}",
+                        &convo_id[..12.min(convo_id.len())]
+                    );
+                    // Non-blocking: messages arrive via WebSocket ChatMessage events
+                }
                 AppEvent::ConvoListUpdated(convos) => {
                     app.conversations = convos;
+                }
+                AppEvent::GroupReset {
+                    convo_id,
+                    new_group_id,
+                    reset_generation,
+                } => {
+                    let label = &convo_id[..12.min(convo_id.len())];
+                    info!(
+                        "Group reset for {} to {} (gen {})",
+                        label,
+                        &new_group_id[..12.min(new_group_id.len())],
+                        reset_generation
+                    );
+                    // Spawn repair in background — don't block the event loop
+                    let svc = Arc::clone(&app.service);
+                    let cid = convo_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = svc.repair_group(&cid).await {
+                            error!("Failed to handle group reset for {}: {e}", &cid[..12.min(cid.len())]);
+                        }
+                    });
+                }
+                AppEvent::TreeDiverged { convo_id } => {
+                    // Spawn repair in background — don't block the event loop
+                    let label = &convo_id[..12.min(convo_id.len())];
+                    info!("Tree diverged for {label}, initiating background repair");
+                    let svc = Arc::clone(&app.service);
+                    let cid = convo_id.clone();
+                    tokio::spawn(async move {
+                        let label = &cid[..12.min(cid.len())];
+                        match svc.repair_group(&cid).await {
+                            Ok(()) => info!("Background tree repair succeeded for {label}"),
+                            Err(e) => error!("Background tree repair failed for {label}: {e}"),
+                        }
+                    });
+                }
+                AppEvent::SyncCompleted => {
+                    // Refresh conversation list from cache after background sync
+                    if let Ok(convos) = app.service.fetch_conversations().await {
+                        app.conversations = convos;
+                    }
                 }
                 AppEvent::Error(e) => {
                     error!("Event error: {e}");
@@ -312,12 +495,15 @@ async fn handle_chat_key(app: &mut App, key: crossterm::event::KeyEvent) {
 }
 
 /// Reload messages for the currently active conversation.
+///
+/// Loads from local SQLCipher (instant). Server data was pre-fetched at startup
+/// and stays current via WebSocket events.
 async fn reload_messages(app: &mut App) {
     if let Some(convo) = app.active_conversation() {
         let group_id = convo.group_id.clone();
-        match app.service.fetch_messages(&group_id, 50).await {
+        match app.service.load_local_messages(&group_id, 50).await {
             Ok(msgs) => app.messages = msgs,
-            Err(e) => error!("Failed to fetch messages: {e}"),
+            Err(e) => error!("Failed to load messages from local DB: {e}"),
         }
     }
 }
@@ -325,7 +511,12 @@ async fn reload_messages(app: &mut App) {
 /// Parse a WebSocket plaintext JSON payload into a `MessageContent`.
 fn parse_ws_plaintext(plaintext: &str) -> catmos_core::types::MessageContent {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(plaintext) {
-        match v.get("type").and_then(|t| t.as_str()) {
+        // iOS uses "messageType", legacy uses "type"
+        let msg_type = v
+            .get("messageType")
+            .or_else(|| v.get("type"))
+            .and_then(|t| t.as_str());
+        match msg_type {
             Some("text") => {
                 let text = v
                     .get("text")

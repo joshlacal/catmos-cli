@@ -13,8 +13,16 @@ pub enum AppEvent {
     Tick,
     /// An incoming chat message (from WebSocket).
     ChatMessage(Message),
+    /// The MLS epoch advanced for a conversation — re-fetch messages.
+    EpochAdvanced { convo_id: String, new_epoch: u64 },
     /// The conversation list was updated.
     ConvoListUpdated(Vec<Conversation>),
+    /// The MLS tree diverged for a conversation — needs silent repair.
+    TreeDiverged { convo_id: String },
+    /// The MLS group was reset by an admin — rejoin with new group ID.
+    GroupReset { convo_id: String, new_group_id: String, reset_generation: u64 },
+    /// Background sync completed — refresh conversation list.
+    SyncCompleted,
     /// An error to display in the status bar.
     Error(String),
 }
