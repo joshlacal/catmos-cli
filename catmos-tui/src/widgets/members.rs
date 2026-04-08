@@ -18,21 +18,12 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         .map(|member| {
             let display = app.display_name(&member.user_did);
 
-            let mut spans = vec![Span::styled(
-                display,
-                Style::default().fg(Color::White),
-            )];
+            let mut spans = vec![Span::styled(display, Style::default().fg(Color::White))];
 
             if member.is_admin {
-                spans.push(Span::styled(
-                    " [admin]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled(" [admin]", Style::default().fg(Color::Yellow)));
             } else if member.is_moderator {
-                spans.push(Span::styled(
-                    " [mod]",
-                    Style::default().fg(Color::Cyan),
-                ));
+                spans.push(Span::styled(" [mod]", Style::default().fg(Color::Cyan)));
             }
 
             ListItem::new(Line::from(spans))

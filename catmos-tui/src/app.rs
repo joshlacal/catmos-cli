@@ -52,7 +52,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(service: Arc<ChatService>, sidebar_visible: bool, member_panel_visible: bool) -> Self {
+    pub fn new(
+        service: Arc<ChatService>,
+        sidebar_visible: bool,
+        member_panel_visible: bool,
+    ) -> Self {
         Self {
             service,
             screen: Screen::Chat,

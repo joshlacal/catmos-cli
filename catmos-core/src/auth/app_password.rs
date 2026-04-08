@@ -91,11 +91,14 @@ impl AppPasswordAuth {
 
     /// Persist auth credentials to the session store.
     pub async fn save(&self, db: &Database) -> Result<()> {
-        db.store_session_value("auth_method", "app_password").await?;
+        db.store_session_value("auth_method", "app_password")
+            .await?;
         db.store_session_value("handle", &self.handle).await?;
         db.store_session_value("did", &self.did).await?;
-        db.store_session_value("access_jwt", &self.access_jwt).await?;
-        db.store_session_value("refresh_jwt", &self.refresh_jwt).await?;
+        db.store_session_value("access_jwt", &self.access_jwt)
+            .await?;
+        db.store_session_value("refresh_jwt", &self.refresh_jwt)
+            .await?;
         db.store_session_value("pds_url", &self.pds_url).await?;
         Ok(())
     }

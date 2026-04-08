@@ -26,15 +26,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
             // Active marker or unread indicator
             if is_active {
-                spans.push(Span::styled(
-                    "\u{25b8} ",
-                    Style::default().fg(Color::Cyan),
-                ));
+                spans.push(Span::styled("\u{25b8} ", Style::default().fg(Color::Cyan)));
             } else if has_unread {
-                spans.push(Span::styled(
-                    "\u{25cf} ",
-                    Style::default().fg(Color::Green),
-                ));
+                spans.push(Span::styled("\u{25cf} ", Style::default().fg(Color::Green)));
             } else {
                 spans.push(Span::raw("  "));
             }

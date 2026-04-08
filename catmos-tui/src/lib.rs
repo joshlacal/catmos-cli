@@ -14,7 +14,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use catmos_core::auth::app_password::AppPasswordAuth;
 use catmos_core::auth::oauth::OAuthAuth;
@@ -268,21 +268,57 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
-    // ── 7b. Background sync loop — 5s interval (spec §6.1) ────────────
+    // ── 7b. Background sync loop — 5s interval (spec section 6.1) ────────
+    // Includes a circuit breaker: after SYNC_CIRCUIT_BREAKER_THRESHOLD
+    // consecutive failures, applies exponential cooldown before retrying.
     let _sync_handle = {
         let svc = Arc::clone(&service);
         let tx = event_tx.clone();
         tokio::spawn(async move {
+            const SYNC_CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
+            let mut consecutive_failures: u32 = 0;
+            let mut circuit_open_until: Option<std::time::Instant> = None;
+
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                // Fetch conversations in the background task (network I/O),
-                // then send the result to the TUI — never block the event loop.
+
+                // Circuit breaker: skip sync while in cooldown
+                if let Some(until) = circuit_open_until {
+                    if std::time::Instant::now() < until {
+                        continue;
+                    }
+                    // Cooldown elapsed — reset and try once
+                    info!("Sync circuit breaker: cooldown elapsed, retrying");
+                    circuit_open_until = None;
+                    consecutive_failures = 0;
+                }
+
                 match svc.fetch_conversations().await {
                     Ok(convos) => {
+                        consecutive_failures = 0;
+                        circuit_open_until = None;
                         let _ = tx.send(AppEvent::ConvoListUpdated(convos));
                     }
                     Err(e) => {
-                        tracing::debug!("Background sync error: {:?}", e);
+                        consecutive_failures += 1;
+                        debug!("Background sync error (consecutive: {consecutive_failures}): {e:?}");
+
+                        if consecutive_failures >= SYNC_CIRCUIT_BREAKER_THRESHOLD {
+                            // Exponential cooldown: min(30 * 2^(failures-1), 300) seconds
+                            let exponent = consecutive_failures.saturating_sub(1);
+                            let cooldown_secs = std::cmp::min(
+                                30u64.saturating_mul(2u64.saturating_pow(exponent)),
+                                300,
+                            );
+                            warn!(
+                                "Sync circuit breaker: {consecutive_failures} consecutive failures, \
+                                 cooling down for {cooldown_secs}s"
+                            );
+                            circuit_open_until = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_secs(cooldown_secs),
+                            );
+                        }
                     }
                 }
             }
@@ -386,16 +422,18 @@ async fn main_loop(
                     });
                 }
                 AppEvent::TreeDiverged { convo_id } => {
-                    // Spawn repair in background — don't block the event loop
+                    // Spec: treeChanged should NOT trigger an immediate External
+                    // Commit. Flag the conversation as NEEDS_REJOIN and let
+                    // deferred recovery (post-sync) handle it.
                     let label = &convo_id[..12.min(convo_id.len())];
-                    info!("Tree diverged for {label}, initiating background repair");
-                    let svc = Arc::clone(&app.service);
-                    let cid = convo_id.clone();
+                    warn!(
+                        "Tree diverged for {label} — flagging NEEDS_REJOIN (deferred recovery)"
+                    );
+                    let db = Arc::clone(&app.service.db);
+                    let key = format!("needs_rejoin:{convo_id}");
                     tokio::spawn(async move {
-                        let label = &cid[..12.min(cid.len())];
-                        match svc.repair_group(&cid).await {
-                            Ok(()) => info!("Background tree repair succeeded for {label}"),
-                            Err(e) => error!("Background tree repair failed for {label}: {e}"),
+                        if let Err(e) = db.store_session_value(&key, "1").await {
+                            error!("Failed to flag NEEDS_REJOIN for {}: {e}", &convo_id[..12.min(convo_id.len())]);
                         }
                     });
                 }

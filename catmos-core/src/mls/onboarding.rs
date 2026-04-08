@@ -104,8 +104,8 @@ impl MlsManager {
 
         // 3. Build XRPC request
         let now = chrono::Utc::now();
-        let expires_str = (now + chrono::Duration::days(30))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let expires_str =
+            (now + chrono::Duration::days(30)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         let key_packages: Vec<mls_chat::register_device::KeyPackageItem> = packages
             .iter()
@@ -119,14 +119,13 @@ impl MlsManager {
             })
             .collect();
 
-        let req: mls_chat::register_device::Input =
-            mls_chat::register_device::InputData {
-                device_name: device_name.to_string(),
-                device_uuid: Some(device_uuid.clone()),
-                signature_public_key: signature_public_key.clone(),
-                key_packages,
-            }
-            .into();
+        let req: mls_chat::register_device::Input = mls_chat::register_device::InputData {
+            device_name: device_name.to_string(),
+            device_uuid: Some(device_uuid.clone()),
+            signature_public_key: signature_public_key.clone(),
+            key_packages,
+        }
+        .into();
 
         // 4. Call registerDevice
         let resp: RegisterDeviceResp = service
@@ -152,10 +151,7 @@ impl MlsManager {
                     );
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to process welcome for convo {}: {e}",
-                        wm.convo_id
-                    );
+                    warn!("Failed to process welcome for convo {}: {e}", wm.convo_id);
                 }
             }
         }
@@ -188,9 +184,8 @@ impl MlsManager {
     /// Returns the group ID bytes on success.
     pub fn process_welcome(&self, welcome_bytes: &[u8], did: &str) -> Result<Vec<u8>> {
         let identity = did.as_bytes().to_vec();
-        let result = self.with_context(|ctx| {
-            ctx.process_welcome(welcome_bytes.to_vec(), identity, None)
-        })?;
+        let result =
+            self.with_context(|ctx| ctx.process_welcome(welcome_bytes.to_vec(), identity, None))?;
         Ok(result.group_id)
     }
 
@@ -215,7 +210,8 @@ impl MlsManager {
         convo_id: &str,
         did: &str,
     ) -> Result<()> {
-        self.try_external_commit_with_retry(service, convo_id, did, 1).await
+        self.try_external_commit_with_retry(service, convo_id, did, 1)
+            .await
     }
 
     async fn try_external_commit_with_retry(
@@ -226,119 +222,159 @@ impl MlsManager {
         max_retries: u32,
     ) -> Result<()> {
         let convo_label = &convo_id[..12.min(convo_id.len())];
-        info!("try_external_commit: fetching groupInfo for convo {convo_label}");
+        let mut retries_left = max_retries;
 
-        // 1. Fetch group info (with retry on GroupInfoUnavailable)
-        let group_info_b64 = match self.fetch_group_info(service, convo_id).await {
-            Ok(info) => info,
-            Err(e) if Self::is_group_info_unavailable(&e) && max_retries > 0 => {
-                warn!(
-                    "try_external_commit: GroupInfo unavailable for {convo_label}, \
-                     requesting refresh and retrying ({max_retries} retries left)"
-                );
+        loop {
+            info!("try_external_commit: fetching groupInfo for convo {convo_label} (retries_left={retries_left})");
 
-                // Request a GroupInfo refresh from other devices via SSE
-                if let Err(refresh_err) = self.request_group_info_refresh(service, convo_id).await {
+            // 1. Fetch group info (with retry on GroupInfoUnavailable)
+            let group_info_b64 = match self.fetch_group_info(service, convo_id).await {
+                Ok(info) => info,
+                Err(e) if Self::is_group_info_unavailable(&e) && retries_left > 0 => {
                     warn!(
-                        "try_external_commit: failed to request GroupInfo refresh for {convo_label}: {refresh_err}"
+                        "try_external_commit: GroupInfo unavailable for {convo_label}, \
+                         requesting refresh and retrying ({retries_left} retries left)"
                     );
+
+                    // Request a GroupInfo refresh from other devices via SSE
+                    if let Err(refresh_err) =
+                        self.request_group_info_refresh(service, convo_id).await
+                    {
+                        warn!(
+                            "try_external_commit: failed to request GroupInfo refresh for {convo_label}: {refresh_err}"
+                        );
+                        return Err(e);
+                    }
+
+                    info!(
+                        "try_external_commit: GroupInfo refresh requested for {convo_label}, \
+                         waiting 5s for iOS devices to publish"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                    // Retry fetch
+                    match self.fetch_group_info(service, convo_id).await {
+                        Ok(info) => {
+                            info!("try_external_commit: GroupInfo now available for {convo_label} after refresh");
+                            info
+                        }
+                        Err(retry_err) => {
+                            warn!(
+                                "try_external_commit: GroupInfo still unavailable for {convo_label} after refresh: {retry_err}"
+                            );
+                            return Err(retry_err);
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+
+            let group_info_bytes = BASE64
+                .decode(&group_info_b64)
+                .map_err(|e| CatmosError::Other(format!("Invalid base64 groupInfo: {e}")))?;
+
+            info!(
+                "try_external_commit: decoded groupInfo for {convo_label} — {} bytes",
+                group_info_bytes.len()
+            );
+
+            // 2. Create external commit
+            let identity = did.as_bytes().to_vec();
+            let ext_result = self.with_context(|ctx| {
+                ctx.create_external_commit(group_info_bytes.clone(), identity)
+            })?;
+
+            debug!(
+                "Created external commit for {convo_label} ({} bytes), group_id={}",
+                ext_result.commit_data.len(),
+                hex::encode(&ext_result.group_id)
+            );
+
+            // 3. Send the commit to the server (with GroupInfo so other clients can join)
+            let commit_b64 = BASE64.encode(&ext_result.commit_data);
+            let group_info_b64 = ext_result.group_info.as_ref().map(|gi| BASE64.encode(gi));
+
+            // Get confirmation tag from the new local group state after external commit
+            let tag_b64 = self
+                .with_context(|ctx| ctx.get_confirmation_tag(ext_result.group_id.clone()))
+                .map(|tag| BASE64.encode(&tag))
+                .ok();
+
+            let req: mls_chat::commit_group_change::Input =
+                mls_chat::commit_group_change::InputData {
+                    convo_id: convo_id.to_string(),
+                    action: "externalCommit".to_string(),
+                    commit: Some(commit_b64),
+                    confirmation_tag: tag_b64,
+                    device_id: None,
+                    group_info: group_info_b64,
+                    idempotency_key: None,
+                    key_package_hashes: None,
+                    member_dids: None,
+                    pending_addition_id: None,
+                    welcome: None,
+                }
+                .into();
+
+            match service
+                .xrpc_procedure::<_, serde_json::Value>(mls_chat::commit_group_change::NSID, &req)
+                .await
+            {
+                Ok(_) => {
+                    // Server accepted — merge the pending external join locally
+                    // to finalize the new group state (spec compliance).
+                    match self.with_context(|ctx| {
+                        ctx.merge_pending_commit(ext_result.group_id.clone())
+                    }) {
+                        Ok(result) => {
+                            info!(
+                                "Joined conversation {convo_id} via external commit (epoch {})",
+                                result.new_epoch
+                            );
+                        }
+                        Err(e) => {
+                            // Non-fatal: the group state may still be usable after
+                            // the next sync processes the commit we just sent.
+                            warn!(
+                                "merge_pending_commit failed after external commit for {convo_label}: {e}"
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Discard the pending join to avoid orphaned crypto state
+                    warn!("External commit rejected for {convo_label}: {e}");
+                    if let Err(discard_err) = self
+                        .with_context(|ctx| ctx.discard_pending_external_join(ext_result.group_id))
+                    {
+                        warn!("Failed to discard pending join: {discard_err}");
+                    }
+
+                    // On 409 (epoch conflict), retry with fresh GroupInfo
+                    if Self::is_epoch_conflict(&e) && retries_left > 0 {
+                        retries_left -= 1;
+                        warn!(
+                            "try_external_commit: 409 epoch conflict for {convo_label}, \
+                             retrying with fresh GroupInfo ({retries_left} retries left)"
+                        );
+                        continue;
+                    }
+
                     return Err(e);
                 }
-
-                info!(
-                    "try_external_commit: GroupInfo refresh requested for {convo_label}, \
-                     waiting 5s for iOS devices to publish"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-                // Retry fetch
-                match self.fetch_group_info(service, convo_id).await {
-                    Ok(info) => {
-                        info!("try_external_commit: GroupInfo now available for {convo_label} after refresh");
-                        info
-                    }
-                    Err(retry_err) => {
-                        warn!(
-                            "try_external_commit: GroupInfo still unavailable for {convo_label} after refresh: {retry_err}"
-                        );
-                        return Err(retry_err);
-                    }
-                }
-            }
-            Err(e) => return Err(e),
-        };
-
-        let group_info_bytes = BASE64.decode(group_info_b64).map_err(|e| {
-            CatmosError::Other(format!("Invalid base64 groupInfo: {e}"))
-        })?;
-
-        info!(
-            "try_external_commit: decoded groupInfo for {} — {} bytes",
-            &convo_id[..12.min(convo_id.len())],
-            group_info_bytes.len()
-        );
-
-        // 2. Create external commit
-        let identity = did.as_bytes().to_vec();
-        let ext_result = self.with_context(|ctx| {
-            ctx.create_external_commit(group_info_bytes.clone(), identity)
-        })?;
-
-        debug!(
-            "Created external commit for {} ({} bytes), group_id={}",
-            convo_id,
-            ext_result.commit_data.len(),
-            hex::encode(&ext_result.group_id)
-        );
-
-        // 3. Send the commit to the server
-        let commit_b64 = BASE64.encode(&ext_result.commit_data);
-
-        let req: mls_chat::commit_group_change::Input =
-            mls_chat::commit_group_change::InputData {
-                convo_id: convo_id.to_string(),
-                action: "externalCommit".to_string(),
-                commit: Some(commit_b64),
-                device_id: None,
-                group_info: None,
-                idempotency_key: None,
-                key_package_hashes: None,
-                member_dids: None,
-                pending_addition_id: None,
-                welcome: None,
-            }
-            .into();
-
-        match service
-            .xrpc_procedure::<_, serde_json::Value>(
-                mls_chat::commit_group_change::NSID,
-                &req,
-            )
-            .await
-        {
-            Ok(_) => {
-                info!("Joined conversation {convo_id} via external commit");
-                Ok(())
-            }
-            Err(e) => {
-                // Discard the pending join to avoid orphaned crypto state
-                warn!("External commit rejected for {convo_id}: {e}");
-                if let Err(discard_err) = self.with_context(|ctx| {
-                    ctx.discard_pending_external_join(ext_result.group_id)
-                }) {
-                    warn!("Failed to discard pending join: {discard_err}");
-                }
-                Err(e)
             }
         }
     }
 
+    /// Check whether an error indicates a 409 epoch conflict.
+    fn is_epoch_conflict(err: &CatmosError) -> bool {
+        let msg = err.to_string();
+        msg.contains("returned 409") || msg.contains("EpochMismatch")
+    }
+
     /// Fetch the base64-encoded GroupInfo for a conversation from the server.
-    async fn fetch_group_info(
-        &self,
-        service: &ChatService,
-        convo_id: &str,
-    ) -> Result<String> {
+    async fn fetch_group_info(&self, service: &ChatService, convo_id: &str) -> Result<String> {
         let group_state: serde_json::Value = service
             .xrpc_query(
                 mls_chat::get_group_state::NSID,
@@ -403,8 +439,7 @@ impl MlsManager {
             return Ok(None);
         }
 
-        let metadata_bytes = self
-            .with_context(|ctx| ctx.get_group_metadata(group_id.to_vec()))?;
+        let metadata_bytes = self.with_context(|ctx| ctx.get_group_metadata(group_id.to_vec()))?;
 
         if metadata_bytes.is_empty() {
             return Ok(None);
@@ -558,14 +593,16 @@ impl ChatService {
             let group_id_bytes = match hex::decode(&convo.group_id) {
                 Ok(b) => b,
                 Err(e) => {
-                    warn!("join_missing_conversations: invalid hex group_id for {convo_label}: {e}");
+                    warn!(
+                        "join_missing_conversations: invalid hex group_id for {convo_label}: {e}"
+                    );
                     continue;
                 }
             };
 
             let has_local_state = self
                 .mls
-                .with_context(|ctx| ctx.get_epoch(group_id_bytes))
+                .with_context(|ctx| ctx.get_epoch(group_id_bytes.clone()))
                 .is_ok();
 
             if has_local_state {
@@ -574,8 +611,30 @@ impl ChatService {
                 continue;
             }
 
+            // Try syncing commits first — if another device already committed,
+            // processing those commits may give us local state without needing
+            // an external commit (which inflates the epoch).
             info!(
-                "join_missing_conversations: {convo_label} — no local MLS state, attempting external commit"
+                "join_missing_conversations: {convo_label} — no local MLS state, syncing commits first"
+            );
+            if let Err(e) = self.sync_conversation(&convo.group_id).await {
+                debug!("join_missing_conversations: {convo_label} — sync failed (expected if no local state): {e}");
+            }
+
+            // Re-check: did sync give us local state?
+            let has_state_after_sync = self
+                .mls
+                .with_context(|ctx| ctx.get_epoch(group_id_bytes.clone()))
+                .is_ok();
+
+            if has_state_after_sync {
+                skipped += 1;
+                info!("join_missing_conversations: {convo_label} — acquired local state via sync, skipping external commit");
+                continue;
+            }
+
+            info!(
+                "join_missing_conversations: {convo_label} — still no local MLS state, attempting external commit"
             );
             match self
                 .mls
@@ -588,7 +647,9 @@ impl ChatService {
                 }
                 Err(e) => {
                     failed += 1;
-                    warn!("join_missing_conversations: {convo_label} — external commit failed: {e}");
+                    warn!(
+                        "join_missing_conversations: {convo_label} — external commit failed: {e}"
+                    );
                 }
             }
         }

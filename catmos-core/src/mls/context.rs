@@ -49,9 +49,10 @@ impl SystemKeychain {
 #[async_trait::async_trait]
 impl KeychainAccess for SystemKeychain {
     async fn read(&self, key: String) -> std::result::Result<Option<Vec<u8>>, MLSError> {
-        let fb = self.fallback.lock().map_err(|e| {
-            MLSError::Internal(format!("Keychain fallback lock poisoned: {e}"))
-        })?;
+        let fb = self
+            .fallback
+            .lock()
+            .map_err(|e| MLSError::Internal(format!("Keychain fallback lock poisoned: {e}")))?;
 
         if let Some(map) = fb.as_ref() {
             return Ok(map.get(&key).cloned());
@@ -68,9 +69,10 @@ impl KeychainAccess for SystemKeychain {
     }
 
     async fn write(&self, key: String, value: Vec<u8>) -> std::result::Result<(), MLSError> {
-        let mut fb = self.fallback.lock().map_err(|e| {
-            MLSError::Internal(format!("Keychain fallback lock poisoned: {e}"))
-        })?;
+        let mut fb = self
+            .fallback
+            .lock()
+            .map_err(|e| MLSError::Internal(format!("Keychain fallback lock poisoned: {e}")))?;
 
         if let Some(map) = fb.as_mut() {
             map.insert(key, value);
@@ -88,9 +90,10 @@ impl KeychainAccess for SystemKeychain {
     }
 
     async fn delete(&self, key: String) -> std::result::Result<(), MLSError> {
-        let mut fb = self.fallback.lock().map_err(|e| {
-            MLSError::Internal(format!("Keychain fallback lock poisoned: {e}"))
-        })?;
+        let mut fb = self
+            .fallback
+            .lock()
+            .map_err(|e| MLSError::Internal(format!("Keychain fallback lock poisoned: {e}")))?;
 
         if let Some(map) = fb.as_mut() {
             map.remove(&key);
@@ -205,8 +208,8 @@ impl MlsManager {
 
         info!("Initializing MLS context at {storage_path}");
 
-        let context = MLSContext::new(storage_path, encryption_key, keychain)
-            .map_err(CatmosError::Mls)?;
+        let context =
+            MLSContext::new(storage_path, encryption_key, keychain).map_err(CatmosError::Mls)?;
 
         Ok(Self { context })
     }

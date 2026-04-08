@@ -2,6 +2,7 @@ pub mod app_password;
 pub mod oauth;
 
 /// Represents the active authentication method for a session.
+#[derive(Clone)]
 pub enum AuthMethod {
     OAuth {
         session_cookie: String,

@@ -35,9 +35,13 @@ enum Commands {
     /// List conversations
     Convos,
     /// List members of a conversation
-    Members { convo: String },
+    Members {
+        convo: String,
+    },
     /// Print recent messages
-    Messages { convo: String },
+    Messages {
+        convo: String,
+    },
     /// Authentication
     Login {
         handle: Option<String>,
@@ -65,6 +69,14 @@ enum Commands {
     KeyPackage(KeyPackageCommands),
     #[command(subcommand)]
     Device(DeviceCommands),
+    /// Reset the MLS group for a conversation (admin only)
+    ResetGroup {
+        /// Conversation name, alias, or ID
+        convo: String,
+        /// Optional reason for the reset
+        #[arg(long)]
+        reason: Option<String>,
+    },
     #[command(subcommand)]
     Debug(DebugCommands),
     #[command(subcommand)]
@@ -210,7 +222,10 @@ async fn init_service() -> anyhow::Result<ChatService> {
             // Fetch conversations and join any that lack local MLS state
             match service.fetch_conversations().await {
                 Ok(convos) => {
-                    info!("Fetched {} conversations, joining missing groups...", convos.len());
+                    info!(
+                        "Fetched {} conversations, joining missing groups...",
+                        convos.len()
+                    );
                     service.join_missing_conversations(&did).await;
                 }
                 Err(e) => {
@@ -242,7 +257,10 @@ async fn open_account_db(did: &str) -> anyhow::Result<Database> {
 async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
     match cmd {
         // ── Auth ─────────────────────────────────────────────────────────
-        Commands::Login { handle, app_password } => {
+        Commands::Login {
+            handle,
+            app_password,
+        } => {
             let handle = match handle {
                 Some(h) => h,
                 None => {
@@ -358,7 +376,9 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                         continue;
                     }
                 }
-                if matches!(&m.content, MessageContent::Unknown) { continue; }
+                if matches!(&m.content, MessageContent::Unknown) {
+                    continue;
+                }
 
                 if shown_join {
                     shown_join = false;
@@ -371,7 +391,11 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 } else if let Some(handle) = handle_cache.get(sender_did) {
                     handle.clone()
                 } else {
-                    sender_did.rsplit(':').next().unwrap_or(sender_did).to_string()
+                    sender_did
+                        .rsplit(':')
+                        .next()
+                        .unwrap_or(sender_did)
+                        .to_string()
                 };
                 let ts = m.created_at.format("%H:%M");
                 let body = match &m.content {
@@ -485,7 +509,10 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             ConvoCommands::Join { convo_id } => {
                 let svc = init_service().await?;
                 svc.join_conversation(&convo_id).await?;
-                println!("Joined conversation {}", &convo_id[..12.min(convo_id.len())]);
+                println!(
+                    "Joined conversation {}",
+                    &convo_id[..12.min(convo_id.len())]
+                );
             }
 
             ConvoCommands::Update {
@@ -496,12 +523,8 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let svc = init_service().await?;
                 svc.fetch_conversations().await?;
                 let convo_id = svc.resolve_convo(&convo).await?;
-                svc.update_conversation(
-                    &convo_id,
-                    name.as_deref(),
-                    description.as_deref(),
-                )
-                .await?;
+                svc.update_conversation(&convo_id, name.as_deref(), description.as_deref())
+                    .await?;
                 println!("Updated conversation {convo}");
             }
 
@@ -530,7 +553,8 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let svc = init_service().await?;
                 svc.fetch_conversations().await?;
                 let convo_id = svc.resolve_convo(&convo).await?;
-                svc.promote_member(&convo_id, &did, admin, moderator).await?;
+                svc.promote_member(&convo_id, &did, admin, moderator)
+                    .await?;
                 let role = if admin {
                     "admin"
                 } else if moderator {
@@ -564,7 +588,10 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let did = svc.did().to_string();
                 let db = svc.db.clone();
                 let device_name = name.as_deref().unwrap_or("catmos-cli");
-                let info = svc.mls.register_device(&svc, &did, device_name, &db).await?;
+                let info = svc
+                    .mls
+                    .register_device(&svc, &did, device_name, &db)
+                    .await?;
                 println!(
                     "Registered device: id={}, mls_did={}",
                     info.device_id, info.mls_did
@@ -654,6 +681,34 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             println!("Removed reaction {emoji} from {message_id}");
         }
 
+        // ── Reset group ──────────────────────────────────────────────────
+        Commands::ResetGroup { convo, reason } => {
+            let svc = init_service().await?;
+            svc.fetch_conversations().await?;
+            let convo_id = svc.resolve_convo(&convo).await?;
+
+            // Generate a new random group ID
+            let new_group_id = hex::encode(rand::random::<[u8; 16]>());
+
+            let req = serde_json::json!({
+                "convoId": convo_id,
+                "newGroupId": new_group_id,
+                "cipherSuite": "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+                "reason": reason,
+            });
+
+            let resp: serde_json::Value = svc
+                .xrpc_procedure("blue.catbird.mlsChat.resetGroup", &req)
+                .await?;
+
+            println!(
+                "Group reset: {} -> {} (generation {})",
+                &convo_id[..12.min(convo_id.len())],
+                &new_group_id[..12.min(new_group_id.len())],
+                resp["resetGeneration"]
+            );
+        }
+
         // ── Debug ────────────────────────────────────────────────────────
         Commands::Debug(sub) => match sub {
             DebugCommands::Epoch { convo } => {
@@ -719,21 +774,36 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Default filter: warn for most, suppress noisy openmls internals.
-    // openmls uses the `log` crate — the tracing-log bridge converts `log`
-    // records into tracing events so `openmls=off` actually takes effect.
-    let default_filter = "warn,catmos=info,catmos_core=info,catmos_tui=info,openmls=off,openmls_rust_crypto=off,openmls_memory_storage=off";
+    let cli = Cli::parse();
+    let is_tui = matches!(cli.command, None | Some(Commands::Chat));
+
+    // Default filter: suppress noisy openmls internals
+    let default_filter = "warn,catmos=info,catmos_core=info,catmos_core::chat=debug,catmos_tui=info,openmls=off,openmls_rust_crypto=off,openmls_memory_storage=off";
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
+
+    if is_tui {
+        // TUI mode: log to file to avoid polluting the terminal
+        let log_dir = catmos_core::storage::config::Config::data_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        let log_file = std::fs::File::create(log_dir.join("catmos.log")).unwrap_or_else(|_| {
+            std::fs::File::create("/tmp/catmos.log").expect("cannot create log file")
+        });
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::sync::Mutex::new(log_file))
+            .with_ansi(false)
+            .init();
+    } else {
+        // CLI mode: log to stderr
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    }
 
     // Bridge `log` crate (used by openmls) into tracing so the filter above works
     tracing_log::LogTracer::init().ok();
-
-    let cli = Cli::parse();
 
     match cli.command {
         None | Some(Commands::Chat) => {

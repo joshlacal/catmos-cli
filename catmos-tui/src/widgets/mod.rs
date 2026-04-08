@@ -17,7 +17,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // status bar
+            Constraint::Length(1), // status bar
             Constraint::Min(1),    // message area (fills remaining)
             Constraint::Length(3), // input bar
         ])

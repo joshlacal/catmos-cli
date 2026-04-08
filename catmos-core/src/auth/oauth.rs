@@ -109,10 +109,9 @@ impl OAuthAuth {
             )));
         }
 
-        let session_info: SessionResponse = session_resp
-            .json()
-            .await
-            .map_err(|e| CatmosError::AuthFailed(format!("failed to parse session response: {e}")))?;
+        let session_info: SessionResponse = session_resp.json().await.map_err(|e| {
+            CatmosError::AuthFailed(format!("failed to parse session response: {e}"))
+        })?;
 
         Ok(Self {
             session_cookie: session_id,
@@ -125,7 +124,8 @@ impl OAuthAuth {
     /// Persist OAuth session to the session store.
     pub async fn save(&self, db: &Database) -> Result<()> {
         db.store_session_value("auth_method", "oauth").await?;
-        db.store_session_value("session_cookie", &self.session_cookie).await?;
+        db.store_session_value("session_cookie", &self.session_cookie)
+            .await?;
         db.store_session_value("did", &self.did).await?;
         db.store_session_value("handle", &self.handle).await?;
         db.store_session_value("nest_url", &self.nest_url).await?;

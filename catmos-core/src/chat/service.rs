@@ -344,12 +344,12 @@ impl ChatService {
         match resp.stats {
             Some(s) => Ok(KeyPackageStatus {
                 available: s.total_available as u64,
-                target: 10, // server default target
-                needs_replenish: s.total_available < 5,
+                target: 50, // spec: KEY_PACKAGE_TARGET = 50
+                needs_replenish: s.total_available < 10, // spec: KEY_PACKAGE_LOW_THRESHOLD = 10
             }),
             None => Ok(KeyPackageStatus {
                 available: 0,
-                target: 10,
+                target: 50,
                 needs_replenish: true,
             }),
         }
@@ -567,7 +567,7 @@ impl ChatService {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
         let identity = self.did().as_bytes().to_vec();
-        let packages = self.mls.create_key_packages(&identity, 10)?;
+        let packages = self.mls.create_key_packages(&identity, 50)?;
 
         let now = chrono::Utc::now();
         let expires_str =
