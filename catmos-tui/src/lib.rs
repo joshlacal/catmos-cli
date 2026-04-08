@@ -82,29 +82,27 @@ pub async fn run() -> anyhow::Result<()> {
     ));
 
     // ── 4a. MLS device registration + join missing conversations ──────
-    match mls.ensure_registered(&service, &did, &db).await {
-        Ok(device_info) => {
-            info!("MLS device ready: {}", device_info.device_id);
-            // Fetch conversations first so join_missing knows what groups exist
-            match service.fetch_conversations().await {
-                Ok(_) => {
-                    info!("Joining missing conversations (10s timeout)...");
-                    // Timeout to avoid blocking startup on GroupInfo refresh waits
-                    let did_clone = did.clone();
-                    let svc = Arc::clone(&service);
-                    let join_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        svc.join_missing_conversations(&did_clone),
-                    )
-                    .await;
-                    if join_result.is_err() {
-                        info!("Join phase timed out — will retry in background");
-                    }
-                }
-                Err(e) => error!("Failed to fetch conversations for joining: {e}"),
-            }
-        }
-        Err(e) => error!("MLS registration failed: {e}"),
+    // Timeout the entire registration/join phase so a slow server can't block startup
+    let reg_result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let device_info = mls.ensure_registered(&service, &did, &db).await?;
+        info!("MLS device ready: {}", device_info.device_id);
+        // Fetch conversations first so join_missing knows what groups exist
+        service.fetch_conversations().await?;
+        info!("Joining missing conversations (10s timeout)...");
+        let did_clone = did.clone();
+        let svc = Arc::clone(&service);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            svc.join_missing_conversations(&did_clone),
+        )
+        .await;
+        Ok::<_, catmos_core::error::CatmosError>(())
+    })
+    .await;
+    match reg_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("MLS setup failed: {e}"),
+        Err(_) => info!("MLS setup timed out — will continue with background sync"),
     }
 
     // ── 5. Initial sync ────────────────────────────────────────────────
@@ -123,43 +121,28 @@ pub async fn run() -> anyhow::Result<()> {
 
             // Load cached messages for the active conversation immediately
             if let Some(convo) = app.active_conversation() {
-                let group_id = convo.group_id.clone();
-                if let Ok(cached) = service.load_local_messages(&group_id, 50).await {
+                let convo_id = convo.conversation_id.clone();
+                if let Ok(cached) = service.load_local_messages(&convo_id, 50).await {
                     if !cached.is_empty() {
                         app.messages = cached;
                     }
                 }
             }
 
-            // Pre-fetch messages for ALL conversations in parallel (populates SQLCipher cache)
+            // Pre-fetch messages for ALL conversations in background (populates SQLCipher cache).
+            // Don't block startup — TUI renders immediately with cached messages.
             let group_ids: Vec<String> = app
                 .conversations
                 .iter()
                 .map(|c| c.group_id.clone())
                 .collect();
-            let active_gid = app.active_conversation().map(|c| c.group_id.clone());
-
-            let mut handles = Vec::with_capacity(group_ids.len());
             for gid in group_ids {
                 let svc = Arc::clone(&service);
-                handles.push(tokio::spawn(async move {
-                    match svc.fetch_messages(&gid, 50).await {
-                        Ok(msgs) => Some((gid, msgs)),
-                        Err(e) => {
-                            debug!("Pre-fetch failed for {}: {e}", &gid[..12.min(gid.len())]);
-                            None
-                        }
+                tokio::spawn(async move {
+                    if let Err(e) = svc.fetch_messages(&gid, 50).await {
+                        debug!("Pre-fetch failed for {}: {e}", &gid[..12.min(gid.len())]);
                     }
-                }));
-            }
-
-            // Collect results — update active conversation's messages if we got fresh data
-            for handle in handles {
-                if let Ok(Some((gid, msgs))) = handle.await {
-                    if Some(&gid) == active_gid.as_ref() {
-                        app.messages = msgs;
-                    }
-                }
+                });
             }
         }
         Err(e) => {
@@ -292,11 +275,16 @@ pub async fn run() -> anyhow::Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if let Err(e) = svc.full_sync().await {
-                    tracing::debug!("Background sync error: {:?}", e);
+                // Fetch conversations in the background task (network I/O),
+                // then send the result to the TUI — never block the event loop.
+                match svc.fetch_conversations().await {
+                    Ok(convos) => {
+                        let _ = tx.send(AppEvent::ConvoListUpdated(convos));
+                    }
+                    Err(e) => {
+                        tracing::debug!("Background sync error: {:?}", e);
+                    }
                 }
-                // Notify TUI to refresh conversation list
-                let _ = tx.send(AppEvent::SyncCompleted);
             }
         })
     };
@@ -358,7 +346,7 @@ async fn main_loop(
                     }
                     // Append to in-memory list if it belongs to the active conversation
                     if let Some(convo) = app.active_conversation() {
-                        if msg.convo_id == convo.group_id {
+                        if msg.convo_id == convo.conversation_id {
                             app.messages.push(msg);
                         }
                     }
@@ -412,10 +400,7 @@ async fn main_loop(
                     });
                 }
                 AppEvent::SyncCompleted => {
-                    // Refresh conversation list from cache after background sync
-                    if let Ok(convos) = app.service.fetch_conversations().await {
-                        app.conversations = convos;
-                    }
+                    // No-op: background sync now sends ConvoListUpdated directly
                 }
                 AppEvent::Error(e) => {
                     error!("Event error: {e}");
@@ -454,7 +439,7 @@ async fn handle_chat_key(app: &mut App, key: crossterm::event::KeyEvent) {
             let text = app.take_input();
             if !text.is_empty() {
                 if let Some(convo) = app.active_conversation() {
-                    let convo_id = convo.group_id.clone();
+                    let convo_id = convo.conversation_id.clone();
                     match app.service.send_message(&convo_id, &text).await {
                         Ok(msg) => {
                             app.messages.push(msg);
@@ -500,8 +485,8 @@ async fn handle_chat_key(app: &mut App, key: crossterm::event::KeyEvent) {
 /// and stays current via WebSocket events.
 async fn reload_messages(app: &mut App) {
     if let Some(convo) = app.active_conversation() {
-        let group_id = convo.group_id.clone();
-        match app.service.load_local_messages(&group_id, 50).await {
+        let convo_id = convo.conversation_id.clone();
+        match app.service.load_local_messages(&convo_id, 50).await {
             Ok(msgs) => app.messages = msgs,
             Err(e) => error!("Failed to load messages from local DB: {e}"),
         }

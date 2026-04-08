@@ -91,6 +91,10 @@ pub(crate) struct GetConvosResp {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConvoViewResp {
     pub group_id: String,
+    /// Stable conversation identifier (survives group resets).
+    /// Falls back to group_id when not provided by the server.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
     pub creator: String,
     pub epoch: i64,
     pub cipher_suite: String,
@@ -169,6 +173,10 @@ pub(crate) fn convo_resp_to_conversation(view: &ConvoViewResp) -> Conversation {
     let members = view.members.iter().map(member_resp_to_member).collect();
 
     Conversation {
+        conversation_id: view
+            .conversation_id
+            .clone()
+            .unwrap_or_else(|| view.group_id.clone()),
         group_id: view.group_id.clone(),
         name: view.metadata.as_ref().and_then(|m| m.name.clone()),
         description: view.metadata.as_ref().and_then(|m| m.description.clone()),

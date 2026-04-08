@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
+    pub conversation_id: String,
     pub group_id: String,
     pub name: Option<String>,
     pub description: Option<String>,

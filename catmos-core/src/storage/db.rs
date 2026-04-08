@@ -61,8 +61,11 @@ impl Database {
 
     async fn migrate(&self) -> Result<()> {
         let statements = [
-            ("conversations", "CREATE TABLE IF NOT EXISTS conversations (
-                group_id      TEXT PRIMARY KEY,
+            (
+                "conversations",
+                "CREATE TABLE IF NOT EXISTS conversations (
+                conversation_id TEXT PRIMARY KEY,
+                group_id      TEXT NOT NULL,
                 name          TEXT,
                 description   TEXT,
                 creator       TEXT NOT NULL,
@@ -72,8 +75,11 @@ impl Database {
                 last_message_at TEXT,
                 unread_count  INTEGER NOT NULL DEFAULT 0,
                 alias         TEXT
-            )"),
-            ("members", "CREATE TABLE IF NOT EXISTS members (
+            )",
+            ),
+            (
+                "members",
+                "CREATE TABLE IF NOT EXISTS members (
                 did           TEXT NOT NULL,
                 group_id      TEXT NOT NULL,
                 user_did      TEXT NOT NULL,
@@ -83,9 +89,12 @@ impl Database {
                 is_moderator  INTEGER NOT NULL DEFAULT 0,
                 joined_at     TEXT NOT NULL,
                 PRIMARY KEY (did, group_id),
-                FOREIGN KEY (group_id) REFERENCES conversations(group_id)
-            )"),
-            ("messages", "CREATE TABLE IF NOT EXISTS messages (
+                FOREIGN KEY (group_id) REFERENCES conversations(conversation_id)
+            )",
+            ),
+            (
+                "messages",
+                "CREATE TABLE IF NOT EXISTS messages (
                 id            TEXT PRIMARY KEY,
                 convo_id      TEXT NOT NULL,
                 sender_did    TEXT,
@@ -94,19 +103,27 @@ impl Database {
                 epoch         INTEGER NOT NULL DEFAULT 0,
                 seq           INTEGER NOT NULL DEFAULT 0,
                 created_at    TEXT NOT NULL,
-                FOREIGN KEY (convo_id) REFERENCES conversations(group_id)
-            )"),
-            ("idx_messages", "CREATE INDEX IF NOT EXISTS idx_messages_convo_seq ON messages(convo_id, seq)"),
-            ("session", "CREATE TABLE IF NOT EXISTS session (
+                FOREIGN KEY (convo_id) REFERENCES conversations(conversation_id)
+            )",
+            ),
+            (
+                "idx_messages",
+                "CREATE INDEX IF NOT EXISTS idx_messages_convo_seq ON messages(convo_id, seq)",
+            ),
+            (
+                "session",
+                "CREATE TABLE IF NOT EXISTS session (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            )"),
+            )",
+            ),
         ];
 
         for (name, sql) in &statements {
-            sqlx::query(sql).execute(&self.pool).await.map_err(|e| {
-                CatmosError::Storage(format!("Migration '{name}' failed: {e}"))
-            })?;
+            sqlx::query(sql)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| CatmosError::Storage(format!("Migration '{name}' failed: {e}")))?;
         }
         Ok(())
     }
@@ -136,9 +153,10 @@ impl Database {
     pub async fn store_conversation(&self, convo: &Conversation) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO conversations
-             (group_id, name, description, creator, epoch, cipher_suite, created_at, last_message_at, unread_count, alias)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (conversation_id, group_id, name, description, creator, epoch, cipher_suite, created_at, last_message_at, unread_count, alias)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
+        .bind(&convo.conversation_id)
         .bind(&convo.group_id)
         .bind(&convo.name)
         .bind(&convo.description)
@@ -176,7 +194,7 @@ impl Database {
 
     pub async fn list_conversations(&self) -> Result<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT group_id, name, description, creator, epoch, cipher_suite,
+            "SELECT conversation_id, group_id, name, description, creator, epoch, cipher_suite,
                     created_at, last_message_at, unread_count, alias
              FROM conversations ORDER BY last_message_at DESC NULLS LAST",
         )
@@ -189,6 +207,7 @@ impl Database {
                 let created_str: String = row.get("created_at");
                 let last_msg_str: Option<String> = row.get("last_message_at");
                 Conversation {
+                    conversation_id: row.get("conversation_id"),
                     group_id: row.get("group_id"),
                     name: row.get("name"),
                     description: row.get("description"),
@@ -267,6 +286,18 @@ impl Database {
         let mut messages: Vec<Message> = rows.iter().map(map_message_row).collect();
         messages.reverse(); // return in chronological order
         Ok(messages)
+    }
+
+    /// Get the highest seq number stored locally for a conversation.
+    /// Used to request only newer messages from the server via `sinceSeq`.
+    pub async fn get_max_seq(&self, convo_id: &str) -> Result<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT MAX(seq) FROM messages WHERE convo_id = ?1 AND seq > 0",
+        )
+        .bind(convo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(seq,)| seq))
     }
 
     // ── Members ──────────────────────────────────────────────────────────
