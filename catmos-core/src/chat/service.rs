@@ -579,7 +579,7 @@ impl ChatService {
                 mls_chat::publish_key_packages::KeyPackageItemData {
                     cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
                     expires: expires_str.parse().expect("valid datetime"),
-                    key_package: BASE64.encode(&kp.key_package_data),
+                    key_package: kp.key_package_data.clone(),
                 }
                 .into()
             })
