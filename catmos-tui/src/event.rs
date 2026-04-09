@@ -23,6 +23,10 @@ pub enum AppEvent {
     GroupReset { convo_id: String, new_group_id: String, reset_generation: u64 },
     /// Background sync completed — refresh conversation list.
     SyncCompleted,
+    /// A message we sent was confirmed by the server.
+    MessageSent(Message),
+    /// A message send failed.
+    SendFailed(String),
     /// An error to display in the status bar.
     Error(String),
 }

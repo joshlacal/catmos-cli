@@ -325,7 +325,7 @@ pub async fn run() -> anyhow::Result<()> {
         })
     };
 
-    let result = main_loop(&mut terminal, &mut app, &mut events).await;
+    let result = main_loop(&mut terminal, &mut app, &mut events, event_tx).await;
 
     // ── 8. Restore terminal ────────────────────────────────────────────
     disable_raw_mode()?;
@@ -340,6 +340,7 @@ async fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     events: &mut EventLoop,
+    event_tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
 ) -> anyhow::Result<()> {
     loop {
         // Draw
@@ -357,7 +358,7 @@ async fn main_loop(
                     }
 
                     match app.screen {
-                        Screen::Chat => handle_chat_key(app, key).await,
+                        Screen::Chat => handle_chat_key(app, key, &event_tx).await,
                         Screen::CommandPalette => {
                             // Command palette is a future enhancement
                             if map_key(key) == Action::Cancel {
@@ -437,6 +438,17 @@ async fn main_loop(
                         }
                     });
                 }
+                AppEvent::MessageSent(msg) => {
+                    if let Some(convo) = app.active_conversation() {
+                        if msg.convo_id == convo.conversation_id {
+                            app.messages.push(msg);
+                            app.scroll_offset = 0;
+                        }
+                    }
+                }
+                AppEvent::SendFailed(e) => {
+                    error!("Send failed: {e}");
+                }
                 AppEvent::SyncCompleted => {
                     // No-op: background sync now sends ConvoListUpdated directly
                 }
@@ -453,7 +465,7 @@ async fn main_loop(
 }
 
 /// Handle a key event in the Chat screen.
-async fn handle_chat_key(app: &mut App, key: crossterm::event::KeyEvent) {
+async fn handle_chat_key(app: &mut App, key: crossterm::event::KeyEvent, event_tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>) {
     let action = map_key(key);
 
     match action {
@@ -478,15 +490,18 @@ async fn handle_chat_key(app: &mut App, key: crossterm::event::KeyEvent) {
             if !text.is_empty() {
                 if let Some(convo) = app.active_conversation() {
                     let convo_id = convo.conversation_id.clone();
-                    match app.service.send_message(&convo_id, &text).await {
-                        Ok(msg) => {
-                            app.messages.push(msg);
-                            app.scroll_offset = 0;
+                    let svc = Arc::clone(&app.service);
+                    let tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        match svc.send_message(&convo_id, &text).await {
+                            Ok(msg) => {
+                                let _ = tx.send(AppEvent::MessageSent(msg));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AppEvent::SendFailed(format!("{e}")));
+                            }
                         }
-                        Err(e) => {
-                            error!("Failed to send message: {e}");
-                        }
-                    }
+                    });
                 }
             }
         }

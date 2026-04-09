@@ -655,6 +655,9 @@ impl ChatService {
             );
 
             let page_count = resp.messages.len();
+            let mut consecutive_failures = 0u32;
+            let epoch_before_page = current_epoch;
+
             for entry in &resp.messages {
                 let ciphertext = base64::engine::general_purpose::STANDARD
                     .decode(&entry.ciphertext.bytes)
@@ -665,6 +668,7 @@ impl ChatService {
                 if self.own_commits.lock().await.remove(&hash).is_some() {
                     debug!("sync: skipping own commit {} epoch={}", entry.id, entry.epoch);
                     total_processed += 1;
+                    consecutive_failures = 0;
                     continue;
                 }
 
@@ -674,10 +678,17 @@ impl ChatService {
                 {
                     Ok(_) => {
                         total_processed += 1;
+                        consecutive_failures = 0;
                         debug!("sync: processed commit {} epoch={}", entry.id, entry.epoch);
                     }
                     Err(e) => {
+                        consecutive_failures += 1;
                         debug!("sync: skip commit {} epoch={}: {e}", entry.id, entry.epoch);
+                        // Bail early: if 3+ consecutive commits fail, the rest likely will too
+                        if consecutive_failures >= 3 {
+                            debug!("sync {convo_label}: bailing after {consecutive_failures} consecutive failures");
+                            break;
+                        }
                     }
                 }
             }
@@ -687,6 +698,12 @@ impl ChatService {
                 .mls
                 .with_context(|ctx| ctx.get_epoch(gid_bytes.clone()))
                 .unwrap_or(current_epoch);
+
+            // If epoch didn't advance, stop — we're stuck and need a rejoin, not more fetches
+            if current_epoch == epoch_before_page {
+                debug!("sync {convo_label}: epoch stuck at {current_epoch}, stopping");
+                break;
+            }
 
             // If we got fewer than the limit, we've reached the end
             if page_count < 50 {
