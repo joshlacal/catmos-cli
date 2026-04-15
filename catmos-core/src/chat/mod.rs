@@ -1,3 +1,4 @@
+pub mod blocks;
 pub mod messages;
 pub mod service;
 pub mod sync;

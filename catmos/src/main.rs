@@ -83,6 +83,28 @@ enum Commands {
     Blob(BlobCommands),
     #[command(subcommand)]
     Alias(AliasCommands),
+    /// Manage Bluesky blocks (syncs with MLS group membership).
+    #[command(subcommand)]
+    Block(BlockCommands),
+}
+
+#[derive(clap::Subcommand)]
+enum BlockCommands {
+    /// Block a user. Leaves any shared MLS conversations (prompts first).
+    Add {
+        /// DID of the user to block.
+        did: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Unblock a user. Does NOT rejoin groups (MLS requires a fresh invite).
+    Remove {
+        /// DID of the user to unblock.
+        did: String,
+    },
+    /// List all users this account has blocked.
+    List,
 }
 
 #[derive(clap::Subcommand)]
@@ -186,22 +208,26 @@ async fn init_service() -> anyhow::Result<ChatService> {
     let db = Database::open(&db_path, &db_key).await?;
 
     // Try to restore auth: OAuth first, then AppPassword
-    let auth = if let Some(oauth) = OAuthAuth::load(&db).await? {
+    let (auth, token_session) = if let Some(oauth) = OAuthAuth::load(&db).await? {
         info!("Restored OAuth session for {did}");
-        AuthMethod::OAuth {
-            session_cookie: oauth.session_cookie,
-            did: oauth.did.clone(),
-            nest_url: oauth.nest_url,
-        }
+        (
+            AuthMethod::OAuth {
+                session_cookie: oauth.session_cookie,
+                did: oauth.did.clone(),
+                nest_url: oauth.nest_url,
+            },
+            None,
+        )
     } else if let Some(ap) = AppPasswordAuth::load(&db).await? {
         info!("Restored app password session for {}", ap.handle);
-        AuthMethod::AppPassword {
-            handle: ap.handle,
-            did: ap.did,
-            access_jwt: ap.access_jwt,
-            refresh_jwt: ap.refresh_jwt,
-            pds_url: ap.pds_url,
-        }
+        (
+            AuthMethod::AppPassword {
+                handle: ap.handle,
+                did: ap.did,
+                pds_url: ap.pds_url,
+            },
+            Some(ap.session),
+        )
     } else {
         anyhow::bail!("No saved session found. Run `catmos login` first.");
     };
@@ -212,7 +238,14 @@ async fn init_service() -> anyhow::Result<ChatService> {
     let aliases = Arc::new(RwLock::new(AliasStore::load()?));
 
     let db = Arc::new(db);
-    let service = ChatService::new(auth, mls.clone(), db.clone(), config, aliases);
+    let service = ChatService::new(
+        auth,
+        token_session,
+        mls.clone(),
+        db.clone(),
+        config,
+        aliases,
+    );
 
     // Auto-register MLS device on startup (idempotent — skips if already registered)
     match mls.ensure_registered(&service, &did, &db).await {
@@ -227,6 +260,44 @@ async fn init_service() -> anyhow::Result<ChatService> {
                         convos.len()
                     );
                     service.join_missing_conversations(&did).await;
+
+                    // Block reconciliation: leave any MLS group containing a
+                    // user from this account's own block list. Catches up on
+                    // blocks made from other clients (iOS, web, etc.) before
+                    // catmos-cli last ran.
+                    match service.list_own_blocks().await {
+                        Ok(blocks) if !blocks.is_empty() => {
+                            let blocked: std::collections::HashSet<String> =
+                                blocks.into_iter().collect();
+                            let convos_to_leave: Vec<String> = service
+                                .conversations()
+                                .await
+                                .into_iter()
+                                .filter(|c| {
+                                    c.members.iter().any(|m| blocked.contains(&m.user_did))
+                                })
+                                .map(|c| c.group_id)
+                                .collect();
+
+                            let mut left = 0usize;
+                            for id in &convos_to_leave {
+                                if let Err(e) = service.leave_conversation(id).await {
+                                    tracing::warn!("reconcile leave {id}: {e}");
+                                } else {
+                                    left += 1;
+                                }
+                            }
+                            if left > 0 {
+                                println!(
+                                    "Reconciled: left {left} group(s) containing blocked users."
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch own block list: {e}");
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to fetch conversations for group joining: {e}");
@@ -761,6 +832,77 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     "Blobs: {} ({:.1} / {:.1} MB used)",
                     usage.blob_count, used_mb, quota_mb
                 );
+            }
+        },
+
+        // ── Blocks ───────────────────────────────────────────────────────
+        Commands::Block(sub) => match sub {
+            BlockCommands::Add { did, yes } => {
+                let svc = init_service().await?;
+                // Ensure conversation list is populated so we can compute
+                // affected groups. init_service attempts this too, but the
+                // fetch may have been skipped on MLS registration failure.
+                if let Err(e) = svc.fetch_conversations().await {
+                    tracing::warn!("fetch_conversations failed before block: {e}");
+                }
+
+                let affected: Vec<String> = svc
+                    .conversations()
+                    .await
+                    .into_iter()
+                    .filter(|c| c.members.iter().any(|m| m.user_did == did))
+                    .map(|c| c.group_id)
+                    .collect();
+
+                if !yes {
+                    println!(
+                        "Blocking {} will leave {} conversation(s). Continue? [y/N]",
+                        did,
+                        affected.len()
+                    );
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    if !input.trim().eq_ignore_ascii_case("y") {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                }
+
+                let uri = svc.create_block(&did).await?;
+                tracing::info!("Created block record: {uri}");
+
+                let mut left = 0usize;
+                for id in &affected {
+                    match svc.leave_conversation(id).await {
+                        Ok(()) => left += 1,
+                        Err(e) => eprintln!("leave {id} failed: {e}"),
+                    }
+                }
+                println!("Blocked {did} and left {left}/{} conversations.", affected.len());
+            }
+            BlockCommands::Remove { did } => {
+                let svc = init_service().await?;
+                let deleted = svc.remove_block(&did).await?;
+                if deleted == 0 {
+                    println!("No existing block record found for {did}.");
+                } else {
+                    println!(
+                        "Unblocked {did} ({deleted} record(s) removed). \
+                         Previously-left conversations are NOT rejoined — \
+                         MLS requires a fresh invite."
+                    );
+                }
+            }
+            BlockCommands::List => {
+                let svc = init_service().await?;
+                let blocks = svc.list_own_blocks().await?;
+                if blocks.is_empty() {
+                    println!("(no blocks)");
+                } else {
+                    for did in blocks {
+                        println!("{did}");
+                    }
+                }
             }
         },
 
