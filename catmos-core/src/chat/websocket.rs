@@ -155,6 +155,8 @@ impl ChatService {
         let own_commits = self.own_commits.clone();
         let config = self.config.clone();
         let auth = self.auth.clone();
+        let token_session = self.token_session.clone();
+        let db = self.db.clone();
         let http = self.http.clone();
 
         // 3. Spawn reader task with reconnect loop
@@ -232,9 +234,14 @@ impl ChatService {
 
                 // Get a fresh subscription ticket using a temporary client
                 // (we can't hold &self across the spawn boundary, so we
-                //  rebuild the request manually).
+                //  rebuild the request manually). Uses the jacquard token
+                // session so token refresh happens transparently.
                 let ticket_result = get_subscription_ticket_standalone(
-                    &http, &auth, &config,
+                    &http,
+                    &auth,
+                    token_session.as_ref(),
+                    &db,
+                    &config,
                 )
                 .await;
 
@@ -273,46 +280,75 @@ impl ChatService {
 
 /// Standalone subscription ticket fetch for use inside the reconnect task.
 /// Avoids needing a `&ChatService` reference across the spawn boundary.
+/// On 401/400 with an AppPassword session, refreshes tokens via jacquard
+/// and retries once.
 async fn get_subscription_ticket_standalone(
     http: &reqwest::Client,
     auth: &crate::auth::AuthMethod,
+    token_session: Option<&crate::auth::TokenSession>,
+    db: &crate::storage::db::Database,
     config: &crate::storage::config::Config,
 ) -> std::result::Result<SubscriptionTicketResponse, String> {
     use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+    use reqwest::StatusCode;
 
     let nsid = "blue.catbird.mlsChat.getSubscriptionTicket";
-    let mut headers = HeaderMap::new();
 
-    let url = match auth {
-        crate::auth::AuthMethod::OAuth {
-            session_cookie,
-            nest_url,
-            ..
-        } => {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {session_cookie}"))
-                    .map_err(|e| e.to_string())?,
-            );
-            format!("{nest_url}/xrpc/{nsid}")
-        }
-        crate::auth::AuthMethod::AppPassword { access_jwt, .. } => {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {access_jwt}"))
-                    .map_err(|e| e.to_string())?,
-            );
+    let base_url = match auth {
+        crate::auth::AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
+        crate::auth::AuthMethod::AppPassword { .. } => {
             format!("{}/xrpc/{nsid}", config.server.mls_url)
         }
     };
 
+    // Resolve the bearer token for this attempt — OAuth uses the cookie;
+    // AppPassword pulls the current access JWT out of the token session.
+    let initial_bearer = match (auth, token_session) {
+        (crate::auth::AuthMethod::OAuth { session_cookie, .. }, _) => session_cookie.clone(),
+        (crate::auth::AuthMethod::AppPassword { .. }, Some(sess)) => sess
+            .current_bearer()
+            .await
+            .map_err(|e| format!("bearer fetch failed: {e}"))?,
+        (crate::auth::AuthMethod::AppPassword { .. }, None) => {
+            return Err("AppPassword auth without a TokenSession".into());
+        }
+    };
+
+    let build_headers = |bearer: &str| -> std::result::Result<HeaderMap, String> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {bearer}")).map_err(|e| e.to_string())?,
+        );
+        Ok(headers)
+    };
+
     let resp = http
-        .post(&url)
-        .headers(headers)
+        .post(&base_url)
+        .headers(build_headers(&initial_bearer)?)
         .json(&serde_json::json!({}))
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
+
+    // Retry once after token refresh if AppPassword + unauthorized
+    let should_refresh = token_session.is_some()
+        && matches!(resp.status(), StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST);
+    let resp = if should_refresh {
+        let sess = token_session.expect("checked above");
+        let new_bearer = sess
+            .refresh(db)
+            .await
+            .map_err(|e| format!("refresh failed: {e}"))?;
+        http.post(&base_url)
+            .headers(build_headers(&new_bearer)?)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| format!("Network error (retry): {e}"))?
+    } else {
+        resp
+    };
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();

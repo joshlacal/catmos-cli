@@ -47,22 +47,26 @@ pub async fn run() -> anyhow::Result<()> {
     let db = Arc::new(Database::open(&db_path, &db_key).await?);
 
     // Try OAuth first, then AppPassword
-    let auth = if let Some(oauth) = OAuthAuth::load(&db).await? {
+    let (auth, token_session) = if let Some(oauth) = OAuthAuth::load(&db).await? {
         info!("Restored OAuth session for {did}");
-        AuthMethod::OAuth {
-            session_cookie: oauth.session_cookie,
-            did: oauth.did.clone(),
-            nest_url: oauth.nest_url,
-        }
+        (
+            AuthMethod::OAuth {
+                session_cookie: oauth.session_cookie,
+                did: oauth.did.clone(),
+                nest_url: oauth.nest_url,
+            },
+            None,
+        )
     } else if let Some(ap) = AppPasswordAuth::load(&db).await? {
         info!("Restored app password session for {}", ap.handle);
-        AuthMethod::AppPassword {
-            handle: ap.handle,
-            did: ap.did,
-            access_jwt: ap.access_jwt,
-            refresh_jwt: ap.refresh_jwt,
-            pds_url: ap.pds_url,
-        }
+        (
+            AuthMethod::AppPassword {
+                handle: ap.handle,
+                did: ap.did,
+                pds_url: ap.pds_url,
+            },
+            Some(ap.session),
+        )
     } else {
         anyhow::bail!("No saved session found. Run `catmos login` first.");
     };
@@ -75,6 +79,7 @@ pub async fn run() -> anyhow::Result<()> {
     let aliases = Arc::new(RwLock::new(AliasStore::load()?));
     let service = Arc::new(ChatService::new(
         auth,
+        token_session,
         mls.clone(),
         db.clone(),
         config.clone(),

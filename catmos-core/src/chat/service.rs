@@ -2,14 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, COOKIE};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::StatusCode;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
 use catbird_atproto::catbird::mls_chat;
 
-use crate::auth::AuthMethod;
+use crate::auth::{AuthMethod, TokenSession};
 use crate::error::{CatmosError, Result};
 use crate::mls::MlsManager;
 use crate::storage::aliases::AliasStore;
@@ -93,6 +94,9 @@ struct GetBlobUsageResp {
 pub struct ChatService {
     pub(crate) http: reqwest::Client,
     pub(crate) auth: AuthMethod,
+    /// Jacquard-backed token lifecycle (login/refresh) for AppPassword auth.
+    /// `None` for OAuth, which is refreshed server-side by nest.
+    pub(crate) token_session: Option<TokenSession>,
     pub mls: Arc<MlsManager>,
     pub db: Arc<Database>,
     pub(crate) config: Config,
@@ -111,6 +115,7 @@ pub struct ChatService {
 impl ChatService {
     pub fn new(
         auth: AuthMethod,
+        token_session: Option<TokenSession>,
         mls: Arc<MlsManager>,
         db: Arc<Database>,
         config: Config,
@@ -119,6 +124,7 @@ impl ChatService {
         Self {
             http: reqwest::Client::new(),
             auth,
+            token_session,
             mls,
             db,
             config,
@@ -188,12 +194,16 @@ impl ChatService {
     // ── XRPC transport ──────────────────────────────────────────────────
 
     /// POST an XRPC procedure (e.g. `blue.catbird.mlsChat.sendMessage`).
+    ///
+    /// On 401/Unauthorized from AppPassword sessions, refreshes the jacquard
+    /// session and retries exactly once.
     pub async fn xrpc_procedure<T: Serialize, R: DeserializeOwned>(
         &self,
         nsid: &str,
         input: &T,
     ) -> Result<R> {
-        let (url, headers) = self.build_request(nsid)?;
+        let bearer = self.current_bearer().await?;
+        let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC POST {nsid} -> {url}");
 
         let resp = self
@@ -204,6 +214,21 @@ impl ChatService {
             .send()
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let resp = if self.should_retry_after_refresh(resp.status()) {
+            let new_bearer = self.refresh_bearer().await?;
+            let (url, headers) = self.build_request(nsid, &new_bearer)?;
+            debug!("XRPC POST {nsid} retry after refresh -> {url}");
+            self.http
+                .post(&url)
+                .headers(headers)
+                .json(input)
+                .send()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?
+        } else {
+            resp
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -219,12 +244,16 @@ impl ChatService {
     }
 
     /// GET an XRPC query (e.g. `blue.catbird.mlsChat.getConvos`).
+    ///
+    /// On 401/Unauthorized from AppPassword sessions, refreshes the jacquard
+    /// session and retries exactly once.
     pub async fn xrpc_query<R: DeserializeOwned>(
         &self,
         nsid: &str,
         params: &[(&str, &str)],
     ) -> Result<R> {
-        let (url, headers) = self.build_request(nsid)?;
+        let bearer = self.current_bearer().await?;
+        let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC GET {nsid} -> {url}");
 
         let resp = self
@@ -235,6 +264,21 @@ impl ChatService {
             .send()
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let resp = if self.should_retry_after_refresh(resp.status()) {
+            let new_bearer = self.refresh_bearer().await?;
+            let (url, headers) = self.build_request(nsid, &new_bearer)?;
+            debug!("XRPC GET {nsid} retry after refresh -> {url}");
+            self.http
+                .get(&url)
+                .headers(headers)
+                .query(params)
+                .send()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?
+        } else {
+            resp
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -255,6 +299,37 @@ impl ChatService {
                 &body[..body.len().min(300)]
             ))
         })
+    }
+
+    /// True if we should refresh & retry after the server returned this status
+    /// code (AppPassword only — OAuth is refreshed server-side by nest).
+    pub(crate) fn should_retry_after_refresh(&self, status: StatusCode) -> bool {
+        self.token_session.is_some()
+            && matches!(
+                status,
+                StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
+            )
+    }
+
+    /// Fetch the current bearer token for the active auth method.
+    pub(crate) async fn current_bearer(&self) -> Result<String> {
+        match (&self.auth, &self.token_session) {
+            (AuthMethod::OAuth { session_cookie, .. }, _) => Ok(session_cookie.clone()),
+            (AuthMethod::AppPassword { .. }, Some(sess)) => sess.current_bearer().await,
+            (AuthMethod::AppPassword { .. }, None) => Err(CatmosError::AuthFailed(
+                "AppPassword auth without a TokenSession — restart catmos".into(),
+            )),
+        }
+    }
+
+    /// Force a `refreshSession` call on the AppPassword token session, persist
+    /// the new tokens, and return the fresh bearer. Fails if no token session.
+    pub(crate) async fn refresh_bearer(&self) -> Result<String> {
+        let sess = self.token_session.as_ref().ok_or_else(|| {
+            CatmosError::AuthFailed("no TokenSession — cannot refresh".into())
+        })?;
+        tracing::info!("Refreshing app-password session tokens");
+        sess.refresh(&self.db).await
     }
 
     // ── Conversation management ──────────────────────────────────────────
@@ -658,7 +733,8 @@ impl ChatService {
             .map_err(|e| CatmosError::Other(format!("Failed to read file {file_path}: {e}")))?;
 
         let nsid = mls_chat::upload_blob::NSID;
-        let (url, headers) = self.build_request(nsid)?;
+        let bearer = self.current_bearer().await?;
+        let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC POST {nsid} -> {url}");
 
         let resp = self
@@ -667,10 +743,26 @@ impl ChatService {
             .headers(headers)
             .query(&[("convoId", convo_id)])
             .header("content-type", "application/octet-stream")
-            .body(data)
+            .body(data.clone())
             .send()
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let resp = if self.should_retry_after_refresh(resp.status()) {
+            let new_bearer = self.refresh_bearer().await?;
+            let (url, headers) = self.build_request(nsid, &new_bearer)?;
+            self.http
+                .post(&url)
+                .headers(headers)
+                .query(&[("convoId", convo_id)])
+                .header("content-type", "application/octet-stream")
+                .body(data)
+                .send()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?
+        } else {
+            resp
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -692,7 +784,8 @@ impl ChatService {
     /// Download a blob by ID and write it to the given output path.
     pub async fn download_blob(&self, blob_id: &str, output_path: &str) -> Result<()> {
         let nsid = mls_chat::get_blob::NSID;
-        let (url, headers) = self.build_request(nsid)?;
+        let bearer = self.current_bearer().await?;
+        let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC GET {nsid} -> {url}");
 
         let resp = self
@@ -703,6 +796,20 @@ impl ChatService {
             .send()
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let resp = if self.should_retry_after_refresh(resp.status()) {
+            let new_bearer = self.refresh_bearer().await?;
+            let (url, headers) = self.build_request(nsid, &new_bearer)?;
+            self.http
+                .get(&url)
+                .headers(headers)
+                .query(&[("blobId", blob_id)])
+                .send()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?
+        } else {
+            resp
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -735,43 +842,36 @@ impl ChatService {
         })
     }
 
-    /// Build the target URL and auth headers for an XRPC call.
+    /// Build the target URL and auth headers for an XRPC call, given a
+    /// pre-resolved bearer token.
     ///
     /// - OAuth: routes through nest (confidential client proxy)
     /// - AppPassword: routes directly to mls-ds for `blue.catbird.mlsChat.*` endpoints
-    fn build_request(&self, nsid: &str) -> Result<(String, HeaderMap)> {
+    pub(crate) fn build_request(
+        &self,
+        nsid: &str,
+        bearer: &str,
+    ) -> Result<(String, HeaderMap)> {
         let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {bearer}"))
+                .map_err(|e| CatmosError::AuthFailed(e.to_string()))?,
+        );
 
-        match &self.auth {
-            AuthMethod::OAuth {
-                session_cookie,
-                nest_url,
-                ..
-            } => {
-                let url = format!("{nest_url}/xrpc/{nsid}");
-                // Use Bearer token (same session_id as cookie, but more reliable for API clients)
-                headers.insert(
-                    AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {session_cookie}"))
-                        .map_err(|e| CatmosError::AuthFailed(e.to_string()))?,
-                );
-                Ok((url, headers))
-            }
-            AuthMethod::AppPassword { access_jwt, .. } => {
+        let url = match &self.auth {
+            AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
+            AuthMethod::AppPassword { .. } => {
                 // Route mlsChat calls directly to the MLS delivery service
                 let base = if nsid.starts_with("blue.catbird.mlsChat.") {
                     &self.config.server.mls_url
                 } else {
                     &self.config.server.nest_url
                 };
-                let url = format!("{base}/xrpc/{nsid}");
-                headers.insert(
-                    AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {access_jwt}"))
-                        .map_err(|e| CatmosError::AuthFailed(e.to_string()))?,
-                );
-                Ok((url, headers))
+                format!("{base}/xrpc/{nsid}")
             }
-        }
+        };
+
+        Ok((url, headers))
     }
 }
