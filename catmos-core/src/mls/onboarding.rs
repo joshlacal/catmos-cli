@@ -307,6 +307,7 @@ impl MlsManager {
                     commit: Some(commit_b64),
                     confirmation_tag: tag_b64,
                     device_id: None,
+                    epoch_authenticator: None,
                     group_info: group_info_b64,
                     idempotency_key: None,
                     key_package_hashes: None,
