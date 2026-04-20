@@ -375,6 +375,11 @@ impl MlsManager {
     }
 
     /// Fetch the base64-encoded GroupInfo for a conversation from the server.
+    ///
+    /// The server returns `groupInfo` in AT Protocol `{"$bytes": "base64..."}`
+    /// wrapper form (matches the regenerated mls-ds types). Older server builds
+    /// emitted a plain base64 string. Accept both so CLI keeps working while
+    /// the wire format evolves.
     async fn fetch_group_info(&self, service: &ChatService, convo_id: &str) -> Result<String> {
         let group_state: serde_json::Value = service
             .xrpc_query(
@@ -390,15 +395,22 @@ impl MlsManager {
                 .map(|o| o.keys().collect::<Vec<_>>())
         );
 
-        group_state
-            .get("groupInfo")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| {
-                CatmosError::Other(format!(
-                    "GroupInfoUnavailable: getGroupState response missing groupInfo for {convo_id}"
-                ))
-            })
+        let gi = group_state.get("groupInfo").ok_or_else(|| {
+            CatmosError::Other(format!(
+                "GroupInfoUnavailable: getGroupState response missing groupInfo for {convo_id}"
+            ))
+        })?;
+
+        if let Some(s) = gi.as_str() {
+            return Ok(s.to_string());
+        }
+        if let Some(b) = gi.get("$bytes").and_then(|v| v.as_str()) {
+            return Ok(b.to_string());
+        }
+
+        Err(CatmosError::Other(format!(
+            "GroupInfoUnavailable: unexpected groupInfo shape {gi:?} for {convo_id}"
+        )))
     }
 
     /// Check whether an error indicates that GroupInfo is unavailable

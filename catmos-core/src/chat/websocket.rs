@@ -407,12 +407,33 @@ async fn convert_event(
                     };
                 }
 
+                // Task #47: explicit stage + merge. process_message stages the
+                // commit; we must call merge_incoming_commit to actually advance
+                // the epoch. Auto-merge was removed in catbird-mls task #33.
+                let gid_for_merge = gid_bytes.clone();
                 match mls.with_context(|ctx| ctx.process_message(gid_bytes, ct_bytes)) {
+                    Ok(catbird_mls::ProcessedContent::StagedCommit { new_epoch, .. }) => {
+                        match mls.with_context(|ctx| {
+                            ctx.merge_incoming_commit(gid_for_merge.clone(), new_epoch)
+                        }) {
+                            Ok(merged) => debug!(
+                                "WS commit {message_id} staged+merged for {convo_id} (epoch {merged})"
+                            ),
+                            Err(e) => {
+                                warn!(
+                                    "WS commit {message_id} merge_incoming_commit failed: {e}"
+                                );
+                                let _ = mls.with_context(|ctx| {
+                                    ctx.discard_incoming_commit(gid_for_merge.clone(), new_epoch)
+                                });
+                            }
+                        }
+                    }
                     Ok(_) => {
-                        debug!("Processed commit message {message_id} for {convo_id}");
+                        debug!("WS commit {message_id}: non-commit content returned, nothing to merge");
                     }
                     Err(e) => {
-                        debug!("Failed to process commit {message_id}: {e}");
+                        debug!("Failed to process WS commit {message_id}: {e}");
                     }
                 }
                 // Commits aren't user-visible messages — skip
@@ -462,18 +483,34 @@ async fn convert_event(
             sender_did: evt.did.to_string(),
             is_typing: evt.is_typing,
         },
-        SubscribeEventsMessage::MemberJoined(evt) => WsEvent::MemberJoined {
-            convo_id: evt.convo_id.to_string(),
-            member_did: evt.did.to_string(),
-        },
-        SubscribeEventsMessage::MemberLeft(evt) => WsEvent::MemberLeft {
-            convo_id: evt.convo_id.to_string(),
-            member_did: evt.did.to_string(),
-        },
-        SubscribeEventsMessage::EpochAdvanced(evt) => WsEvent::EpochAdvanced {
-            convo_id: evt.convo_id.to_string(),
-            new_epoch: evt.epoch as u64,
-        },
+        // Lexicon drift (April 2026): the separate `memberJoined` / `memberLeft`
+        // / `epochAdvanced` events were collapsed. Membership deltas now ride on
+        // `membershipChangeEvent` (distinguished by `action`), and epoch
+        // advancement is reported via `treeChanged`.
+        //
+        // Lexicon `knownValues` for action: ["joined", "left", "removed", "kicked"].
+        // "left" = self-initiated leave; "removed" / "kicked" = admin-initiated.
+        // From the UI's perspective all three are "this DID is no longer a member."
+        SubscribeEventsMessage::MembershipChangeEvent(evt) => {
+            let action = evt.action.as_ref();
+            match action {
+                "joined" => WsEvent::MemberJoined {
+                    convo_id: evt.convo_id.to_string(),
+                    member_did: evt.did.to_string(),
+                },
+                "left" | "removed" | "kicked" => WsEvent::MemberLeft {
+                    convo_id: evt.convo_id.to_string(),
+                    member_did: evt.did.to_string(),
+                },
+                other => {
+                    info!(
+                        "WS MembershipChangeEvent: unknown action {other:?} for {}",
+                        evt.convo_id
+                    );
+                    WsEvent::Error(format!("Unknown membership action: {other}"))
+                }
+            }
+        }
         SubscribeEventsMessage::ReactionEvent(evt) => WsEvent::Reaction {
             convo_id: evt.convo_id.to_string(),
             message_id: evt.message_id.to_string(),

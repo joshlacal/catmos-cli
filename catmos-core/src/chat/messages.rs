@@ -627,7 +627,12 @@ impl ChatService {
         let mut total_processed = 0u32;
 
         loop {
-            let from_epoch = current_epoch.to_string();
+            // Server stores each commit at the epoch it LANDS ON (post-apply),
+            // and its get_messages filter is `epoch >= fromEpoch`. Requesting
+            // `fromEpoch = current_epoch` would return the commit we already
+            // applied to reach current_epoch, which then fails with a
+            // forward-secrecy error (sender_epoch = current-1). Skip past it.
+            let from_epoch = current_epoch.saturating_add(1).to_string();
             let resp: GetMessagesResp = self
                 .xrpc_query(
                     mls_chat::get_messages::NSID,
@@ -672,14 +677,57 @@ impl ChatService {
                     continue;
                 }
 
-                match self
+                // Task #47: three-phase receive — process_message stages the commit
+                // (does NOT advance the epoch). We must then explicitly call
+                // merge_incoming_commit to confirm, or discard_incoming_commit to
+                // abandon. Auto-merge behavior moved out of catbird-mls in task #33.
+                //
+                // Policy here: always merge after successful stage. catmos-cli sees
+                // commits only via server fan-out, so anything that deserialised and
+                // staged cleanly is the canonical next epoch.
+                let process_result = self
                     .mls
-                    .with_context(|ctx| ctx.process_message(gid_bytes.clone(), ciphertext.clone()))
-                {
+                    .with_context(|ctx| ctx.process_message(gid_bytes.clone(), ciphertext.clone()));
+                match process_result {
+                    Ok(catbird_mls::ProcessedContent::StagedCommit { new_epoch, .. }) => {
+                        // Confirm the merge so the local epoch actually advances.
+                        match self.mls.with_context(|ctx| {
+                            ctx.merge_incoming_commit(gid_bytes.clone(), new_epoch)
+                        }) {
+                            Ok(merged_epoch) => {
+                                total_processed += 1;
+                                consecutive_failures = 0;
+                                debug!(
+                                    "sync: staged+merged commit {} epoch={} (local now {merged_epoch})",
+                                    entry.id, entry.epoch
+                                );
+                            }
+                            Err(e) => {
+                                consecutive_failures += 1;
+                                warn!(
+                                    "sync: merge_incoming_commit failed for {} epoch={}: {e}",
+                                    entry.id, entry.epoch
+                                );
+                                // Best-effort discard so we don't leak a staged handle.
+                                let _ = self.mls.with_context(|ctx| {
+                                    ctx.discard_incoming_commit(gid_bytes.clone(), new_epoch)
+                                });
+                                if consecutive_failures >= 3 {
+                                    debug!("sync {convo_label}: bailing after {consecutive_failures} consecutive merge failures");
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     Ok(_) => {
+                        // Proposal / ApplicationMessage delivered down the commit
+                        // endpoint is unusual but harmless — nothing to merge.
                         total_processed += 1;
                         consecutive_failures = 0;
-                        debug!("sync: processed commit {} epoch={}", entry.id, entry.epoch);
+                        debug!(
+                            "sync: non-commit processed for {} epoch={}",
+                            entry.id, entry.epoch
+                        );
                     }
                     Err(e) => {
                         consecutive_failures += 1;
