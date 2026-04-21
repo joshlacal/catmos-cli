@@ -290,32 +290,38 @@ impl MlsManager {
                 hex::encode(&ext_result.group_id)
             );
 
-            // 3. Send the commit to the server (with GroupInfo so other clients can join)
-            let commit_b64 = BASE64.encode(&ext_result.commit_data);
-            let group_info_b64 = ext_result.group_info.as_ref().map(|gi| BASE64.encode(gi));
+            // 3. Send the commit to the server (with GroupInfo so other clients can join).
+            //
+            // Build CommitGroupChange<'static> directly (via
+            // `chat::service::build_commit_group_change`) to bypass the
+            // double-encoding trap in `catbird_atproto::catbird::mls_chat::
+            // commit_group_change::InputData`. That wrapper types bytes fields
+            // as `Option<String>` and maps them via `bytes::Bytes::from(String)`
+            // which takes the UTF-8 bytes of the string verbatim — passing a
+            // pre-base64-encoded string (the old pattern here) resulted in
+            // `{"$bytes": base64(ASCII-of-base64)}` on the wire, which the
+            // server then decodes into ASCII-of-base64 garbage instead of the
+            // raw commit. That's the root of the MLS-joining blocker tracked
+            // in `project_catmos_cli_status.md`. See #64 commit for the full
+            // rationale; the fix applies identically to this external-commit
+            // path.
 
             // Get confirmation tag from the new local group state after external commit
-            let tag_b64 = self
+            let tag_bytes = self
                 .with_context(|ctx| ctx.get_confirmation_tag(ext_result.group_id.clone()))
-                .map(|tag| BASE64.encode(&tag))
                 .ok();
 
-            let req: mls_chat::commit_group_change::Input =
-                mls_chat::commit_group_change::InputData {
-                    convo_id: convo_id.to_string(),
-                    action: "externalCommit".to_string(),
-                    commit: Some(commit_b64),
-                    confirmation_tag: tag_b64,
-                    device_id: None,
-                    epoch_authenticator: None,
-                    group_info: group_info_b64,
-                    idempotency_key: None,
-                    key_package_hashes: None,
-                    member_dids: None,
-                    pending_addition_id: None,
-                    welcome: None,
-                }
-                .into();
+            let req = crate::chat::service::build_commit_group_change(
+                convo_id,
+                "externalCommit",
+                Some(ext_result.commit_data.clone()),
+                None, // welcome: none for externalCommit (server
+                      // enforce_non_add_action_contract rejects it)
+                ext_result.group_info.clone(),
+                tag_bytes,
+                None, // member_dids: none for externalCommit (same gate)
+                None, // idempotency_key
+            );
 
             match service
                 .xrpc_procedure::<_, serde_json::Value>(mls_chat::commit_group_change::NSID, &req)

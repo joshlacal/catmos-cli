@@ -579,7 +579,14 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
 
             ConvoCommands::Join { convo_id } => {
                 let svc = init_service().await?;
-                svc.join_conversation(&convo_id).await?;
+                // Route to the real external-commit join flow (fetch GroupInfo
+                // → create_external_commit → POST commitGroupChange → merge
+                // locally) in `MlsManager::join_via_external_commit`. The
+                // former `ChatService::join_conversation` was a broken
+                // placeholder (see service.rs task #65 note); removed.
+                svc.mls
+                    .join_via_external_commit(&svc, &convo_id, svc.did())
+                    .await?;
                 println!(
                     "Joined conversation {}",
                     &convo_id[..12.min(convo_id.len())]

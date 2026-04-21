@@ -176,7 +176,7 @@ mod serde_bytes_wrapper {
 /// the lexicon struct directly lets us pass raw `bytes::Bytes::from(Vec<u8>)`
 /// so the single serializer layer does the one correct base64 encode.
 #[allow(clippy::too_many_arguments)]
-fn build_commit_group_change(
+pub(crate) fn build_commit_group_change(
     convo_id: &str,
     action: &str,
     commit: Option<Vec<u8>>,
@@ -550,30 +550,16 @@ impl ChatService {
 
     // ── Join / Update / Member management ─────────────────────────────────
 
-    /// Join an existing conversation via external commit.
-    pub async fn join_conversation(&self, convo_id: &str) -> Result<()> {
-        let req: mls_chat::commit_group_change::Input = mls_chat::commit_group_change::InputData {
-            convo_id: convo_id.to_string(),
-            action: "externalCommit".to_string(),
-            commit: None,
-            confirmation_tag: None,
-            device_id: None,
-            epoch_authenticator: None,
-            group_info: None,
-            idempotency_key: None,
-            key_package_hashes: None,
-            member_dids: None,
-            pending_addition_id: None,
-            welcome: None,
-        }
-        .into();
-
-        let _: serde_json::Value = self
-            .xrpc_procedure(mls_chat::commit_group_change::NSID, &req)
-            .await?;
-
-        Ok(())
-    }
+    // NOTE: the former `join_conversation` method lived here. It POSTed
+    // `commitGroupChange` with `action: "externalCommit"` and every commit/
+    // welcome/group_info field set to None — no MLS crypto was performed
+    // locally, so the server always rejected it as `InvalidCommit`. The real
+    // external-commit join flow is in `crate::mls::onboarding::MlsManager::
+    // join_via_external_commit`, which fetches GroupInfo, constructs the
+    // external commit via `MLSContext::create_external_commit`, and merges
+    // locally on success. Removed in task #65 along with fixing the same
+    // double-encoding wire bug in onboarding.rs. CLI `convo join` now routes
+    // there directly.
 
     /// Update conversation metadata (name, description).
     ///
