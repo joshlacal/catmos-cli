@@ -5,10 +5,14 @@ use std::time::Instant;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::StatusCode;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
+use catbird_atproto::blue_catbird::mlsChat::commit_group_change::CommitGroupChange;
 use catbird_atproto::catbird::mls_chat;
+use catbird_mls::group_metadata::GroupMetadata;
+use catbird_mls::orchestrator_bridge::FFICommitKind;
 
 use crate::auth::{AuthMethod, TokenSession};
 use crate::error::{CatmosError, Result};
@@ -87,6 +91,120 @@ struct GetBlobUsageResp {
     used_bytes: i64,
     quota_bytes: i64,
     blob_count: i64,
+}
+
+// ── commitGroupChange ───────────────────────────────────────────────────
+//
+// Thin DeserializeOwned response wrapper for `commitGroupChange`. Mirrors the
+// Jacquard-generated `CommitGroupChangeOutput` shape for the fields we care
+// about at the sender side — used to pick up the server-echoed `newEpoch`
+// which we fence `confirm_commit` against.
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitGroupChangeResp {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    new_epoch: Option<i64>,
+}
+
+// ── getKeyPackages ──────────────────────────────────────────────────────
+//
+// DeserializeOwned wrapper for `getKeyPackages` output. The server emits
+// `keyPackage` as a `{"$bytes": "base64..."}` envelope (AT Protocol bytes
+// wrapper), so we use `serde_bytes_wrapper` below to unwrap it.
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // did / cipher_suite / key_package_hash are parsed but
+                    // not yet consumed — kept for log-line surface and for
+                    // future `keyPackageHashes` commit-group-change field.
+struct KeyPackageRefResp {
+    did: String,
+    cipher_suite: String,
+    #[serde(with = "serde_bytes_wrapper")]
+    key_package: Vec<u8>,
+    #[serde(default)]
+    key_package_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetKeyPackagesResp {
+    #[serde(default)]
+    key_packages: Vec<KeyPackageRefResp>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    missing: Option<Vec<String>>,
+}
+
+/// AT Protocol `{"$bytes": "base64..."}` envelope → raw `Vec<u8>`.
+///
+/// The server-side lexicon types serialize `bytes` fields as
+/// `{"$bytes": "<BASE64>"}`. Use this helper when deserializing into a
+/// plain `Vec<u8>` in our thin owned response wrappers.
+mod serde_bytes_wrapper {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+    use serde::{de::Error as DeError, Deserialize, Deserializer};
+
+    #[derive(Deserialize)]
+    struct Wrapper {
+        #[serde(rename = "$bytes")]
+        bytes: String,
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let w = Wrapper::deserialize(d)?;
+        BASE64
+            .decode(&w.bytes)
+            .map_err(|e| D::Error::custom(format!("invalid $bytes base64: {e}")))
+    }
+}
+
+/// Build a `CommitGroupChange<'static>` for the wire **without** going through
+/// the buggy `InputData → Input` adapter in `catbird-atproto`.
+///
+/// Why not use `catbird_atproto::catbird::mls_chat::commit_group_change::InputData`?
+/// That adapter types `commit` / `welcome` / `group_info` / `confirmation_tag` as
+/// `Option<String>`, and its `From<InputData> for Input` impl maps them via
+/// `String → bytes::Bytes`. `bytes::Bytes::from(String)` takes the UTF-8 bytes
+/// of the string verbatim — so when callers pass a pre-base64 string, the
+/// bytes field ends up containing the ASCII of the base64 text and the jacquard
+/// serializer then wraps it as `{"$bytes": base64(ASCII-base64)}`, producing
+/// double-encoded commits the server rejects or silently mis-decodes. Building
+/// the lexicon struct directly lets us pass raw `bytes::Bytes::from(Vec<u8>)`
+/// so the single serializer layer does the one correct base64 encode.
+#[allow(clippy::too_many_arguments)]
+fn build_commit_group_change(
+    convo_id: &str,
+    action: &str,
+    commit: Option<Vec<u8>>,
+    welcome: Option<Vec<u8>>,
+    group_info: Option<Vec<u8>>,
+    confirmation_tag: Option<Vec<u8>>,
+    member_dids: Option<Vec<String>>,
+    idempotency_key: Option<String>,
+) -> CommitGroupChange<'static> {
+    CommitGroupChange {
+        convo_id: convo_id.to_string().into(),
+        action: action.to_string().into(),
+        commit: commit.map(bytes::Bytes::from),
+        welcome: welcome.map(bytes::Bytes::from),
+        group_info: group_info.map(bytes::Bytes::from),
+        confirmation_tag: confirmation_tag.map(bytes::Bytes::from),
+        member_dids: member_dids.map(|dids| {
+            dids.into_iter()
+                .map(catbird_atproto::types::string::Did::from)
+                .collect()
+        }),
+        idempotency_key: idempotency_key.map(Into::into),
+        device_id: None,
+        epoch_authenticator: None,
+        key_package_hashes: None,
+        pending_addition_id: None,
+        ..Default::default()
+    }
 }
 
 /// Central coordinator for chat operations: XRPC calls, message encryption,
@@ -458,85 +576,327 @@ impl ChatService {
     }
 
     /// Update conversation metadata (name, description).
+    ///
+    /// This drives a client-side MLS commit (GroupContextExtensions update) via
+    /// the three-phase `stage_commit` / `confirm_commit` / `discard_pending`
+    /// API on `MLSContext` and posts to `commitGroupChange` with
+    /// `action: "updateMetadata"`.
+    ///
+    /// Note: the generic `"commit" | "updateMetadata"` branch on the server
+    /// rejects requests that set `welcome` or `memberDids`, so those stay
+    /// `None`. The server also does not echo `newEpoch` reliably for this
+    /// action, so we fence `confirm_commit` with the skip sentinel and trust
+    /// the staged target epoch.
     pub async fn update_conversation(
         &self,
         convo_id: &str,
         name: Option<&str>,
         description: Option<&str>,
     ) -> Result<()> {
-        // The generated UpdateConvo type doesn't have metadata fields directly,
-        // so we construct the JSON manually using the correct field names from
-        // the generated type.
-        let mut json = serde_json::json!({
-            "action": "updateMetadata",
-            "convoId": convo_id,
-        });
-        if let Some(n) = name {
-            json["name"] = serde_json::Value::String(n.to_string());
-        }
-        if let Some(d) = description {
-            json["description"] = serde_json::Value::String(d.to_string());
-        }
+        // 1. Build the GroupMetadata JSON blob that MLS will embed in the
+        //    group-context extension (matches iOS `GroupMetadataPayload`).
+        let metadata = GroupMetadata::new(
+            name.map(str::to_string),
+            description.map(str::to_string),
+        );
+        let metadata_json = metadata
+            .to_extension_bytes()
+            .map_err(|e| CatmosError::Other(format!("Failed to encode GroupMetadata: {e}")))?;
 
-        let _: serde_json::Value = self
-            .xrpc_procedure(mls_chat::update_convo::NSID, &json)
-            .await?;
+        // 2. Stage the updateMetadata commit locally (not yet merged, not yet
+        //    sent to the DS).
+        let did = self.did().to_string();
+        let plan = self.mls.with_commit_context(|ctx| {
+            ctx.stage_commit(
+                convo_id.to_string(),
+                FFICommitKind::UpdateMetadata {
+                    group_info_extension: metadata_json,
+                },
+                did.as_bytes().to_vec(),
+            )
+        })?;
 
-        Ok(())
+        // 3. POST commitGroupChange carrying the raw commit bytes. welcome /
+        //    memberDids MUST be None for updateMetadata (server-side
+        //    enforce_non_add_action_contract gate).
+        let req = build_commit_group_change(
+            convo_id,
+            "updateMetadata",
+            Some(plan.commit_bytes.clone()),
+            None,
+            None,
+            None,
+            None,
+            Some(ulid::Ulid::new().to_string()),
+        );
+
+        // Track our own commit so the incoming sync/WS path doesn't
+        // redundantly process it (spec §5.4 — own-commit dedup).
+        self.track_own_commit(&plan.commit_bytes).await;
+
+        let handle = plan.handle.clone();
+        match self
+            .xrpc_procedure::<_, CommitGroupChangeResp>(
+                mls_chat::commit_group_change::NSID,
+                &req,
+            )
+            .await
+        {
+            Ok(resp) if resp.success => {
+                // commitGroupChange does not reliably echo newEpoch for the
+                // `updateMetadata` path — fence with the skip sentinel and
+                // trust the staged target epoch (mirrors iOS).
+                let server_epoch = catbird_mls::mls_skip_server_epoch_fence();
+                if let Err(e) = self
+                    .mls
+                    .with_commit_context(|ctx| ctx.confirm_commit(handle.clone(), server_epoch))
+                {
+                    warn!(
+                        "update_conversation: confirm_commit failed for {convo_id}: {e} — \
+                         discarding staged commit to avoid leaking pending state"
+                    );
+                    // TODO(#63): if `e` is an unflattened EpochMismatch, we
+                    // could surface { local, remote } to the caller.
+                    let _ = self
+                        .mls
+                        .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
+                    return Err(e);
+                }
+                info!("Updated metadata for conversation {convo_id}");
+                Ok(())
+            }
+            Ok(_) => {
+                // Server returned 200 but success=false — treat as failure.
+                let _ = self
+                    .mls
+                    .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
+                Err(CatmosError::Xrpc(format!(
+                    "commitGroupChange[updateMetadata] returned success=false for {convo_id}"
+                )))
+            }
+            Err(e) => {
+                // Server rejected the commit — discard the staged handle so
+                // OpenMLS's one-pending-commit invariant is restored.
+                let _ = self
+                    .mls
+                    .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
+                Err(e)
+            }
+        }
     }
 
     /// Add a member to a conversation.
+    ///
+    /// Drives a client-side MLS `addMembers` commit (three-phase:
+    /// `stage_commit` → POST → `confirm_commit` on success, `discard_pending`
+    /// on any failure). Fetches the target device's key packages from the
+    /// server first, then constructs and ships the commit + Welcome.
     pub async fn add_member(&self, convo_id: &str, member_did: &str) -> Result<()> {
-        let req: mls_chat::commit_group_change::Input = mls_chat::commit_group_change::InputData {
-            convo_id: convo_id.to_string(),
-            action: "addMembers".to_string(),
-            commit: None,
-            confirmation_tag: None,
-            device_id: None,
-            epoch_authenticator: None,
-            group_info: None,
-            idempotency_key: None,
-            key_package_hashes: None,
-            member_dids: Some(vec![catbird_atproto::types::string::Did::from(
-                member_did.to_string(),
-            )]),
-            pending_addition_id: None,
-            welcome: None,
+        // 1. Fetch key packages for the target DID (server returns one KP per
+        //    registered device). Missing DIDs surface as an error.
+        let kp_refs = self.fetch_key_packages(&[member_did.to_string()]).await?;
+        if kp_refs.is_empty() {
+            return Err(CatmosError::Other(format!(
+                "No key packages available for {member_did}"
+            )));
         }
-        .into();
+        let key_packages: Vec<Vec<u8>> = kp_refs.iter().map(|k| k.key_package.clone()).collect();
 
-        let _: serde_json::Value = self
-            .xrpc_procedure(mls_chat::commit_group_change::NSID, &req)
-            .await?;
+        // 2. Stage the addMembers commit locally.
+        let did = self.did().to_string();
+        let plan = self.mls.with_commit_context(|ctx| {
+            ctx.stage_commit(
+                convo_id.to_string(),
+                FFICommitKind::AddMembers {
+                    member_dids: vec![member_did.to_string()],
+                    key_packages: key_packages.clone(),
+                },
+                did.as_bytes().to_vec(),
+            )
+        })?;
 
-        Ok(())
+        let welcome_bytes = plan.welcome_bytes.clone().ok_or_else(|| {
+            CatmosError::Other(
+                "stage_commit(AddMembers) did not return welcome bytes".to_string(),
+            )
+        })?;
+
+        // 3. POST commitGroupChange with commit + welcome + memberDids.
+        let req = build_commit_group_change(
+            convo_id,
+            "addMembers",
+            Some(plan.commit_bytes.clone()),
+            Some(welcome_bytes),
+            None,
+            None,
+            Some(vec![member_did.to_string()]),
+            Some(ulid::Ulid::new().to_string()),
+        );
+
+        self.track_own_commit(&plan.commit_bytes).await;
+
+        let handle = plan.handle.clone();
+        match self
+            .xrpc_procedure::<_, CommitGroupChangeResp>(
+                mls_chat::commit_group_change::NSID,
+                &req,
+            )
+            .await
+        {
+            Ok(resp) if resp.success => {
+                // Server echoes `newEpoch` on the addMembers path (see
+                // mls-ds `handle_add_members`). Use it to fence
+                // confirm_commit, mirroring iOS. Fall back to the skip
+                // sentinel for idempotency hits where the server returns 0.
+                let server_epoch = match resp.new_epoch {
+                    Some(e) if e > 0 => e as u64,
+                    _ => catbird_mls::mls_skip_server_epoch_fence(),
+                };
+                if let Err(e) = self
+                    .mls
+                    .with_commit_context(|ctx| ctx.confirm_commit(handle.clone(), server_epoch))
+                {
+                    warn!(
+                        "add_member: confirm_commit failed for {convo_id}: {e} — discarding"
+                    );
+                    let _ = self
+                        .mls
+                        .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
+                    return Err(e);
+                }
+                info!(
+                    "Added {member_did} to {convo_id} (epoch hint: {:?})",
+                    resp.new_epoch
+                );
+                Ok(())
+            }
+            Ok(_) => {
+                let _ = self
+                    .mls
+                    .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
+                Err(CatmosError::Xrpc(format!(
+                    "commitGroupChange[addMembers] returned success=false for {convo_id}"
+                )))
+            }
+            Err(e) => {
+                let _ = self
+                    .mls
+                    .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
+                Err(e)
+            }
+        }
     }
 
     /// Remove a member from a conversation.
+    ///
+    /// Drives a client-side MLS `removeMembers` commit (three-phase). No
+    /// Welcome is produced by this path.
     pub async fn remove_member(&self, convo_id: &str, member_did: &str) -> Result<()> {
-        let req: mls_chat::commit_group_change::Input = mls_chat::commit_group_change::InputData {
-            convo_id: convo_id.to_string(),
-            action: "removeMembers".to_string(),
-            commit: None,
-            confirmation_tag: None,
-            device_id: None,
-            epoch_authenticator: None,
-            group_info: None,
-            idempotency_key: None,
-            key_package_hashes: None,
-            member_dids: Some(vec![catbird_atproto::types::string::Did::from(
-                member_did.to_string(),
-            )]),
-            pending_addition_id: None,
-            welcome: None,
+        // 1. Stage the removeMembers commit locally.
+        let did = self.did().to_string();
+        let plan = self.mls.with_commit_context(|ctx| {
+            ctx.stage_commit(
+                convo_id.to_string(),
+                FFICommitKind::RemoveMembers {
+                    member_dids: vec![member_did.to_string()],
+                },
+                did.as_bytes().to_vec(),
+            )
+        })?;
+
+        // 2. POST commitGroupChange with commit + memberDids. No welcome.
+        let req = build_commit_group_change(
+            convo_id,
+            "removeMembers",
+            Some(plan.commit_bytes.clone()),
+            None,
+            None,
+            None,
+            Some(vec![member_did.to_string()]),
+            Some(ulid::Ulid::new().to_string()),
+        );
+
+        self.track_own_commit(&plan.commit_bytes).await;
+
+        let handle = plan.handle.clone();
+        match self
+            .xrpc_procedure::<_, CommitGroupChangeResp>(
+                mls_chat::commit_group_change::NSID,
+                &req,
+            )
+            .await
+        {
+            Ok(resp) if resp.success => {
+                // Server echoes `newEpoch` on the removeMembers path (see
+                // mls-ds handler, returns Some(new_epoch as i64)). Fence
+                // confirm_commit against it; fall back to skip sentinel for
+                // idempotency hits.
+                let server_epoch = match resp.new_epoch {
+                    Some(e) if e > 0 => e as u64,
+                    _ => catbird_mls::mls_skip_server_epoch_fence(),
+                };
+                if let Err(e) = self
+                    .mls
+                    .with_commit_context(|ctx| ctx.confirm_commit(handle.clone(), server_epoch))
+                {
+                    warn!(
+                        "remove_member: confirm_commit failed for {convo_id}: {e} — discarding"
+                    );
+                    let _ = self
+                        .mls
+                        .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
+                    return Err(e);
+                }
+                info!(
+                    "Removed {member_did} from {convo_id} (epoch hint: {:?})",
+                    resp.new_epoch
+                );
+                Ok(())
+            }
+            Ok(_) => {
+                let _ = self
+                    .mls
+                    .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
+                Err(CatmosError::Xrpc(format!(
+                    "commitGroupChange[removeMembers] returned success=false for {convo_id}"
+                )))
+            }
+            Err(e) => {
+                let _ = self
+                    .mls
+                    .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
+                Err(e)
+            }
         }
-        .into();
+    }
 
-        let _: serde_json::Value = self
-            .xrpc_procedure(mls_chat::commit_group_change::NSID, &req)
+    /// Record a SHA-256 of our outgoing commit ciphertext so the incoming
+    /// sync / WebSocket paths can dedup the server-fanned echo (spec §5.4).
+    async fn track_own_commit(&self, commit_bytes: &[u8]) {
+        let hash: [u8; 32] = Sha256::digest(commit_bytes).into();
+        let mut own = self.own_commits.lock().await;
+        own.insert(hash, Instant::now());
+        // Expire entries older than 5 minutes.
+        own.retain(|_, ts| ts.elapsed() < std::time::Duration::from_secs(300));
+    }
+
+    /// Fetch key packages for the given DIDs from the server.
+    ///
+    /// The server returns one key package per registered device for each DID.
+    /// Missing DIDs are surfaced in `missing` (we currently ignore that — the
+    /// caller will just see an empty `key_packages` and can decide policy).
+    pub(crate) async fn fetch_key_packages(
+        &self,
+        dids: &[String],
+    ) -> Result<Vec<KeyPackageRefResp>> {
+        // xrpc_query takes `&[(&str, &str)]`; `dids` is a repeated query
+        // parameter per AT Protocol convention.
+        let params: Vec<(&str, &str)> =
+            dids.iter().map(|d| ("dids", d.as_str())).collect();
+        let resp: GetKeyPackagesResp = self
+            .xrpc_query(mls_chat::get_key_packages::NSID, &params)
             .await?;
-
-        Ok(())
+        Ok(resp.key_packages)
     }
 
     /// Promote a member to admin or moderator.

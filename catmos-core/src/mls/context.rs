@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use catbird_mls::{KeychainAccess, MLSContext, MLSError};
+use catbird_mls::{KeychainAccess, MLSCommitError, MLSContext, MLSError};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
@@ -220,6 +220,22 @@ impl MlsManager {
         F: FnOnce(&MLSContext) -> std::result::Result<T, MLSError>,
     {
         f(&self.context).map_err(CatmosError::Mls)
+    }
+
+    /// Execute a closure with access to the underlying `MLSContext` for the
+    /// three-phase sender-side commit API (task #62).
+    ///
+    /// `stage_commit` / `confirm_commit` / `discard_pending` return
+    /// `Result<_, MLSCommitError>` rather than the usual `MLSError`, so they
+    /// need their own helper — `MLSCommitError` preserves the structured
+    /// `EpochMismatch { local, remote }` variant across the FFI that the
+    /// flat `MLSError` would erase. See `catbird-mls/src/error.rs` for the
+    /// rationale, and `TODO.md` task #63.
+    pub fn with_commit_context<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&MLSContext) -> std::result::Result<T, MLSCommitError>,
+    {
+        f(&self.context).map_err(CatmosError::MlsCommit)
     }
 
     /// Get a reference to the inner Arc<MLSContext>.

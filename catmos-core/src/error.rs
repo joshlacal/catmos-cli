@@ -12,6 +12,12 @@ pub enum CatmosError {
     NotMember(String),
     #[error("MLS error: {0}")]
     Mls(#[from] catbird_mls::MLSError),
+    /// Three-phase-commit failures from `MLSContext::{stage,confirm,discard}_commit`
+    /// (task #62). Carries the structured `EpochMismatch { local, remote }`
+    /// variant so callers can pattern-match instead of string-sniffing
+    /// (task #63 — pending a `MLSError::EpochMismatch` unflatten).
+    #[error("MLS commit error: {0}")]
+    MlsCommit(#[from] catbird_mls::MLSCommitError),
     #[error("XRPC error: {0}")]
     Xrpc(String),
     #[error("Storage error: {0}")]
