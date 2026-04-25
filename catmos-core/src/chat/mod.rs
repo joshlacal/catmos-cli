@@ -1,5 +1,6 @@
 pub mod blocks;
 pub mod messages;
+pub mod recovery_ops;
 pub mod service;
 pub mod sync;
 pub mod websocket;

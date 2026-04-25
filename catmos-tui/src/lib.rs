@@ -413,18 +413,22 @@ async fn main_loop(
                 } => {
                     let label = &convo_id[..12.min(convo_id.len())];
                     info!(
-                        "Group reset for {} to {} (gen {})",
+                        "Group reset for {} to {} (gen {}) — persisting RESET_PENDING",
                         label,
                         &new_group_id[..12.min(new_group_id.len())],
                         reset_generation
                     );
-                    // Spawn repair in background — don't block the event loop
+                    // Spec §8.6: persist the RESET_PENDING payload so the
+                    // next deferred-recovery cycle (Phase 1) adopts the new
+                    // group id. We do NOT call External Commit inline here —
+                    // that's the deferred-recovery loop's job, which already
+                    // gates on RecoveryTracker / circuit breaker.
                     let svc = Arc::clone(&app.service);
                     let cid = convo_id.clone();
+                    let new_gid = new_group_id.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = svc.repair_group(&cid).await {
-                            error!("Failed to handle group reset for {}: {e}", &cid[..12.min(cid.len())]);
-                        }
+                        svc.handle_group_reset_event(&cid, &new_gid, reset_generation)
+                            .await;
                     });
                 }
                 AppEvent::TreeDiverged { convo_id } => {
@@ -435,12 +439,10 @@ async fn main_loop(
                     warn!(
                         "Tree diverged for {label} — flagging NEEDS_REJOIN (deferred recovery)"
                     );
-                    let db = Arc::clone(&app.service.db);
-                    let key = format!("needs_rejoin:{convo_id}");
+                    let svc = Arc::clone(&app.service);
+                    let cid = convo_id.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = db.store_session_value(&key, "1").await {
-                            error!("Failed to flag NEEDS_REJOIN for {}: {e}", &convo_id[..12.min(convo_id.len())]);
-                        }
+                        svc.flag_needs_rejoin(&cid).await;
                     });
                 }
                 AppEvent::MessageSent(msg) => {

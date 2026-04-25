@@ -195,6 +195,10 @@ impl MlsManager {
     /// 2. Create an external commit via the MLS context
     /// 3. Send the commit to the server
     /// 4. On failure, discard the pending join and optionally retry once
+    ///
+    /// NOTE: The §8.4 recovery path in `recovery_ops.rs` does NOT call this —
+    /// it must fetch GroupInfo BEFORE deleting local state, so it uses
+    /// `external_commit_with_group_info` directly after its own fetch.
     pub async fn join_via_external_commit(
         &self,
         service: &ChatService,
@@ -202,6 +206,89 @@ impl MlsManager {
         did: &str,
     ) -> Result<()> {
         self.try_external_commit(service, convo_id, did).await
+    }
+
+    /// Steps 3-5 of §8.4 EXTERNAL_COMMIT_REJOIN: given an already-fetched
+    /// base64 GroupInfo blob, create the External Commit, send it, and merge.
+    /// On any failure the half-built `MlsGroup` is discarded via
+    /// `discard_pending_external_join` (§8.4.1).
+    ///
+    /// Used by `ChatService::external_commit_rejoin` so the GroupInfo fetch
+    /// happens before local state is deleted.
+    pub(crate) async fn external_commit_with_group_info(
+        &self,
+        service: &ChatService,
+        convo_id: &str,
+        did: &str,
+        group_info_b64: &str,
+    ) -> Result<()> {
+        let convo_label = &convo_id[..12.min(convo_id.len())];
+        let group_info_bytes = BASE64
+            .decode(group_info_b64)
+            .map_err(|e| CatmosError::Other(format!("Invalid base64 groupInfo: {e}")))?;
+
+        info!(
+            "external_commit_with_group_info: decoded groupInfo for {convo_label} — {} bytes",
+            group_info_bytes.len()
+        );
+
+        let identity = did.as_bytes().to_vec();
+        let ext_result = self
+            .with_context(|ctx| ctx.create_external_commit(group_info_bytes, identity))?;
+
+        debug!(
+            "Created external commit for {convo_label} ({} bytes), group_id={}",
+            ext_result.commit_data.len(),
+            hex::encode(&ext_result.group_id)
+        );
+
+        let tag_bytes = self
+            .with_context(|ctx| ctx.get_confirmation_tag(ext_result.group_id.clone()))
+            .ok();
+
+        let req = crate::chat::service::build_commit_group_change(
+            convo_id,
+            "externalCommit",
+            Some(ext_result.commit_data.clone()),
+            None,
+            ext_result.group_info.clone(),
+            tag_bytes,
+            None,
+            None,
+        );
+
+        match service
+            .xrpc_procedure::<_, serde_json::Value>(mls_chat::commit_group_change::NSID, &req)
+            .await
+        {
+            Ok(_) => {
+                match self
+                    .with_context(|ctx| ctx.merge_pending_commit(ext_result.group_id.clone()))
+                {
+                    Ok(result) => {
+                        info!(
+                            "Joined conversation {convo_id} via external commit (epoch {})",
+                            result.new_epoch
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "merge_pending_commit failed after external commit for {convo_label}: {e}"
+                        );
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                warn!("External commit rejected for {convo_label}: {e}");
+                if let Err(discard_err) =
+                    self.with_context(|ctx| ctx.discard_pending_external_join(ext_result.group_id))
+                {
+                    warn!("Failed to discard pending join: {discard_err}");
+                }
+                Err(e)
+            }
+        }
     }
 
     async fn try_external_commit(
@@ -386,7 +473,11 @@ impl MlsManager {
     /// wrapper form (matches the regenerated mls-ds types). Older server builds
     /// emitted a plain base64 string. Accept both so CLI keeps working while
     /// the wire format evolves.
-    async fn fetch_group_info(&self, service: &ChatService, convo_id: &str) -> Result<String> {
+    pub(crate) async fn fetch_group_info(
+        &self,
+        service: &ChatService,
+        convo_id: &str,
+    ) -> Result<String> {
         let group_state: serde_json::Value = service
             .xrpc_query(
                 mls_chat::get_group_state::NSID,
@@ -421,7 +512,7 @@ impl MlsManager {
 
     /// Check whether an error indicates that GroupInfo is unavailable
     /// (404 from the server or missing groupInfo field in the response).
-    fn is_group_info_unavailable(err: &CatmosError) -> bool {
+    pub(crate) fn is_group_info_unavailable(err: &CatmosError) -> bool {
         let msg = err.to_string();
         msg.contains("GroupInfoUnavailable")
             || msg.contains("missing groupInfo")

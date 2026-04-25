@@ -5,7 +5,7 @@ use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use catbird_atproto::catbird::mls_chat;
 
@@ -341,8 +341,13 @@ impl ChatService {
                         Ok(msg)
                     }
                     Err(_) => {
-                        // Second failure: flag for deferred recovery — DO NOT EC here
+                        // Spec §5.3: send-path recovery is lightweight sync
+                        // only; on second failure flag NEEDS_REJOIN so the
+                        // post-sync deferred-recovery loop (§8.5) handles
+                        // the External Commit. NEVER EC inline from the send
+                        // path.
                         warn!("send_message: retry also failed for {convo_label}, flagging NEEDS_REJOIN");
+                        self.flag_needs_rejoin(convo_id).await;
                         Err(CatmosError::Other(
                             "Message will send when connection recovers".into(),
                         ))
@@ -712,6 +717,12 @@ impl ChatService {
                                 let _ = self.mls.with_context(|ctx| {
                                     ctx.discard_incoming_commit(gid_bytes.clone(), new_epoch)
                                 });
+                                // §10 EPOCH_DIVERGENCE_THRESHOLD: bump per-convo
+                                // counter; if hit, flag NEEDS_REJOIN and stop
+                                // syncing this conversation (spec §8.2).
+                                if self.note_epoch_divergence(convo_id).await {
+                                    return Ok(());
+                                }
                                 if consecutive_failures >= 3 {
                                     debug!("sync {convo_label}: bailing after {consecutive_failures} consecutive merge failures");
                                     break;
@@ -841,6 +852,8 @@ impl ChatService {
                     // Reset failure counter on successful decrypt
                     consecutive_failures_at_epoch = 0;
                     last_failure_epoch = None;
+                    // §8.2 reset both threshold counters on success.
+                    self.reset_recovery_counters(&entry.convo_id).await;
 
                     let content = parse_message_content(&plaintext);
                     let msg = Message {
@@ -869,10 +882,14 @@ impl ChatService {
                         last_failure_epoch = Some(msg_epoch);
                     }
 
-                    if consecutive_failures_at_epoch == 3 {
+                    // §10 DECRYPTION_FAILURE_THRESHOLD: feed the per-convo
+                    // counter; on threshold this flags NEEDS_REJOIN and we
+                    // bail.
+                    let threshold_hit = self.note_decrypt_failure(&entry.convo_id).await;
+                    if threshold_hit || consecutive_failures_at_epoch == 3 {
                         warn!(
                             "Possible tree divergence for {convo_label} — \
-                             3 consecutive failures at epoch {msg_epoch} (local: {}). \
+                             {consecutive_failures_at_epoch} consecutive failures at epoch {msg_epoch} (local: {}). \
                              Skipping remaining messages.",
                             local_epoch.unwrap_or(0)
                         );
@@ -898,75 +915,15 @@ impl ChatService {
         Ok(messages)
     }
 
-    /// Repair a diverged group: delete local MLS state and re-join via external commit.
+    /// Repair a diverged group via External Commit rejoin (spec §8.4).
     ///
-    /// Called automatically when divergence is detected (3+ consecutive decryption
-    /// failures at the current epoch, or TreeStateDiverged error from server).
+    /// This is now a thin wrapper around `external_commit_rejoin` (in
+    /// `recovery_ops.rs`) so all rejoin paths share the same `RecoveryTracker`
+    /// gating: global `MIN_REJOIN_INTERVAL`, per-convo backoff
+    /// (`REJOIN_BACKOFF`), `MAX_REJOIN_ATTEMPTS` cap with auto-transition to
+    /// `UNRECOVERABLE_LOCAL`, and the `GROUPINFO_404_CIRCUIT_BREAKER`.
     pub async fn repair_group(&self, convo_id: &str) -> Result<()> {
-        let convo_label = &convo_id[..12.min(convo_id.len())];
-
-        // ── Cooldown gate: max 1 external commit per 60s per conversation ──
-        {
-            let cooldowns = self.repair_cooldowns.lock().await;
-            if let Some(last_repair) = cooldowns.get(convo_id) {
-                let elapsed = last_repair.elapsed();
-                if elapsed < std::time::Duration::from_secs(60) {
-                    warn!(
-                        "repair_group: cooldown active for {} ({:.0}s remaining)",
-                        convo_label,
-                        60.0 - elapsed.as_secs_f64()
-                    );
-                    return Err(CatmosError::Other("Repair cooldown active".into()));
-                }
-            }
-        }
-
-        warn!("repair_group: deleting local MLS state for {convo_label}");
-
-        let gid_bytes = hex::decode(convo_id)
-            .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
-
-        // Delete the group from local MLS state
-        let _ = self.mls.with_context(|ctx| {
-            ctx.delete_group(gid_bytes.clone());
-            Ok(())
-        });
-
-        // Re-join via external commit using the existing onboarding flow.
-        // If rate-limited (429), wait and retry once — don't leave client with no state.
-        let did = self.did().to_string();
-        let join_result = self
-            .mls
-            .join_via_external_commit(self, convo_id, &did)
-            .await;
-
-        let join_result = match &join_result {
-            Err(e) if Self::is_rate_limited(e) => {
-                warn!("repair_group: {convo_label} rate-limited, waiting 31s before retry");
-                tokio::time::sleep(std::time::Duration::from_secs(31)).await;
-                self.mls
-                    .join_via_external_commit(self, convo_id, &did)
-                    .await
-            }
-            _ => join_result,
-        };
-
-        // Record cooldown regardless of outcome
-        {
-            let mut cooldowns = self.repair_cooldowns.lock().await;
-            cooldowns.insert(convo_id.to_string(), Instant::now());
-        }
-
-        match join_result {
-            Ok(()) => {
-                info!("repair_group: {convo_label} re-joined successfully");
-                Ok(())
-            }
-            Err(e) => {
-                error!("repair_group: {convo_label} re-join failed: {e}");
-                Err(e)
-            }
-        }
+        self.external_commit_rejoin(convo_id).await
     }
 }
 

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use crate::error::{CatmosError, Result};
+use crate::recovery::{PersistedRecoveryFlags, ResetPendingPayload};
 use crate::types::{Conversation, Member, Message, MessageContent};
 
 /// SQLCipher-encrypted database for per-account storage.
@@ -125,6 +126,41 @@ impl Database {
                 .await
                 .map_err(|e| CatmosError::Storage(format!("Migration '{name}' failed: {e}")))?;
         }
+
+        // ── Additive migrations: recovery state machine columns (spec §8) ──
+        //
+        // SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so we
+        // probe `pragma_table_info` for the column name and only add it if
+        // missing. Any other error is fatal (a real schema problem). This
+        // keeps `migrate()` idempotent across restarts.
+        let recovery_columns: &[(&str, &str)] = &[
+            ("needs_rejoin", "INTEGER NOT NULL DEFAULT 0"),
+            ("reset_new_group_id", "TEXT NULL"),
+            ("reset_generation", "INTEGER NULL"),
+            ("reset_notified_at_ms", "INTEGER NULL"),
+            ("recovery_attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_rejoin_attempt_ms", "INTEGER NULL"),
+            ("unrecoverable_local", "INTEGER NOT NULL DEFAULT 0"),
+        ];
+        for (col, decl) in recovery_columns {
+            let existing: Option<(String,)> = sqlx::query_as(
+                "SELECT name FROM pragma_table_info('conversations') WHERE name = ?1",
+            )
+            .bind(col)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                CatmosError::Storage(format!("Probe column '{col}' failed: {e}"))
+            })?;
+            if existing.is_some() {
+                continue;
+            }
+            let stmt = format!("ALTER TABLE conversations ADD COLUMN {col} {decl}");
+            sqlx::query(&stmt).execute(&self.pool).await.map_err(|e| {
+                CatmosError::Storage(format!("Add column '{col}' failed: {e}"))
+            })?;
+        }
+
         Ok(())
     }
 
@@ -301,6 +337,165 @@ impl Database {
     }
 
     // ── Members ──────────────────────────────────────────────────────────
+
+    // ── Recovery state machine (spec §8) ─────────────────────────────────
+
+    /// Load the persisted recovery flags for `convo_id`. Returns default
+    /// (HEALTHY, no payload) when the row is missing.
+    pub async fn get_recovery_flags(&self, convo_id: &str) -> Result<PersistedRecoveryFlags> {
+        let row = sqlx::query(
+            "SELECT needs_rejoin, reset_new_group_id, reset_generation,
+                    reset_notified_at_ms, recovery_attempt_count,
+                    last_rejoin_attempt_ms, unrecoverable_local
+             FROM conversations WHERE conversation_id = ?1",
+        )
+        .bind(convo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(PersistedRecoveryFlags::default());
+        };
+
+        let needs_rejoin: i64 = row.get("needs_rejoin");
+        let unrecoverable_local: i64 = row.get("unrecoverable_local");
+        let reset_new_group_id: Option<String> = row.get("reset_new_group_id");
+        let reset_generation: Option<i64> = row.get("reset_generation");
+        let reset_notified_at_ms: Option<i64> = row.get("reset_notified_at_ms");
+        let recovery_attempt_count: i64 = row.get("recovery_attempt_count");
+        let last_rejoin_attempt_ms: Option<i64> = row.get("last_rejoin_attempt_ms");
+
+        let reset = match (reset_new_group_id, reset_generation, reset_notified_at_ms) {
+            (Some(gid), Some(gen), Some(ts)) => Some(ResetPendingPayload {
+                new_group_id: gid,
+                reset_generation: gen,
+                notified_at_ms: ts,
+            }),
+            _ => None,
+        };
+
+        Ok(PersistedRecoveryFlags {
+            needs_rejoin: needs_rejoin != 0,
+            unrecoverable_local: unrecoverable_local != 0,
+            reset,
+            recovery_attempt_count: recovery_attempt_count.max(0) as u32,
+            last_rejoin_attempt_ms,
+        })
+    }
+
+    /// Mark a conversation as needing a deferred External Commit rejoin
+    /// (§8.2). Idempotent.
+    pub async fn mark_needs_rejoin(&self, convo_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE conversations SET needs_rejoin = 1 WHERE conversation_id = ?1",
+        )
+        .bind(convo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear the `NEEDS_REJOIN` flag (called on successful rejoin).
+    pub async fn clear_needs_rejoin(&self, convo_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE conversations
+             SET needs_rejoin = 0,
+                 recovery_attempt_count = 0,
+                 last_rejoin_attempt_ms = NULL
+             WHERE conversation_id = ?1",
+        )
+        .bind(convo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Persist an attempt counter bump and timestamp after a failed rejoin.
+    pub async fn record_rejoin_attempt(
+        &self,
+        convo_id: &str,
+        attempt_count: u32,
+        attempt_ms: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE conversations
+             SET recovery_attempt_count = ?1,
+                 last_rejoin_attempt_ms = ?2
+             WHERE conversation_id = ?3",
+        )
+        .bind(attempt_count as i64)
+        .bind(attempt_ms)
+        .bind(convo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark a conversation as locally unrecoverable (max attempts hit, §8.2).
+    pub async fn mark_unrecoverable_local(&self, convo_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE conversations
+             SET unrecoverable_local = 1, needs_rejoin = 0
+             WHERE conversation_id = ?1",
+        )
+        .bind(convo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear the `UNRECOVERABLE_LOCAL` flag (e.g. after server reset
+    /// `GroupResetEvent` rescues us).
+    pub async fn clear_unrecoverable_local(&self, convo_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE conversations SET unrecoverable_local = 0 WHERE conversation_id = ?1",
+        )
+        .bind(convo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Persist a `RESET_PENDING` payload received via `GroupResetEvent`
+    /// (§8.2 / §8.6). The triple is required.
+    pub async fn mark_reset_pending(
+        &self,
+        convo_id: &str,
+        new_group_id: &str,
+        reset_generation: i64,
+        notified_at_ms: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE conversations
+             SET reset_new_group_id = ?1,
+                 reset_generation = ?2,
+                 reset_notified_at_ms = ?3
+             WHERE conversation_id = ?4",
+        )
+        .bind(new_group_id)
+        .bind(reset_generation)
+        .bind(notified_at_ms)
+        .bind(convo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear the persisted `RESET_PENDING` payload (after Phase 1 deferred
+    /// recovery succeeds in adopting the new group).
+    pub async fn clear_reset_pending(&self, convo_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE conversations
+             SET reset_new_group_id = NULL,
+                 reset_generation = NULL,
+                 reset_notified_at_ms = NULL
+             WHERE conversation_id = ?1",
+        )
+        .bind(convo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 
     pub async fn get_members(&self, group_id: &str) -> Result<Vec<Member>> {
         let rows = sqlx::query(

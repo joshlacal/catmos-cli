@@ -17,6 +17,7 @@ use catbird_mls::orchestrator_bridge::FFICommitKind;
 use crate::auth::{AuthMethod, TokenSession};
 use crate::error::{CatmosError, Result};
 use crate::mls::MlsManager;
+use crate::recovery::{GroupInfo404Tracker, RecoveryTracker};
 use crate::storage::aliases::AliasStore;
 use crate::storage::config::Config;
 use crate::storage::db::Database;
@@ -222,9 +223,20 @@ pub struct ChatService {
     pub(crate) conversations: Arc<RwLock<Vec<Conversation>>>,
     /// DID -> handle cache, populated during fetch_conversations.
     pub(crate) handle_cache: Arc<RwLock<HashMap<String, String>>>,
-    /// Per-conversation repair cooldown: tracks when each conversation was last repaired
-    /// to prevent epoch inflation from rapid successive external commits.
-    pub(crate) repair_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Process-wide rejoin tracker (spec §8.4). Replaces the previous
+    /// `repair_cooldowns` map — the new tracker also enforces the global
+    /// `MIN_REJOIN_INTERVAL` floor across all conversations and the per-convo
+    /// `MAX_REJOIN_ATTEMPTS` cap.
+    pub(crate) recovery_tracker: Arc<Mutex<RecoveryTracker>>,
+    /// Per-conversation GroupInfo 404 circuit breaker (spec §8.3).
+    pub(crate) groupinfo_404_tracker: Arc<Mutex<GroupInfo404Tracker>>,
+    /// Per-conversation consecutive decryption failures at the same epoch.
+    /// Reset on every successful decrypt; threshold = `DECRYPTION_FAILURE_THRESHOLD`
+    /// (spec §10).
+    pub(crate) decrypt_fail_counts: Arc<Mutex<HashMap<String, u32>>>,
+    /// Per-conversation consecutive `merge_incoming_commit` / WrongEpoch
+    /// failures. Threshold = `EPOCH_DIVERGENCE_THRESHOLD` (spec §10).
+    pub(crate) epoch_divergence_counts: Arc<Mutex<HashMap<String, u32>>>,
     /// Own-commit SHA256 dedup: hash → timestamp. Prevents processing our own commits
     /// as incoming messages (spec §5.4). Entries expire after 5 minutes.
     pub(crate) own_commits: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
@@ -249,7 +261,10 @@ impl ChatService {
             aliases,
             conversations: Arc::new(RwLock::new(Vec::new())),
             handle_cache: Arc::new(RwLock::new(HashMap::new())),
-            repair_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            recovery_tracker: Arc::new(Mutex::new(RecoveryTracker::new())),
+            groupinfo_404_tracker: Arc::new(Mutex::new(GroupInfo404Tracker::new())),
+            decrypt_fail_counts: Arc::new(Mutex::new(HashMap::new())),
+            epoch_divergence_counts: Arc::new(Mutex::new(HashMap::new())),
             own_commits: Arc::new(Mutex::new(HashMap::new())),
         }
     }
