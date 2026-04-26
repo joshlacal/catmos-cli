@@ -58,18 +58,24 @@ fn is_transient_error_str(msg: &str) -> bool {
         || msg.contains("timeout")
 }
 
-/// Whether an error represents a `createConvo` race-loss: the server returned
-/// 409 with the `ConvoAlreadyExists` lexicon error code, meaning a different
-/// DID won the first-responder bootstrap race for the same `groupId`.
+/// Whether an error represents a `bootstrapResetGroup` race-loss: the server
+/// returned 409 with the `AlreadyBootstrapped` lexicon error code, meaning
+/// another caller already populated `group_info` on the post-reset row for
+/// `(originalConvoId, newGroupId)` (mls-ds task #17).
 ///
-/// Mirrors `catbird_mls::OrchestratorError::is_create_convo_race_loss`. We
-/// re-implement here because catmos-cli surfaces XRPC errors as
-/// `CatmosError::Xrpc("{nsid} returned {status}: {body}")` rather than as a
-/// structured `ServerError { status, body }` variant — substring-matching the
-/// flattened message is the cheapest reliable detection on this platform.
-pub(crate) fn is_create_convo_race_loss(err: &CatmosError) -> bool {
+/// Race-losers MUST discard their local pre-bootstrap MLS group and fall back
+/// to Welcome on the next deferred-recovery cycle. They MUST NOT clear
+/// `reset_pending` — leaving it set keeps the convo in the ladder so step 1
+/// (Welcome) picks up the winner's published Welcome.
+///
+/// Substring-matching the flattened `CatmosError::Xrpc("{nsid} returned
+/// {status}: {body}")` is the cheapest reliable detection on this platform.
+/// See the parallel orchestrator-side helper (likely renamed during the
+/// catmos-impl fix-forward — task #18) for the structured-variant version
+/// FFI clients use.
+pub(crate) fn is_bootstrap_already_bootstrapped(err: &CatmosError) -> bool {
     let msg = err.to_string();
-    msg.contains("returned 409") && msg.contains("ConvoAlreadyExists")
+    msg.contains("returned 409") && msg.contains("AlreadyBootstrapped")
 }
 
 #[derive(Serialize)]
@@ -812,7 +818,9 @@ impl ChatService {
             "bootstrap: creating local MLS group at predetermined id"
         );
 
-        // 1. Create local MLS group AT the predetermined id.
+        // 1. Create local MLS group AT the predetermined id, then export its
+        // GroupInfo so the server-side row at (originalConvoId, newGroupId)
+        // can be UPDATEd in place with our genesis blob.
         let did = self.did().to_string();
         let identity_bytes = did.as_bytes().to_vec();
         if let Err(e) = self.mls.with_context(|ctx| {
@@ -831,17 +839,37 @@ impl ChatService {
             return;
         }
 
-        // 2. Submit to server. Filter creator's DID from initial members
-        // (server records the caller as a member implicitly).
-        let did_lower = did.to_lowercase();
-        let initial_members: Vec<String> = roster
-            .iter()
-            .filter(|m| m.to_lowercase() != did_lower)
-            .cloned()
-            .collect();
+        let group_info_bytes = match self.mls.with_context(|ctx| {
+            ctx.export_group_info(new_group_id_bytes.clone(), identity_bytes.clone())
+        }) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    convo = %convo_label,
+                    error = %e,
+                    "bootstrap: export_group_info failed; dropping local group, will retry next cycle"
+                );
+                let _ = self.mls.with_context(|ctx| {
+                    let _ = ctx.delete_group(new_group_id_bytes.clone());
+                    Ok(())
+                });
+                return;
+            }
+        };
 
+        // 2. Submit to server via bootstrapResetGroup. The bootstrap roster
+        // ships the FULL membership including the caller — server uses the
+        // persisted members table (preserved across reset) as the
+        // authoritative roster and treats this list as a diagnostic/audit
+        // hint per the lexicon's `members` field doc.
         let submit_result = self
-            .create_convo_at_group_id(&payload.new_group_id, &cipher_suite, &initial_members)
+            .bootstrap_reset_group(
+                convo_id,
+                &payload.new_group_id,
+                &cipher_suite,
+                &roster,
+                group_info_bytes,
+            )
             .await;
 
         match submit_result {
@@ -860,12 +888,12 @@ impl ChatService {
                     );
                 }
             }
-            Err(e) if is_create_convo_race_loss(&e) => {
+            Err(e) if is_bootstrap_already_bootstrapped(&e) => {
                 info!(
                     convo = %convo_label,
                     new_group = %payload.new_group_id,
                     reset_generation = payload.reset_generation,
-                    "bootstrap: race lost (ConvoAlreadyExists) — dropping local pre-bootstrap group; next cycle will retry Welcome"
+                    "bootstrap: race lost (AlreadyBootstrapped) — dropping local pre-bootstrap group; next cycle will retry Welcome"
                 );
                 // Discard the local pre-bootstrap MLS group so the next cycle
                 // can welcome-join the winner's group cleanly.
@@ -886,7 +914,7 @@ impl ChatService {
                 warn!(
                     convo = %convo_label,
                     error = %e,
-                    "bootstrap: createConvo failed; dropping local group, will retry next cycle"
+                    "bootstrap: bootstrapResetGroup failed; dropping local group, will retry next cycle"
                 );
                 if let Err(e) = self.mls.with_context(|ctx| {
                     let _ = ctx.delete_group(new_group_id_bytes.clone());
@@ -934,54 +962,67 @@ impl ChatService {
 mod bootstrap_classifier_tests {
     use super::*;
 
-    /// Server returns HTTP 409 with `{"error":"ConvoAlreadyExists",...}` when
-    /// a different DID won the first-responder bootstrap race for the same
-    /// `groupId`. catmos-cli flattens that into
-    /// `CatmosError::Xrpc("blue.catbird.mlsChat.createConvo returned 409
-    /// Conflict: {...}")`. The classifier must detect this exact shape — and
-    /// must NOT mis-classify other 409s or other lexicon error codes.
+    /// Server returns HTTP 409 with `{"error":"AlreadyBootstrapped",...}` when
+    /// another caller already populated `group_info` on the post-reset row
+    /// for `(originalConvoId, newGroupId)` (mls-ds task #17 endpoint).
+    /// catmos-cli flattens that into
+    /// `CatmosError::Xrpc("blue.catbird.mlsChat.bootstrapResetGroup returned
+    /// 409 Conflict: {...}")`. The classifier must detect this exact shape
+    /// and must NOT mis-classify other 409s or non-409 statuses.
     #[test]
-    fn is_create_convo_race_loss_matches_real_xrpc_shape() {
+    fn is_bootstrap_already_bootstrapped_matches_real_xrpc_shape() {
         let err = CatmosError::Xrpc(
-            "blue.catbird.mlsChat.createConvo returned 409 Conflict: \
-             {\"error\":\"ConvoAlreadyExists\",\"message\":\"caller lost first-responder race\"}"
+            "blue.catbird.mlsChat.bootstrapResetGroup returned 409 Conflict: \
+             {\"error\":\"AlreadyBootstrapped\",\"message\":\"caller lost first-responder race\"}"
                 .to_string(),
         );
         assert!(
-            is_create_convo_race_loss(&err),
-            "409 with ConvoAlreadyExists in body must classify as race loss"
+            is_bootstrap_already_bootstrapped(&err),
+            "409 with AlreadyBootstrapped in body must classify as race loss"
         );
     }
 
     #[test]
-    fn is_create_convo_race_loss_rejects_other_409_codes() {
+    fn is_bootstrap_already_bootstrapped_rejects_other_409_codes() {
+        // Sibling lexicon errors on the same endpoint (BootstrapTargetNotFound,
+        // NotMember, InvalidCipherSuite) MUST NOT trigger the race-loss path.
+        let err = CatmosError::Xrpc(
+            "blue.catbird.mlsChat.bootstrapResetGroup returned 409 Conflict: \
+             {\"error\":\"BootstrapTargetNotFound\",\"message\":\"...\"}"
+                .to_string(),
+        );
+        assert!(
+            !is_bootstrap_already_bootstrapped(&err),
+            "409 with sibling lexicon error must not classify as race loss"
+        );
+
         let err = CatmosError::Xrpc(
             "blue.catbird.mlsChat.commitGroupChange returned 409 Conflict: \
              {\"error\":\"EpochMismatch\",\"message\":\"...\"}"
                 .to_string(),
         );
         assert!(
-            !is_create_convo_race_loss(&err),
-            "409 with non-ConvoAlreadyExists code must not classify"
+            !is_bootstrap_already_bootstrapped(&err),
+            "409 from a different endpoint with a different code must not classify"
         );
     }
 
     #[test]
-    fn is_create_convo_race_loss_rejects_non_409_statuses() {
+    fn is_bootstrap_already_bootstrapped_rejects_non_409_statuses() {
         // Same body string, wrong status: must not classify.
         let err = CatmosError::Xrpc(
-            "blue.catbird.mlsChat.createConvo returned 500 Internal Server Error: \
-             {\"error\":\"ConvoAlreadyExists\"}"
+            "blue.catbird.mlsChat.bootstrapResetGroup returned 500 Internal Server Error: \
+             {\"error\":\"AlreadyBootstrapped\"}"
                 .to_string(),
         );
         assert!(
-            !is_create_convo_race_loss(&err),
+            !is_bootstrap_already_bootstrapped(&err),
             "non-409 statuses must not classify even with matching body"
         );
 
         let err = CatmosError::Network("connection refused".into());
         assert!(
-            !is_create_convo_race_loss(&err),
+            !is_bootstrap_already_bootstrapped(&err),
             "non-Xrpc variants must not classify"
         );
     }

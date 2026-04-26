@@ -507,47 +507,61 @@ impl ChatService {
         Ok(super::messages::convo_resp_to_conversation(&resp.convo))
     }
 
-    /// Submit a `createConvo` call at a predetermined `group_id` for the
-    /// first-responder bootstrap path (spec §8.5 Phase 1). The MLS group at
-    /// `group_id_hex` MUST already exist locally (created via
-    /// `MLSContext::create_group_with_id`).
+    /// Submit a `bootstrapResetGroup` call for the first-responder bootstrap
+    /// path (spec §8.5 Phase 1, mls-ds endpoint added in task #17 / commit
+    /// `mls-ds@da85949`). The MLS group at `new_group_id_hex` MUST already
+    /// exist locally (created via `MLSContext::create_group_with_id` and its
+    /// `group_info` blob exported via `MLSContext::export_group_info`).
     ///
-    /// Server returns HTTP 409 with body `"ConvoAlreadyExists"` if a different
-    /// DID already won the bootstrap race for this `groupId`; race losers
-    /// detect this via `Self::is_create_convo_race_loss`.
+    /// Why a dedicated endpoint vs. `createConvo` with a predetermined
+    /// `groupId`: post-reset, the server holds a row at
+    /// `(id=originalConvoId, group_id=newGroupId)` waiting to be bootstrapped.
+    /// `createConvo` would INSERT a brand-new row at `id=newGroupId` and
+    /// orphan the post-reset row. `bootstrapResetGroup` UPDATEs the existing
+    /// row in place via `WHERE id=originalConvoId AND group_id=newGroupId AND
+    /// group_info IS NULL`.
+    ///
+    /// Race-loser detection: server returns HTTP 409 with body
+    /// `"AlreadyBootstrapped"` when the post-reset row's `group_info` was
+    /// already set by another caller; classified by
+    /// `recovery_ops::is_bootstrap_already_bootstrapped`.
     ///
     /// `welcome_message` is `None` because race-winners broadcast Welcome via
-    /// the next `add_members` cycle (matches orchestrator's behavior at
+    /// the next `add_members` cycle (mirrors
     /// `catbird-mls/src/orchestrator/recovery.rs:1654`).
-    pub(crate) async fn create_convo_at_group_id(
+    pub(crate) async fn bootstrap_reset_group(
         &self,
-        group_id_hex: &str,
+        original_convo_id: &str,
+        new_group_id_hex: &str,
         cipher_suite: &str,
-        initial_members: &[String],
+        members: &[String],
+        group_info: Vec<u8>,
     ) -> Result<()> {
-        let req: mls_chat::create_convo::Input = mls_chat::create_convo::InputData {
-            group_id: group_id_hex.to_string(),
-            cipher_suite: cipher_suite.to_string(),
-            initial_members: if initial_members.is_empty() {
-                None
-            } else {
-                Some(
-                    initial_members
-                        .iter()
-                        .map(|m| catbird_atproto::types::string::Did::from(m.clone()))
-                        .collect(),
-                )
-            },
-            metadata: None,
-            welcome_message: None,
+        // Build the lexicon struct directly to dodge the InputData/Bytes
+        // double-encoding bug documented above `build_commit_group_change`.
+        // bootstrap_reset_group has no hand-written shim in
+        // catbird-atproto/src/lib.rs as of commit `f6d7efc` so we construct
+        // the generated `BootstrapResetGroup<'static>` ourselves.
+        use catbird_atproto::blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroup;
+
+        const NSID: &str = "blue.catbird.mlsChat.bootstrapResetGroup";
+
+        let req = BootstrapResetGroup {
+            original_convo_id: original_convo_id.to_string().into(),
+            new_group_id: new_group_id_hex.to_string().into(),
+            cipher_suite: cipher_suite.to_string().into(),
+            group_info: bytes::Bytes::from(group_info),
+            members: members
+                .iter()
+                .map(|d| catbird_atproto::types::string::Did::from(d.clone()))
+                .collect(),
             current_epoch: None,
             key_package_hashes: None,
-        }
-        .into();
+            welcome_message: None,
+            extra_data: Default::default(),
+        };
 
-        let _: super::messages::CreateConvoResp = self
-            .xrpc_procedure(mls_chat::create_convo::NSID, &req)
-            .await?;
+        let _: serde_json::Value = self.xrpc_procedure(NSID, &req).await?;
         Ok(())
     }
 
