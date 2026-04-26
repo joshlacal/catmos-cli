@@ -484,16 +484,22 @@ impl Database {
     /// Clear the persisted `RESET_PENDING` payload (after Phase 1 deferred
     /// recovery succeeds in adopting the new group).
     pub async fn clear_reset_pending(&self, convo_id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // Swap group_id from the persisted reset_new_group_id, then clear all reset columns.
         sqlx::query(
             "UPDATE conversations
-             SET reset_new_group_id = NULL,
+             SET group_id = COALESCE(reset_new_group_id, group_id),
+                 reset_new_group_id = NULL,
                  reset_generation = NULL,
                  reset_notified_at_ms = NULL
              WHERE conversation_id = ?1",
         )
         .bind(convo_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 
