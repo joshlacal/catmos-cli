@@ -528,6 +528,68 @@ impl Database {
     }
 }
 
+#[cfg(test)]
+mod reset_pending_tests {
+    use super::*;
+    use crate::types::Conversation;
+
+    fn fixture_convo(convo_id: &str, group_id: &str) -> Conversation {
+        Conversation {
+            conversation_id: convo_id.to_string(),
+            group_id: group_id.to_string(),
+            name: None,
+            description: None,
+            creator: String::new(),
+            epoch: 0,
+            cipher_suite: String::new(),
+            members: vec![],
+            created_at: Utc::now(),
+            last_message_at: None,
+            unread_count: 0,
+            alias: None,
+        }
+    }
+
+    async fn read_group_id(db: &Database, convo_id: &str) -> String {
+        db.list_conversations()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.conversation_id == convo_id)
+            .expect("conversation must exist")
+            .group_id
+    }
+
+    #[tokio::test]
+    async fn clear_reset_pending_swaps_group_id() {
+        let path = std::env::temp_dir()
+            .join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_unencrypted(&path).await.unwrap();
+
+        let convo_id = "convo-1";
+        let old_group_id = "old-group-hex";
+        let new_group_id = "new-group-hex";
+
+        db.store_conversation(&fixture_convo(convo_id, old_group_id))
+            .await
+            .unwrap();
+        db.mark_reset_pending(convo_id, new_group_id, 1, 0)
+            .await
+            .unwrap();
+
+        let pre = read_group_id(&db, convo_id).await;
+        assert_eq!(pre, old_group_id);
+
+        db.clear_reset_pending(convo_id).await.unwrap();
+
+        let post = read_group_id(&db, convo_id).await;
+        assert_eq!(
+            post, new_group_id,
+            "clear_reset_pending must swap group_id from reset_new_group_id"
+        );
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn serialize_content(content: &MessageContent) -> (String, String) {
