@@ -594,6 +594,42 @@ mod reset_pending_tests {
             "clear_reset_pending must swap group_id from reset_new_group_id"
         );
     }
+
+    /// Regression guard for the §8.6 External Commit exhaustion path
+    /// (`ChatService::transition_unrecoverable_local`). The platform layer
+    /// fires `reportRecoveryFailure` only after `mark_unrecoverable_local`
+    /// flips the row, so the persisted invariants matter:
+    /// - `unrecoverable_local` becomes `true`
+    /// - `needs_rejoin` is cleared (otherwise the deferred-recovery loop
+    ///   would keep retrying a convo we just declared dead)
+    #[tokio::test]
+    async fn mark_unrecoverable_local_sets_flag_and_clears_needs_rejoin() {
+        let path = std::env::temp_dir()
+            .join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_unencrypted(&path).await.unwrap();
+
+        let convo_id = "convo-exhausted";
+        db.store_conversation(&fixture_convo(convo_id, "group-hex"))
+            .await
+            .unwrap();
+        db.mark_needs_rejoin(convo_id).await.unwrap();
+
+        let pre = db.get_recovery_flags(convo_id).await.unwrap();
+        assert!(pre.needs_rejoin, "needs_rejoin must be set before exhaustion");
+        assert!(!pre.unrecoverable_local);
+
+        db.mark_unrecoverable_local(convo_id).await.unwrap();
+
+        let post = db.get_recovery_flags(convo_id).await.unwrap();
+        assert!(
+            post.unrecoverable_local,
+            "mark_unrecoverable_local must set unrecoverable_local=true"
+        );
+        assert!(
+            !post.needs_rejoin,
+            "mark_unrecoverable_local must clear needs_rejoin so deferred recovery stops"
+        );
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
