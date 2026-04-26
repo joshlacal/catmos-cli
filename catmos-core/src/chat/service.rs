@@ -507,6 +507,50 @@ impl ChatService {
         Ok(super::messages::convo_resp_to_conversation(&resp.convo))
     }
 
+    /// Submit a `createConvo` call at a predetermined `group_id` for the
+    /// first-responder bootstrap path (spec §8.5 Phase 1). The MLS group at
+    /// `group_id_hex` MUST already exist locally (created via
+    /// `MLSContext::create_group_with_id`).
+    ///
+    /// Server returns HTTP 409 with body `"ConvoAlreadyExists"` if a different
+    /// DID already won the bootstrap race for this `groupId`; race losers
+    /// detect this via `Self::is_create_convo_race_loss`.
+    ///
+    /// `welcome_message` is `None` because race-winners broadcast Welcome via
+    /// the next `add_members` cycle (matches orchestrator's behavior at
+    /// `catbird-mls/src/orchestrator/recovery.rs:1654`).
+    pub(crate) async fn create_convo_at_group_id(
+        &self,
+        group_id_hex: &str,
+        cipher_suite: &str,
+        initial_members: &[String],
+    ) -> Result<()> {
+        let req: mls_chat::create_convo::Input = mls_chat::create_convo::InputData {
+            group_id: group_id_hex.to_string(),
+            cipher_suite: cipher_suite.to_string(),
+            initial_members: if initial_members.is_empty() {
+                None
+            } else {
+                Some(
+                    initial_members
+                        .iter()
+                        .map(|m| catbird_atproto::types::string::Did::from(m.clone()))
+                        .collect(),
+                )
+            },
+            metadata: None,
+            welcome_message: None,
+            current_epoch: None,
+            key_package_hashes: None,
+        }
+        .into();
+
+        let _: super::messages::CreateConvoResp = self
+            .xrpc_procedure(mls_chat::create_convo::NSID, &req)
+            .await?;
+        Ok(())
+    }
+
     /// Leave (remove self from) a conversation.
     pub async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
         let req: mls_chat::leave_convo::Input = mls_chat::leave_convo::InputData {

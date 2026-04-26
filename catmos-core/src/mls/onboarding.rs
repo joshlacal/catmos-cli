@@ -519,6 +519,39 @@ impl MlsManager {
             || msg.contains("returned 404")
     }
 
+    /// Fetch a pending base64-encoded Welcome message addressed to this caller
+    /// for `convo_id`, if one exists on the server. Returns `Ok(None)` when the
+    /// server has no pending Welcome (the response simply omits the field).
+    /// Returns `Err` for transport / non-404 server errors.
+    pub(crate) async fn fetch_pending_welcome(
+        &self,
+        service: &ChatService,
+        convo_id: &str,
+    ) -> Result<Option<String>> {
+        let group_state: serde_json::Value = match service
+            .xrpc_query(
+                mls_chat::get_group_state::NSID,
+                &[("convoId", convo_id), ("include", "welcome")],
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) if Self::is_group_info_unavailable(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        let Some(w) = group_state.get("welcome") else {
+            return Ok(None);
+        };
+        if let Some(s) = w.as_str() {
+            return Ok(Some(s.to_string()));
+        }
+        if let Some(b) = w.get("$bytes").and_then(|v| v.as_str()) {
+            return Ok(Some(b.to_string()));
+        }
+        Ok(None)
+    }
+
     /// Ask the server to request a GroupInfo refresh from other devices.
     /// This sends an SSE event so that iOS clients can publish fresh GroupInfo.
     async fn request_group_info_refresh(

@@ -26,7 +26,7 @@ use tracing::{debug, error, info, warn};
 use super::service::ChatService;
 use crate::error::{CatmosError, Result};
 use crate::mls::MlsManager;
-use crate::recovery::{constants, RecoveryState};
+use crate::recovery::{constants, RecoveryState, ResetPendingPayload};
 
 /// `failureType` strings the server understands (§8.6).
 const FAILURE_EXTERNAL_COMMIT_EXHAUSTED: &str = "external_commit_exhausted";
@@ -56,6 +56,20 @@ fn is_transient_error_str(msg: &str) -> bool {
         || msg.contains("returned 504")
         || msg.contains("timed out")
         || msg.contains("timeout")
+}
+
+/// Whether an error represents a `createConvo` race-loss: the server returned
+/// 409 with the `ConvoAlreadyExists` lexicon error code, meaning a different
+/// DID won the first-responder bootstrap race for the same `groupId`.
+///
+/// Mirrors `catbird_mls::OrchestratorError::is_create_convo_race_loss`. We
+/// re-implement here because catmos-cli surfaces XRPC errors as
+/// `CatmosError::Xrpc("{nsid} returned {status}: {body}")` rather than as a
+/// structured `ServerError { status, body }` variant — substring-matching the
+/// flattened message is the cheapest reliable detection on this platform.
+pub(crate) fn is_create_convo_race_loss(err: &CatmosError) -> bool {
+    let msg = err.to_string();
+    msg.contains("returned 409") && msg.contains("ConvoAlreadyExists")
 }
 
 #[derive(Serialize)]
@@ -509,6 +523,13 @@ impl ChatService {
 
         // Phase 1: RESET_PENDING (highest priority). The server has already
         // re-keyed the group; all retry counters reset.
+        //
+        // Spec §8.5 Phase 1 ladder: try Welcome first (cheapest, no MLS state
+        // mutation), then External Commit (needs server-published GroupInfo),
+        // then first-responder bootstrap (creates the empty group locally and
+        // claims it server-side via createConvo at the predetermined
+        // newGroupId — the race is resolved by the server's primary-key
+        // collision check returning 409 ConvoAlreadyExists for the loser).
         for convo_id in &convo_ids {
             let flags = match self.db.get_recovery_flags(convo_id).await {
                 Ok(f) => f,
@@ -521,38 +542,76 @@ impl ChatService {
                     continue;
                 }
             };
-            if !matches!(
-                RecoveryState::from_flags(&flags),
-                RecoveryState::ResetPending(_)
-            ) {
-                continue;
-            }
+            let payload = match RecoveryState::from_flags(&flags) {
+                RecoveryState::ResetPending(p) => p,
+                _ => continue,
+            };
             // Server reset = fresh start: clear our local retry counters.
             self.recovery_tracker.lock().await.clear_convo(convo_id);
             self.groupinfo_404_tracker
                 .lock()
                 .await
                 .clear(convo_id);
+
+            // Step 1: try Welcome. Cheapest, no MLS state mutation.
+            if self.try_pending_welcome(convo_id).await {
+                if let Err(e) = self.db.clear_reset_pending(convo_id).await {
+                    warn!(
+                        convo = %&convo_id[..12.min(convo_id.len())],
+                        error = %e,
+                        "deferred_recovery: failed to clear RESET_PENDING after Welcome"
+                    );
+                }
+                info!(
+                    convo = %&convo_id[..12.min(convo_id.len())],
+                    "deferred_recovery: RESET_PENDING adopted via Welcome"
+                );
+                tokio::time::sleep(constants::DEFERRED_RECOVERY_PAUSE).await;
+                continue;
+            }
+
+            // Step 2: try External Commit. Internally fetches GroupInfo;
+            // returns Err with `is_group_info_unavailable` when the server has
+            // none yet (post-reset window before any responder publishes).
             match self.external_commit_rejoin(convo_id).await {
                 Ok(()) => {
                     if let Err(e) = self.db.clear_reset_pending(convo_id).await {
                         warn!(
                             convo = %&convo_id[..12.min(convo_id.len())],
                             error = %e,
-                            "deferred_recovery: failed to clear RESET_PENDING after success"
+                            "deferred_recovery: failed to clear RESET_PENDING after External Commit"
                         );
                     }
                     info!(
                         convo = %&convo_id[..12.min(convo_id.len())],
-                        "deferred_recovery: RESET_PENDING adopted"
+                        "deferred_recovery: RESET_PENDING adopted via External Commit"
                     );
+                    tokio::time::sleep(constants::DEFERRED_RECOVERY_PAUSE).await;
+                    continue;
                 }
-                Err(e) => warn!(
-                    convo = %&convo_id[..12.min(convo_id.len())],
-                    error = %e,
-                    "deferred_recovery: RESET_PENDING adoption failed (will retry next cycle)"
-                ),
+                Err(e) if MlsManager::is_group_info_unavailable(&e) => {
+                    debug!(
+                        convo = %&convo_id[..12.min(convo_id.len())],
+                        "deferred_recovery: GroupInfo unavailable — attempting first-responder bootstrap"
+                    );
+                    // Fall through to bootstrap.
+                }
+                Err(e) => {
+                    warn!(
+                        convo = %&convo_id[..12.min(convo_id.len())],
+                        error = %e,
+                        "deferred_recovery: RESET_PENDING External Commit failed (will retry next cycle)"
+                    );
+                    tokio::time::sleep(constants::DEFERRED_RECOVERY_PAUSE).await;
+                    continue;
+                }
             }
+
+            // Step 3: first-responder bootstrap. Creates an empty MLS group at
+            // payload.new_group_id and submits via createConvo. Race-winner
+            // clears reset_pending; race-loser keeps it set so the next cycle
+            // re-enters Step 1 to pick up the winner's Welcome.
+            self.try_first_responder_bootstrap(convo_id, &payload).await;
             tokio::time::sleep(constants::DEFERRED_RECOVERY_PAUSE).await;
         }
 
@@ -634,5 +693,296 @@ impl ChatService {
             "Persisted RESET_PENDING from GroupResetEvent"
         );
     }
+
+    // ── §8.5 Phase 1 ladder helpers (Welcome → ExternalCommit → Bootstrap) ──
+
+    /// Try to adopt the post-reset group via a server-published Welcome.
+    /// Returns `true` if a Welcome existed and was processed successfully.
+    /// Returns `false` if no Welcome is available or processing failed (the
+    /// caller falls through to the next ladder step in either case — a
+    /// processing failure here is not fatal because External Commit and
+    /// bootstrap remain as fallbacks).
+    async fn try_pending_welcome(&self, convo_id: &str) -> bool {
+        let convo_label = &convo_id[..12.min(convo_id.len())];
+        let welcome_b64 = match self.mls.fetch_pending_welcome(self, convo_id).await {
+            Ok(Some(w)) => w,
+            Ok(None) => return false,
+            Err(e) => {
+                debug!(
+                    convo = %convo_label,
+                    error = %e,
+                    "try_pending_welcome: getGroupState include=welcome failed"
+                );
+                return false;
+            }
+        };
+
+        let did = self.did().to_string();
+        match self.mls.process_welcome_b64(&welcome_b64, &did) {
+            Ok(group_id) => {
+                info!(
+                    convo = %convo_label,
+                    group = %hex::encode(&group_id),
+                    "try_pending_welcome: adopted post-reset group via Welcome"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    convo = %convo_label,
+                    error = %e,
+                    "try_pending_welcome: process_welcome failed (will retry next cycle)"
+                );
+                false
+            }
+        }
+    }
+
+    /// First-responder bootstrap (spec §8.5 Phase 1, Plan Task 23).
+    ///
+    /// Creates the MLS group locally at `payload.new_group_id` and submits via
+    /// `createConvo`. Server's primary-key idempotency on `(group_id)` plus
+    /// the `ConvoAlreadyExists` 409 (lexicon task #16) lets the loser detect
+    /// "someone else won" and drop their pre-bootstrap MLS group cleanly.
+    ///
+    /// Race-winner: clears `reset_pending`, transitions to Active.
+    /// Race-loser: keeps `reset_pending` set; next cycle re-enters the ladder
+    /// at Step 1 (Welcome) and picks up the winner's published Welcome.
+    /// Other failures: drop the local group so the next attempt starts clean.
+    async fn try_first_responder_bootstrap(
+        &self,
+        convo_id: &str,
+        payload: &ResetPendingPayload,
+    ) {
+        let convo_label = &convo_id[..12.min(convo_id.len())];
+
+        let new_group_id_bytes = match hex::decode(&payload.new_group_id) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    convo = %convo_label,
+                    new_group = %payload.new_group_id,
+                    error = %e,
+                    "bootstrap: ResetPending.new_group_id is not valid hex; cannot bootstrap"
+                );
+                return;
+            }
+        };
+
+        // Fetch fresh roster — post-reset, the server clears the membership
+        // table atomically with the reset transaction (Phase 0 Q3). Local
+        // cached members would be the pre-reset roster.
+        let roster = match self.fetch_member_roster_for_bootstrap(convo_id).await {
+            Ok(r) if !r.is_empty() => r,
+            Ok(_) => {
+                warn!(
+                    convo = %convo_label,
+                    "bootstrap: server roster is empty; cannot bootstrap"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    convo = %convo_label,
+                    error = %e,
+                    "bootstrap: getConvos roster fetch failed; will retry next cycle"
+                );
+                return;
+            }
+        };
+
+        // Cipher suite the original convo used (the orchestrator stores this on
+        // the Conversation; we read it from our local cache).
+        let cipher_suite = {
+            let convos = self.conversations.read().await;
+            convos
+                .iter()
+                .find(|c| c.conversation_id == convo_id)
+                .map(|c| c.cipher_suite.clone())
+        };
+        let cipher_suite = cipher_suite.unwrap_or_else(|| {
+            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string()
+        });
+
+        info!(
+            convo = %convo_label,
+            new_group = %payload.new_group_id,
+            roster_size = roster.len(),
+            cipher_suite = %cipher_suite,
+            "bootstrap: creating local MLS group at predetermined id"
+        );
+
+        // 1. Create local MLS group AT the predetermined id.
+        let did = self.did().to_string();
+        let identity_bytes = did.as_bytes().to_vec();
+        if let Err(e) = self.mls.with_context(|ctx| {
+            let _ = ctx.create_group_with_id(
+                identity_bytes.clone(),
+                new_group_id_bytes.clone(),
+                None,
+            )?;
+            Ok(())
+        }) {
+            warn!(
+                convo = %convo_label,
+                error = %e,
+                "bootstrap: create_group_with_id failed; will retry next cycle"
+            );
+            return;
+        }
+
+        // 2. Submit to server. Filter creator's DID from initial members
+        // (server records the caller as a member implicitly).
+        let did_lower = did.to_lowercase();
+        let initial_members: Vec<String> = roster
+            .iter()
+            .filter(|m| m.to_lowercase() != did_lower)
+            .cloned()
+            .collect();
+
+        let submit_result = self
+            .create_convo_at_group_id(&payload.new_group_id, &cipher_suite, &initial_members)
+            .await;
+
+        match submit_result {
+            Ok(()) => {
+                info!(
+                    convo = %convo_label,
+                    new_group = %payload.new_group_id,
+                    reset_generation = payload.reset_generation,
+                    "bootstrap: race won — clearing RESET_PENDING"
+                );
+                if let Err(e) = self.db.clear_reset_pending(convo_id).await {
+                    warn!(
+                        convo = %convo_label,
+                        error = %e,
+                        "bootstrap: failed to clear RESET_PENDING after winning bootstrap"
+                    );
+                }
+            }
+            Err(e) if is_create_convo_race_loss(&e) => {
+                info!(
+                    convo = %convo_label,
+                    new_group = %payload.new_group_id,
+                    reset_generation = payload.reset_generation,
+                    "bootstrap: race lost (ConvoAlreadyExists) — dropping local pre-bootstrap group; next cycle will retry Welcome"
+                );
+                // Discard the local pre-bootstrap MLS group so the next cycle
+                // can welcome-join the winner's group cleanly.
+                if let Err(e) = self.mls.with_context(|ctx| {
+                    let _ = ctx.delete_group(new_group_id_bytes.clone());
+                    Ok(())
+                }) {
+                    warn!(
+                        convo = %convo_label,
+                        error = %e,
+                        "bootstrap: delete_group for race-lost bootstrap failed (non-fatal)"
+                    );
+                }
+                // Do NOT clear reset_pending — next deferred-recovery cycle
+                // re-enters the ladder at Step 1 (Welcome).
+            }
+            Err(e) => {
+                warn!(
+                    convo = %convo_label,
+                    error = %e,
+                    "bootstrap: createConvo failed; dropping local group, will retry next cycle"
+                );
+                if let Err(e) = self.mls.with_context(|ctx| {
+                    let _ = ctx.delete_group(new_group_id_bytes.clone());
+                    Ok(())
+                }) {
+                    warn!(
+                        convo = %convo_label,
+                        error = %e,
+                        "bootstrap: delete_group for failed bootstrap failed (non-fatal)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Fetch the current member roster for `convo_id` via `getConvos`.
+    /// Returns the unique set of `user_did`s. Spec §8.5 Phase 1 / Phase 0 Q3:
+    /// `groupResetEvent` carries no roster, so bootstrap MUST refetch fresh.
+    async fn fetch_member_roster_for_bootstrap(
+        &self,
+        convo_id: &str,
+    ) -> Result<Vec<String>> {
+        let resp: super::messages::GetConvosResp = self
+            .xrpc_query(catbird_atproto::catbird::mls_chat::get_convos::NSID, &[])
+            .await?;
+
+        let mut roster: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for c in &resp.conversations {
+            let id = c.conversation_id.as_deref().unwrap_or(&c.group_id);
+            if id != convo_id {
+                continue;
+            }
+            for m in &c.members {
+                if seen.insert(m.user_did.clone()) {
+                    roster.push(m.user_did.clone());
+                }
+            }
+        }
+        Ok(roster)
+    }
 }
 
+#[cfg(test)]
+mod bootstrap_classifier_tests {
+    use super::*;
+
+    /// Server returns HTTP 409 with `{"error":"ConvoAlreadyExists",...}` when
+    /// a different DID won the first-responder bootstrap race for the same
+    /// `groupId`. catmos-cli flattens that into
+    /// `CatmosError::Xrpc("blue.catbird.mlsChat.createConvo returned 409
+    /// Conflict: {...}")`. The classifier must detect this exact shape — and
+    /// must NOT mis-classify other 409s or other lexicon error codes.
+    #[test]
+    fn is_create_convo_race_loss_matches_real_xrpc_shape() {
+        let err = CatmosError::Xrpc(
+            "blue.catbird.mlsChat.createConvo returned 409 Conflict: \
+             {\"error\":\"ConvoAlreadyExists\",\"message\":\"caller lost first-responder race\"}"
+                .to_string(),
+        );
+        assert!(
+            is_create_convo_race_loss(&err),
+            "409 with ConvoAlreadyExists in body must classify as race loss"
+        );
+    }
+
+    #[test]
+    fn is_create_convo_race_loss_rejects_other_409_codes() {
+        let err = CatmosError::Xrpc(
+            "blue.catbird.mlsChat.commitGroupChange returned 409 Conflict: \
+             {\"error\":\"EpochMismatch\",\"message\":\"...\"}"
+                .to_string(),
+        );
+        assert!(
+            !is_create_convo_race_loss(&err),
+            "409 with non-ConvoAlreadyExists code must not classify"
+        );
+    }
+
+    #[test]
+    fn is_create_convo_race_loss_rejects_non_409_statuses() {
+        // Same body string, wrong status: must not classify.
+        let err = CatmosError::Xrpc(
+            "blue.catbird.mlsChat.createConvo returned 500 Internal Server Error: \
+             {\"error\":\"ConvoAlreadyExists\"}"
+                .to_string(),
+        );
+        assert!(
+            !is_create_convo_race_loss(&err),
+            "non-409 statuses must not classify even with matching body"
+        );
+
+        let err = CatmosError::Network("connection refused".into());
+        assert!(
+            !is_create_convo_race_loss(&err),
+            "non-Xrpc variants must not classify"
+        );
+    }
+}
