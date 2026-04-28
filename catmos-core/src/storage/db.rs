@@ -595,6 +595,100 @@ mod reset_pending_tests {
         );
     }
 
+    /// Phase 2.5 Stage 1 dual-emission safety: the server emits BOTH
+    /// `groupResetEvent` AND `resetRequestedEvent` for the same trigger
+    /// during the migration window (plan §5 Stage 1). Both event handlers
+    /// in `ChatService` write through `mark_reset_pending`, so the DB
+    /// layer must remain consistent regardless of arrival order.
+    ///
+    /// This test validates that two `mark_reset_pending` calls at the same
+    /// generation with the SAME group id (the realistic dual-emission case
+    /// — an admin-initiated reset where `expectedNewMlsGroupId` matches the
+    /// legacy `newGroupId`) leave the row in the same final state.
+    /// Idempotency at the handler level (skip the second write entirely on
+    /// matching generation) is enforced in
+    /// `ChatService::handle_reset_requested_event`; this test exercises the
+    /// underlying DB invariant that makes that policy safe.
+    #[tokio::test]
+    async fn mark_reset_pending_is_idempotent_at_same_generation() {
+        let path = std::env::temp_dir()
+            .join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_unencrypted(&path).await.unwrap();
+
+        let convo_id = "convo-dual-emit";
+        let new_group_id = "post-reset-group-hex";
+        db.store_conversation(&fixture_convo(convo_id, "pre-reset-group"))
+            .await
+            .unwrap();
+
+        // First write — simulates the legacy `groupResetEvent` arriving.
+        db.mark_reset_pending(convo_id, new_group_id, 5, 1_000_000)
+            .await
+            .unwrap();
+        let after_first = db.get_recovery_flags(convo_id).await.unwrap();
+        let payload_first = after_first
+            .reset
+            .as_ref()
+            .expect("reset payload must be set after first write");
+        assert_eq!(payload_first.new_group_id, new_group_id);
+        assert_eq!(payload_first.reset_generation, 5);
+
+        // Second write at the same generation with the same group id —
+        // simulates the Phase 2.5 `resetRequestedEvent` arriving second
+        // for the same admin reset. The DB row must not regress.
+        db.mark_reset_pending(convo_id, new_group_id, 5, 2_000_000)
+            .await
+            .unwrap();
+        let after_second = db.get_recovery_flags(convo_id).await.unwrap();
+        let payload_second = after_second
+            .reset
+            .as_ref()
+            .expect("reset payload must remain set");
+        assert_eq!(
+            payload_second.new_group_id, new_group_id,
+            "same-generation re-write at the DB layer must keep the group id"
+        );
+        assert_eq!(
+            payload_second.reset_generation, 5,
+            "generation must not regress on a same-generation re-write"
+        );
+    }
+
+    /// Phase 2.5: a higher generation supersedes a lower one (mirrors the
+    /// orchestrator-side rule in
+    /// `catbird-mls/src/orchestrator/recovery.rs:1413-1424`). A stale
+    /// pending row from generation N must be overwritten by an authoritative
+    /// new request at generation N+1 — otherwise the deferred-recovery loop
+    /// would chase the wrong group id.
+    #[tokio::test]
+    async fn mark_reset_pending_higher_generation_supersedes() {
+        let path = std::env::temp_dir()
+            .join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_unencrypted(&path).await.unwrap();
+
+        let convo_id = "convo-supersede";
+        db.store_conversation(&fixture_convo(convo_id, "pre-reset"))
+            .await
+            .unwrap();
+
+        db.mark_reset_pending(convo_id, "stale-group", 3, 1_000_000)
+            .await
+            .unwrap();
+
+        db.mark_reset_pending(convo_id, "fresh-group", 4, 2_000_000)
+            .await
+            .unwrap();
+        let payload = db
+            .get_recovery_flags(convo_id)
+            .await
+            .unwrap()
+            .reset
+            .expect("payload must be set after supersede");
+        assert_eq!(payload.new_group_id, "fresh-group");
+        assert_eq!(payload.reset_generation, 4);
+        assert_eq!(payload.notified_at_ms, 2_000_000);
+    }
+
     /// Regression guard for the §8.6 External Commit exhaustion path
     /// (`ChatService::transition_unrecoverable_local`). The platform layer
     /// fires `reportRecoveryFailure` only after `mark_unrecoverable_local`

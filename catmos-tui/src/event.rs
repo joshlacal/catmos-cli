@@ -21,6 +21,19 @@ pub enum AppEvent {
     TreeDiverged { convo_id: String },
     /// The MLS group was reset by an admin — rejoin with new group ID.
     GroupReset { convo_id: String, new_group_id: String, reset_generation: u64 },
+    /// Phase 2.5 indirect-trigger reset request — server has not minted a new
+    /// group ID; this client may participate in the first-responder bootstrap
+    /// race via the deferred-recovery loop after `RESET_PENDING` is persisted.
+    /// `expected_new_mls_group_id` is `None` for indirect triggers (quorum,
+    /// sweep, inline 409/404) and `Some(_)` for admin/bootstrap direct flows.
+    ResetRequested {
+        convo_id: String,
+        crypto_session_id: String,
+        generation: i64,
+        trigger: String,
+        request_event_id: String,
+        expected_new_mls_group_id: Option<String>,
+    },
     /// Background sync completed — refresh conversation list.
     SyncCompleted,
     /// A message we sent was confirmed by the server.

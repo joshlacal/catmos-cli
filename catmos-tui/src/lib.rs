@@ -259,6 +259,34 @@ pub async fn run() -> anyhow::Result<()> {
                                 break;
                             }
                         }
+                        catmos_core::chat::WsEvent::ResetRequested {
+                            convo_id,
+                            crypto_session_id,
+                            generation,
+                            trigger,
+                            request_event_id,
+                            expected_new_mls_group_id,
+                        } => {
+                            info!(
+                                phase_2_5_path = "request_only",
+                                "WS reset requested: convo={} crypto_session={} gen={generation} trigger={trigger}",
+                                &convo_id[..12.min(convo_id.len())],
+                                &crypto_session_id[..12.min(crypto_session_id.len())]
+                            );
+                            if ws_tx
+                                .send(AppEvent::ResetRequested {
+                                    convo_id,
+                                    crypto_session_id,
+                                    generation,
+                                    trigger,
+                                    request_event_id,
+                                    expected_new_mls_group_id,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                         _ => {
                             // Typing, MemberJoined, MemberLeft,
                             // Reaction — future enhancements
@@ -429,6 +457,44 @@ async fn main_loop(
                     tokio::spawn(async move {
                         svc.handle_group_reset_event(&cid, &new_gid, reset_generation)
                             .await;
+                    });
+                }
+                AppEvent::ResetRequested {
+                    convo_id,
+                    crypto_session_id,
+                    generation,
+                    trigger,
+                    request_event_id,
+                    expected_new_mls_group_id,
+                } => {
+                    let label = &convo_id[..12.min(convo_id.len())];
+                    info!(
+                        phase_2_5_path = "request_only",
+                        "Reset requested for {} (gen {}, trigger {}) — persisting RESET_PENDING",
+                        label,
+                        generation,
+                        trigger
+                    );
+                    // Phase 2.5 (plan §3, §5 Stage 2): persist RESET_PENDING so
+                    // the existing deferred-recovery loop drives the
+                    // first-responder bootstrap. We do NOT call External
+                    // Commit inline — same invariant as `GroupReset`.
+                    let svc = Arc::clone(&app.service);
+                    let cid = convo_id.clone();
+                    let csid = crypto_session_id.clone();
+                    let trig = trigger.clone();
+                    let req_id = request_event_id.clone();
+                    let exp = expected_new_mls_group_id.clone();
+                    tokio::spawn(async move {
+                        svc.handle_reset_requested_event(
+                            &cid,
+                            &csid,
+                            generation,
+                            &trig,
+                            &req_id,
+                            exp.as_deref(),
+                        )
+                        .await;
                     });
                 }
                 AppEvent::TreeDiverged { convo_id } => {

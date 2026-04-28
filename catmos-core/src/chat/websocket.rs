@@ -24,6 +24,46 @@ struct RawGroupResetEvent {
     reason: Option<String>,
 }
 
+/// Raw ResetRequestedEvent fields for manual DAG-CBOR deserialization.
+///
+/// Phase 2.5 indirect-trigger SSE event (`docs/plans/phase-2-5-indirect-funneling.md`
+/// §3): an indirect trigger (quorum vote, system sweep, inline 409/404) has
+/// requested a crypto session reset. The server has NOT minted a new MLS
+/// group id; subscribed clients are invited to elect a first responder.
+///
+/// The generated `SubscribeEventsMessage` does not yet include this variant
+/// on `catbird-atproto/main` (the type lives on the
+/// `lexicon/reset-requested-event` branch). We parse it from raw bytes when
+/// `decode_framed` returns `UnknownEventType`, mirroring the
+/// `RawGroupResetEvent` pattern above.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct RawResetRequestedEvent {
+    convo_id: String,
+    crypto_session_id: String,
+    /// `i64` to match the lexicon `integer` width and the orchestrator-side
+    /// `record_reset_requested(reset_generation: i32, ..)` signature in
+    /// `catbird-mls/src/orchestrator/recovery.rs:1387` (we narrow at the call
+    /// site after a range check).
+    generation: i64,
+    /// Lexicon `knownValues`: `quorum_vote | system_sweep | inline_commit_409
+    /// | inline_groupinfo_404`. Logged for observability (Stage 1
+    /// `phase_2_5_path = "request_only"`); not parsed into an enum here per
+    /// the orchestrator-side comment at recovery.rs:1373.
+    trigger: String,
+    /// Server-side opaque id of the `crypto_session_reset_requested`
+    /// delivery_event. Deterministic dedup key (plan §3 idempotency scheme).
+    request_event_id: String,
+    /// Usually `None` for indirect triggers (locked decision §1: server never
+    /// mints `mls_group_id` outside the chokepoint). Admin/bootstrap direct
+    /// flows may set it.
+    expected_new_mls_group_id: Option<String>,
+    #[allow(dead_code)]
+    reason: Option<String>,
+    #[allow(dead_code)]
+    requested_at: Option<String>,
+}
+
 use super::service::ChatService;
 use crate::error::{CatmosError, Result};
 
@@ -78,6 +118,22 @@ pub enum WsEvent {
         reset_by: String,
         cipher_suite: String,
         reason: Option<String>,
+    },
+    /// Phase 2.5 indirect-trigger reset request
+    /// (`docs/plans/phase-2-5-indirect-funneling.md` §3, §5 Stage 2).
+    ///
+    /// The server has not minted a new group id; subscribed clients race to
+    /// produce one via `bootstrapResetGroup` / `commitGroupChange`. Our local
+    /// handler `ChatService::handle_reset_requested_event` mints a candidate
+    /// id and persists `RESET_PENDING`; the existing deferred-recovery loop
+    /// drives the first-responder bootstrap.
+    ResetRequested {
+        convo_id: String,
+        crypto_session_id: String,
+        generation: i64,
+        trigger: String,
+        request_event_id: String,
+        expected_new_mls_group_id: Option<String>,
     },
     /// An error occurred on the WebSocket.
     Error(String),
@@ -590,6 +646,246 @@ fn try_decode_unknown_event(data: &[u8]) -> Option<WsEvent> {
                 reason: raw.reason,
             })
         }
+        "#resetRequestedEvent" => {
+            let raw: RawResetRequestedEvent = serde_ipld_dagcbor::from_slice(body).ok()?;
+            info!(
+                phase_2_5_path = "request_only",
+                "WS ResetRequestedEvent: convo={} crypto_session={} gen={} trigger={} request_event_id={} expected_new_group={}",
+                &raw.convo_id[..12.min(raw.convo_id.len())],
+                &raw.crypto_session_id[..12.min(raw.crypto_session_id.len())],
+                raw.generation,
+                raw.trigger,
+                &raw.request_event_id[..16.min(raw.request_event_id.len())],
+                raw.expected_new_mls_group_id
+                    .as_deref()
+                    .unwrap_or("<none>")
+            );
+            Some(WsEvent::ResetRequested {
+                convo_id: raw.convo_id,
+                crypto_session_id: raw.crypto_session_id,
+                generation: raw.generation,
+                trigger: raw.trigger,
+                request_event_id: raw.request_event_id,
+                expected_new_mls_group_id: raw.expected_new_mls_group_id,
+            })
+        }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Wire-level decode tests for the manual `try_decode_unknown_event`
+    //! parser. The framed format is the AT Protocol subscription frame
+    //! `cbor(EventHeader { op, t }) ++ cbor(body)` per
+    //! `jacquard_common::xrpc::subscription::parse_event_header`.
+
+    use super::*;
+    use serde::Serialize;
+
+    /// Mirror of `jacquard_common::xrpc::subscription::EventHeader` for
+    /// encoding test fixtures. The real type is `Deserialize`-only.
+    #[derive(Serialize)]
+    struct TestEventHeader<'a> {
+        op: i64,
+        t: &'a str,
+    }
+
+    /// Encode a frame with the given header type and body.
+    fn frame<B: Serialize>(t: &str, body: &B) -> Vec<u8> {
+        let mut buf = Vec::new();
+        serde_ipld_dagcbor::ser::to_vec(&TestEventHeader { op: 1, t })
+            .unwrap()
+            .into_iter()
+            .for_each(|b| buf.push(b));
+        serde_ipld_dagcbor::ser::to_vec(body)
+            .unwrap()
+            .into_iter()
+            .for_each(|b| buf.push(b));
+        buf
+    }
+
+    /// Lexicon-shaped payload (camelCase keys), matching what the server
+    /// emits. We use serde_json::Value at the test boundary to avoid
+    /// re-deriving Serialize on the private RawResetRequestedEvent.
+    fn reset_requested_body(
+        convo_id: &str,
+        crypto_session_id: &str,
+        generation: i64,
+        trigger: &str,
+        request_event_id: &str,
+        expected_new_mls_group_id: Option<&str>,
+        cursor: &str,
+    ) -> serde_json::Value {
+        let mut obj = serde_json::json!({
+            "convoId": convo_id,
+            "cryptoSessionId": crypto_session_id,
+            "cursor": cursor,
+            "generation": generation,
+            "trigger": trigger,
+            "requestEventId": request_event_id,
+        });
+        if let Some(g) = expected_new_mls_group_id {
+            obj.as_object_mut()
+                .unwrap()
+                .insert("expectedNewMlsGroupId".into(), serde_json::Value::String(g.into()));
+        }
+        obj
+    }
+
+    #[test]
+    fn try_decode_unknown_event_returns_none_for_unknown_type() {
+        let body = serde_json::json!({"foo": "bar"});
+        let bytes = frame("#someUnknownEventType", &body);
+        assert!(try_decode_unknown_event(&bytes).is_none());
+    }
+
+    /// Validates that an indirect-trigger payload (no `expectedNewMlsGroupId`)
+    /// decodes into `WsEvent::ResetRequested` with `expected_new_mls_group_id
+    /// = None`. This is the dominant Phase 2.5 case (plan §1 locked decision).
+    #[test]
+    fn try_decode_reset_requested_indirect_trigger() {
+        let body = reset_requested_body(
+            "convo-abc",
+            "crypto-session-123",
+            17,
+            "quorum_vote",
+            "req-quorum:convo-abc:vote-42",
+            None,
+            "cursor-99",
+        );
+        let bytes = frame("#resetRequestedEvent", &body);
+        let event = try_decode_unknown_event(&bytes)
+            .expect("framed #resetRequestedEvent must decode to Some(WsEvent::ResetRequested)");
+        match event {
+            WsEvent::ResetRequested {
+                convo_id,
+                crypto_session_id,
+                generation,
+                trigger,
+                request_event_id,
+                expected_new_mls_group_id,
+            } => {
+                assert_eq!(convo_id, "convo-abc");
+                assert_eq!(crypto_session_id, "crypto-session-123");
+                assert_eq!(generation, 17);
+                assert_eq!(trigger, "quorum_vote");
+                assert_eq!(request_event_id, "req-quorum:convo-abc:vote-42");
+                assert!(
+                    expected_new_mls_group_id.is_none(),
+                    "indirect triggers MUST omit expectedNewMlsGroupId (plan §1 locked decision)"
+                );
+            }
+            other => panic!("expected WsEvent::ResetRequested, got {other:?}"),
+        }
+    }
+
+    /// Validates that a direct-trigger payload (admin path with
+    /// `expectedNewMlsGroupId` populated) decodes correctly. Stage 1
+    /// dual-emission: the same lexicon variant is used for both indirect
+    /// (None) and direct (Some) flows.
+    #[test]
+    fn try_decode_reset_requested_with_expected_group_id() {
+        let body = reset_requested_body(
+            "convo-xyz",
+            "crypto-session-456",
+            42,
+            "system_sweep",
+            "req-sweep:convo-xyz:tick-789",
+            Some("aabbccddeeff00112233445566778899"),
+            "cursor-100",
+        );
+        let bytes = frame("#resetRequestedEvent", &body);
+        let event = try_decode_unknown_event(&bytes)
+            .expect("framed #resetRequestedEvent must decode to Some(WsEvent::ResetRequested)");
+        match event {
+            WsEvent::ResetRequested {
+                trigger,
+                expected_new_mls_group_id,
+                ..
+            } => {
+                assert_eq!(trigger, "system_sweep");
+                assert_eq!(
+                    expected_new_mls_group_id.as_deref(),
+                    Some("aabbccddeeff00112233445566778899")
+                );
+            }
+            other => panic!("expected WsEvent::ResetRequested, got {other:?}"),
+        }
+    }
+
+    /// All four lexicon `knownValues` for `trigger` must round-trip — the
+    /// handler is string-typed by design (orchestrator-side comment at
+    /// `catbird-mls/src/orchestrator/recovery.rs:1373`).
+    #[test]
+    fn try_decode_reset_requested_accepts_all_known_triggers() {
+        for trig in [
+            "quorum_vote",
+            "system_sweep",
+            "inline_commit_409",
+            "inline_groupinfo_404",
+        ] {
+            let body = reset_requested_body(
+                "convo-1",
+                "session-1",
+                1,
+                trig,
+                "req-id-1",
+                None,
+                "cursor-1",
+            );
+            let bytes = frame("#resetRequestedEvent", &body);
+            let event = try_decode_unknown_event(&bytes)
+                .unwrap_or_else(|| panic!("trigger {trig:?} must decode"));
+            match event {
+                WsEvent::ResetRequested { trigger, .. } => {
+                    assert_eq!(trigger, trig);
+                }
+                other => panic!("expected ResetRequested for {trig:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Idempotency at the wire level: replaying the same framed bytes (e.g.
+    /// SSE reconnect with cursor replay) decodes to the same payload. The
+    /// per-(convo, generation) idempotency check that prevents duplicate
+    /// `mark_reset_pending` writes lives in
+    /// `ChatService::handle_reset_requested_event` and is exercised by the
+    /// DB-layer test.
+    #[test]
+    fn try_decode_reset_requested_is_pure() {
+        let body = reset_requested_body(
+            "convo-pure",
+            "session-pure",
+            7,
+            "quorum_vote",
+            "req-pure",
+            None,
+            "cursor-pure",
+        );
+        let bytes = frame("#resetRequestedEvent", &body);
+        let first = try_decode_unknown_event(&bytes).expect("first decode");
+        let second = try_decode_unknown_event(&bytes).expect("second decode");
+        match (first, second) {
+            (
+                WsEvent::ResetRequested {
+                    convo_id: a,
+                    generation: ga,
+                    request_event_id: ra,
+                    ..
+                },
+                WsEvent::ResetRequested {
+                    convo_id: b,
+                    generation: gb,
+                    request_event_id: rb,
+                    ..
+                },
+            ) => {
+                assert_eq!(a, b);
+                assert_eq!(ga, gb);
+                assert_eq!(ra, rb);
+            }
+            other => panic!("decode must be pure, got {other:?}"),
+        }
     }
 }

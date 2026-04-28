@@ -45,6 +45,32 @@ fn is_remote_data_error_str(msg: &str) -> bool {
         || m.contains("deseriali")
 }
 
+/// Phase 2.5 (`docs/plans/phase-2-5-indirect-funneling.md` §3): resolve the
+/// candidate `new_group_id` that this client will race-bootstrap to. Mirrors
+/// `MLSOrchestrator::record_reset_requested` in
+/// `catbird-mls/src/orchestrator/recovery.rs:1430-1456`.
+///
+/// - When the server supplied a non-empty `expected_new_mls_group_id` (the
+///   admin/bootstrap direct flow), use it as-is — the server has authority.
+/// - When the server omitted it (the dominant indirect case per locked
+///   decision §1: server NEVER mints `mls_group_id` outside the chokepoint),
+///   mint a fresh UUIDv4-style 32-hex-char id locally. The
+///   `crypto_sessions UNIQUE (conversation_id, generation)` constraint
+///   serializes the race winner; losers get `AlreadyBootstrapped` and fall
+///   back to Welcome on the next deferred-recovery cycle.
+///
+/// Returns `(new_group_id, was_minted)`. `was_minted = true` indicates we
+/// generated the id locally (use this for telemetry / log fidelity).
+fn resolve_reset_candidate_group_id(expected: Option<&str>) -> (String, bool) {
+    match expected {
+        Some(hex_id) if !hex_id.is_empty() => (hex_id.to_string(), false),
+        _ => (
+            format!("{:032x}", uuid::Uuid::new_v4().as_u128()),
+            true,
+        ),
+    }
+}
+
 /// Classify an error string as a §9.3 transient error (network / 429 / 5xx —
 /// retry without burning a counter slot).
 fn is_transient_error_str(msg: &str) -> bool {
@@ -700,6 +726,151 @@ impl ChatService {
         );
     }
 
+    /// Phase 2.5 (`docs/plans/phase-2-5-indirect-funneling.md` §3, §5 Stage 2):
+    /// persist a `RESET_PENDING` payload received via the new
+    /// `resetRequestedEvent` SSE event. Called from the WebSocket layer when a
+    /// `WsEvent::ResetRequested` arrives.
+    ///
+    /// **Architectural note.** catmos-cli does not instantiate
+    /// `MLSOrchestrator`; it talks to `MLSContext` directly via
+    /// `MlsManager::with_context`. The orchestrator-side equivalent of this
+    /// function is `MLSOrchestrator::record_reset_requested` in
+    /// `catbird-mls/src/orchestrator/recovery.rs:1387`. We mirror its
+    /// observable contract here (idempotency on `(convo_id, generation)`,
+    /// candidate-id minting when `expected_new_mls_group_id` is `None`,
+    /// `RESET_PENDING` persistence + tracker clears) so a future refactor
+    /// that introduces an orchestrator instance can drop in
+    /// `record_reset_requested` and delete this helper.
+    ///
+    /// **`expected_new_mls_group_id == None` is the Phase 2.5 case** — the
+    /// server never mints group ids for indirect triggers (locked decision
+    /// §1). When `None`, mint a fresh UUIDv4-style 32-hex-char id locally as
+    /// our race-bootstrap candidate (matches
+    /// `recovery.rs:1444`). When `Some(_)` (admin/bootstrap direct flow),
+    /// use it directly (matches `recovery.rs:1431-1442`).
+    ///
+    /// **Stage 1 dual-emission safety**: during the migration window the
+    /// server emits BOTH `groupResetEvent` AND `resetRequestedEvent` for the
+    /// same trigger (plan §5 Stage 1). Both handlers write to the same
+    /// `(reset_new_group_id, reset_generation)` columns, so receiving them
+    /// in either order at the same generation is safe — the persisted state
+    /// converges. Within this handler, idempotency guards against a single
+    /// `resetRequestedEvent` arriving twice (SSE reconnect, cursor replay)
+    /// at the same generation: we skip the write.
+    pub async fn handle_reset_requested_event(
+        &self,
+        convo_id: &str,
+        crypto_session_id: &str,
+        generation: i64,
+        trigger: &str,
+        request_event_id: &str,
+        expected_new_mls_group_id: Option<&str>,
+    ) {
+        // Idempotency check: if we already persisted RESET_PENDING at this
+        // generation, drop the duplicate. Mirrors
+        // `MLSOrchestrator::record_reset_requested` recovery.rs:1400-1411.
+        match self.db.get_recovery_flags(convo_id).await {
+            Ok(flags) => {
+                if let Some(payload) = flags.reset.as_ref() {
+                    if payload.reset_generation == generation {
+                        info!(
+                            convo = %&convo_id[..12.min(convo_id.len())],
+                            crypto_session = %&crypto_session_id[..12.min(crypto_session_id.len())],
+                            generation,
+                            trigger,
+                            request_event_id = %&request_event_id[..16.min(request_event_id.len())],
+                            existing_new_group_id = %payload.new_group_id,
+                            "resetRequestedEvent: already in RESET_PENDING at this generation, idempotent no-op"
+                        );
+                        return;
+                    }
+                    info!(
+                        convo = %&convo_id[..12.min(convo_id.len())],
+                        old_generation = payload.reset_generation,
+                        new_generation = generation,
+                        trigger,
+                        "resetRequestedEvent: superseding existing RESET_PENDING at different generation"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    convo = %&convo_id[..12.min(convo_id.len())],
+                    error = %e,
+                    "handle_reset_requested_event: failed to read recovery flags for idempotency check; proceeding"
+                );
+            }
+        }
+
+        // Resolve new_group_id eagerly. Mirrors recovery.rs:1430-1456:
+        // server-supplied id (admin path) wins; otherwise mint a fresh
+        // UUIDv4-style 32-hex-char id locally for our race-bootstrap
+        // candidate. The chokepoint's `crypto_sessions UNIQUE
+        // (conversation_id, generation)` constraint serializes the winner;
+        // race losers see HTTP 409 `AlreadyBootstrapped` and drop their
+        // pre-bootstrap MLS group cleanly via the existing
+        // `try_first_responder_bootstrap` race-loser branch.
+        let (new_group_id, was_minted) =
+            resolve_reset_candidate_group_id(expected_new_mls_group_id);
+        if was_minted {
+            info!(
+                convo = %&convo_id[..12.min(convo_id.len())],
+                crypto_session = %&crypto_session_id[..12.min(crypto_session_id.len())],
+                generation,
+                trigger,
+                new_group_id = %new_group_id,
+                "resetRequestedEvent: no expected_new_mls_group_id from server, minting client-side candidate for first-responder bootstrap"
+            );
+        } else {
+            info!(
+                convo = %&convo_id[..12.min(convo_id.len())],
+                crypto_session = %&crypto_session_id[..12.min(crypto_session_id.len())],
+                generation,
+                trigger,
+                new_group_id = %new_group_id,
+                "resetRequestedEvent: server-supplied expected_new_mls_group_id, using it directly"
+            );
+        }
+
+        let notified_at_ms = chrono::Utc::now().timestamp_millis();
+        if let Err(e) = self
+            .db
+            .mark_reset_pending(convo_id, &new_group_id, generation, notified_at_ms)
+            .await
+        {
+            warn!(
+                convo = %&convo_id[..12.min(convo_id.len())],
+                error = %e,
+                "handle_reset_requested_event: failed to persist RESET_PENDING"
+            );
+            return;
+        }
+
+        // Mirrors handle_group_reset_event: server reset clears all local
+        // retry counters and the unrecoverable flag — this is a fresh
+        // start (§8.6).
+        self.recovery_tracker.lock().await.clear_convo(convo_id);
+        self.groupinfo_404_tracker.lock().await.clear(convo_id);
+        self.reset_recovery_counters(convo_id).await;
+        if let Err(e) = self.db.clear_unrecoverable_local(convo_id).await {
+            warn!(
+                convo = %&convo_id[..12.min(convo_id.len())],
+                error = %e,
+                "handle_reset_requested_event: failed to clear UNRECOVERABLE_LOCAL"
+            );
+        }
+        info!(
+            phase_2_5_path = "request_only",
+            convo = %&convo_id[..12.min(convo_id.len())],
+            crypto_session = %&crypto_session_id[..12.min(crypto_session_id.len())],
+            new_group = %&new_group_id[..12.min(new_group_id.len())],
+            generation,
+            trigger,
+            request_event_id = %&request_event_id[..16.min(request_event_id.len())],
+            "Persisted RESET_PENDING from resetRequestedEvent"
+        );
+    }
+
     // ── §8.5 Phase 1 ladder helpers (Welcome → ExternalCommit → Bootstrap) ──
 
     /// Try to adopt the post-reset group via a server-published Welcome.
@@ -1025,5 +1196,52 @@ mod bootstrap_classifier_tests {
             !is_bootstrap_already_bootstrapped(&err),
             "non-Xrpc variants must not classify"
         );
+    }
+
+    /// Phase 2.5 indirect case (locked decision §1): server omits
+    /// `expectedNewMlsGroupId` so the client mints a candidate id locally.
+    /// Mirrors orchestrator behavior at
+    /// `catbird-mls/src/orchestrator/recovery.rs:1444`.
+    #[test]
+    fn resolve_reset_candidate_mints_when_no_expected_group_id() {
+        let (id, was_minted) = resolve_reset_candidate_group_id(None);
+        assert!(was_minted, "indirect trigger must mint a candidate id");
+        assert_eq!(id.len(), 32, "minted id must be 32 hex chars (UUIDv4 u128)");
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "minted id must be lowercase hex: {id}"
+        );
+
+        // Two consecutive mints must produce different ids — the
+        // first-responder bootstrap race relies on each client picking a
+        // unique candidate.
+        let (id2, _) = resolve_reset_candidate_group_id(None);
+        assert_ne!(id, id2, "minted ids must be unique per call");
+    }
+
+    /// Empty-string `expectedNewMlsGroupId` is treated as "not provided" —
+    /// mirrors the orchestrator-side check `if !hex_id.is_empty()` at
+    /// `catbird-mls/src/orchestrator/recovery.rs:1431`. Defends against
+    /// a malformed / placeholder server payload.
+    #[test]
+    fn resolve_reset_candidate_treats_empty_string_as_none() {
+        let (id, was_minted) = resolve_reset_candidate_group_id(Some(""));
+        assert!(
+            was_minted,
+            "empty-string expected_new_mls_group_id must fall through to mint"
+        );
+        assert_eq!(id.len(), 32);
+    }
+
+    /// Direct flow (admin reset, legacy bootstrap path): server-supplied id
+    /// passes through unchanged. The chokepoint enforces the "admin path
+    /// must always set expected_new_mls_group_id" invariant on the server
+    /// side (plan §7 R1 mitigation 1); this client trusts the wire value.
+    #[test]
+    fn resolve_reset_candidate_passes_through_server_supplied_id() {
+        let server_id = "deadbeefcafebabe0011223344556677";
+        let (id, was_minted) = resolve_reset_candidate_group_id(Some(server_id));
+        assert!(!was_minted, "server-supplied id must not be re-minted");
+        assert_eq!(id, server_id, "server-supplied id must pass through verbatim");
     }
 }
