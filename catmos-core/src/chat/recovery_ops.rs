@@ -64,10 +64,7 @@ fn is_remote_data_error_str(msg: &str) -> bool {
 fn resolve_reset_candidate_group_id(expected: Option<&str>) -> (String, bool) {
     match expected {
         Some(hex_id) if !hex_id.is_empty() => (hex_id.to_string(), false),
-        _ => (
-            format!("{:032x}", uuid::Uuid::new_v4().as_u128()),
-            true,
-        ),
+        _ => (format!("{:032x}", uuid::Uuid::new_v4().as_u128()), true),
     }
 }
 
@@ -300,12 +297,7 @@ impl ChatService {
         }
 
         // 2. Gate on GroupInfo 404 circuit breaker (§8.3)
-        if self
-            .groupinfo_404_tracker
-            .lock()
-            .await
-            .is_tripped(convo_id)
-        {
+        if self.groupinfo_404_tracker.lock().await.is_tripped(convo_id) {
             warn!(
                 convo = %convo_label,
                 "External Commit rejoin suppressed: GroupInfo 404 circuit breaker tripped"
@@ -341,10 +333,7 @@ impl ChatService {
             Err(e) => {
                 let msg = e.to_string();
                 if MlsManager::is_group_info_unavailable(&e) || msg.contains("returned 404") {
-                    self.groupinfo_404_tracker
-                        .lock()
-                        .await
-                        .record_404(convo_id);
+                    self.groupinfo_404_tracker.lock().await.record_404(convo_id);
                     warn!(
                         convo = %convo_label,
                         error = %e,
@@ -429,10 +418,7 @@ impl ChatService {
                     let mut tracker = self.recovery_tracker.lock().await;
                     tracker.record_success(convo_id);
                 }
-                self.groupinfo_404_tracker
-                    .lock()
-                    .await
-                    .clear(convo_id);
+                self.groupinfo_404_tracker.lock().await.clear(convo_id);
                 self.reset_recovery_counters(convo_id).await;
                 if let Err(e) = self.db.clear_needs_rejoin(convo_id).await {
                     warn!(
@@ -452,10 +438,7 @@ impl ChatService {
                     || msg.contains("missing groupInfo")
                     || msg.contains("returned 404");
                 if is_gi_404 {
-                    self.groupinfo_404_tracker
-                        .lock()
-                        .await
-                        .record_404(convo_id);
+                    self.groupinfo_404_tracker.lock().await.record_404(convo_id);
                 }
                 // Remote data error during create_external_commit / merge =
                 // §9.2: malformed GroupInfo we already fetched. Transition
@@ -525,11 +508,7 @@ impl ChatService {
     /// Variant of `transition_unrecoverable_local` that lets the caller pick
     /// the §8.6 `failureType`. Used by §9.2 remote-data classification, which
     /// reports `"remote_data_error"` instead of `"external_commit_exhausted"`.
-    async fn transition_unrecoverable_local_with_reason(
-        &self,
-        convo_id: &str,
-        failure_type: &str,
-    ) {
+    async fn transition_unrecoverable_local_with_reason(&self, convo_id: &str, failure_type: &str) {
         if let Err(e) = self.db.mark_unrecoverable_local(convo_id).await {
             warn!(
                 convo = %&convo_id[..12.min(convo_id.len())],
@@ -580,10 +559,7 @@ impl ChatService {
             };
             // Server reset = fresh start: clear our local retry counters.
             self.recovery_tracker.lock().await.clear_convo(convo_id);
-            self.groupinfo_404_tracker
-                .lock()
-                .await
-                .clear(convo_id);
+            self.groupinfo_404_tracker.lock().await.clear(convo_id);
 
             // Step 1: try Welcome. Cheapest, no MLS state mutation.
             if self.try_pending_welcome(convo_id).await {
@@ -706,10 +682,7 @@ impl ChatService {
         // Server reset clears all local retry counters and the unrecoverable
         // flag — this is a fresh start (§8.6).
         self.recovery_tracker.lock().await.clear_convo(convo_id);
-        self.groupinfo_404_tracker
-            .lock()
-            .await
-            .clear(convo_id);
+        self.groupinfo_404_tracker.lock().await.clear(convo_id);
         self.reset_recovery_counters(convo_id).await;
         if let Err(e) = self.db.clear_unrecoverable_local(convo_id).await {
             warn!(
@@ -897,11 +870,23 @@ impl ChatService {
         let did = self.did().to_string();
         match self.mls.process_welcome_b64(&welcome_b64, &did) {
             Ok(group_id) => {
+                let group_id_hex = hex::encode(&group_id);
                 info!(
                     convo = %convo_label,
-                    group = %hex::encode(&group_id),
+                    group = %group_id_hex,
                     "try_pending_welcome: adopted post-reset group via Welcome"
                 );
+                // Encrypted-bootstrap: the post-reset group has a fresh
+                // exporter; the resetter has re-published metadata under
+                // (convoId, resetGeneration, kind) and we can pick it up
+                // immediately via bootstrap_group_metadata.
+                if let Err(e) = self.bootstrap_group_metadata(convo_id, &group_id_hex).await {
+                    warn!(
+                        convo = %convo_label,
+                        error = %e,
+                        "try_pending_welcome: bootstrap_group_metadata failed (non-fatal; will retry next cycle)"
+                    );
+                }
                 true
             }
             Err(e) => {
@@ -926,11 +911,7 @@ impl ChatService {
     /// Race-loser: keeps `reset_pending` set; next cycle re-enters the ladder
     /// at Step 1 (Welcome) and picks up the winner's published Welcome.
     /// Other failures: drop the local group so the next attempt starts clean.
-    async fn try_first_responder_bootstrap(
-        &self,
-        convo_id: &str,
-        payload: &ResetPendingPayload,
-    ) {
+    async fn try_first_responder_bootstrap(&self, convo_id: &str, payload: &ResetPendingPayload) {
         let convo_label = &convo_id[..12.min(convo_id.len())];
 
         let new_group_id_bytes = match hex::decode(&payload.new_group_id) {
@@ -977,9 +958,8 @@ impl ChatService {
                 .find(|c| c.conversation_id == convo_id)
                 .map(|c| c.cipher_suite.clone())
         };
-        let cipher_suite = cipher_suite.unwrap_or_else(|| {
-            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string()
-        });
+        let cipher_suite = cipher_suite
+            .unwrap_or_else(|| "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string());
 
         info!(
             convo = %convo_label,
@@ -995,11 +975,8 @@ impl ChatService {
         let did = self.did().to_string();
         let identity_bytes = did.as_bytes().to_vec();
         if let Err(e) = self.mls.with_context(|ctx| {
-            let _ = ctx.create_group_with_id(
-                identity_bytes.clone(),
-                new_group_id_bytes.clone(),
-                None,
-            )?;
+            let _ =
+                ctx.create_group_with_id(identity_bytes.clone(), new_group_id_bytes.clone(), None)?;
             Ok(())
         }) {
             warn!(
@@ -1028,7 +1005,27 @@ impl ChatService {
             }
         };
 
-        // 2. Submit to server via bootstrapResetGroup. The bootstrap roster
+        // 2a. Republish encrypted metadata against the new group epoch so the
+        // declared locator on `bootstrapResetGroup` matches a live blob the
+        // server can serve to joiners. Best-effort: if there's nothing to
+        // re-encrypt (no prior local metadata) we skip and pass None on to
+        // the bootstrap call. Per Phase E of the metadata cutover plan.
+        let (republished_locator, republished_version) = match self
+            .republish_metadata_after_reset(convo_id, &new_group_id_bytes, payload.reset_generation)
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                warn!(
+                    convo = %convo_label,
+                    error = %e,
+                    "bootstrap: republish_metadata_after_reset failed; bootstrapping without metadata declaration"
+                );
+                (None, None)
+            }
+        };
+
+        // 2b. Submit to server via bootstrapResetGroup. The bootstrap roster
         // ships the FULL membership including the caller — server uses the
         // persisted members table (preserved across reset) as the
         // authoritative roster and treats this list as a diagnostic/audit
@@ -1040,6 +1037,8 @@ impl ChatService {
                 &cipher_suite,
                 &roster,
                 group_info_bytes,
+                republished_locator.as_deref(),
+                republished_version,
             )
             .await;
 
@@ -1104,10 +1103,7 @@ impl ChatService {
     /// Fetch the current member roster for `convo_id` via `getConvos`.
     /// Returns the unique set of `user_did`s. Spec §8.5 Phase 1 / Phase 0 Q3:
     /// `groupResetEvent` carries no roster, so bootstrap MUST refetch fresh.
-    async fn fetch_member_roster_for_bootstrap(
-        &self,
-        convo_id: &str,
-    ) -> Result<Vec<String>> {
+    async fn fetch_member_roster_for_bootstrap(&self, convo_id: &str) -> Result<Vec<String>> {
         let resp: super::messages::GetConvosResp = self
             .xrpc_query(catbird_atproto::catbird::mls_chat::get_convos::NSID, &[])
             .await?;
@@ -1242,6 +1238,9 @@ mod bootstrap_classifier_tests {
         let server_id = "deadbeefcafebabe0011223344556677";
         let (id, was_minted) = resolve_reset_candidate_group_id(Some(server_id));
         assert!(!was_minted, "server-supplied id must not be re-minted");
-        assert_eq!(id, server_id, "server-supplied id must pass through verbatim");
+        assert_eq!(
+            id, server_id,
+            "server-supplied id must pass through verbatim"
+        );
     }
 }

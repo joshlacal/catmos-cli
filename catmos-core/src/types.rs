@@ -5,7 +5,12 @@ use serde::{Deserialize, Serialize};
 pub struct Conversation {
     pub conversation_id: String,
     pub group_id: String,
+    /// Decrypted group title. Populated from `bootstrap_group_metadata` after
+    /// a Welcome / external-commit join / metadata-update commit merge.
+    /// **Never read from API responses** — the server is cryptographically
+    /// blind to group titles after the metadata cutover.
     pub name: Option<String>,
+    /// Decrypted group description. Same provenance rules as `name`.
     pub description: Option<String>,
     pub creator: String,
     pub epoch: u64,
@@ -15,6 +20,20 @@ pub struct Conversation {
     pub last_message_at: Option<DateTime<Utc>>,
     pub unread_count: u32,
     pub alias: Option<String>,
+    /// `MetadataReference.metadata_version` for the most recent bootstrap.
+    /// Used to skip redundant blob fetches when we already hold the same version.
+    pub metadata_version: Option<i64>,
+    /// `MetadataReference.blob_locator` for the most recent bootstrap.
+    pub metadata_blob_locator: Option<String>,
+    /// Locator for the avatar blob referenced by the last decrypted
+    /// `GroupMetadataV1`. May be `None` even when `name` is set.
+    pub avatar_blob_locator: Option<String>,
+    /// Decrypted avatar image bytes (raw, not base64). Persisted so the TUI
+    /// can render the avatar across restarts without re-fetching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_bytes: Option<Vec<u8>>,
+    /// MIME type of `avatar_bytes`, e.g. `"image/jpeg"`.
+    pub avatar_content_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

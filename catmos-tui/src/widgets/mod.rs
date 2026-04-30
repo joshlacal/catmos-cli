@@ -1,3 +1,4 @@
+pub mod avatar;
 pub mod input;
 pub mod members;
 pub mod messages;

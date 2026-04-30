@@ -144,11 +144,24 @@ impl MlsManager {
         for wm in &resp.welcome_messages {
             match self.process_welcome_b64(&wm.welcome, did) {
                 Ok(group_id) => {
+                    let group_id_hex = hex::encode(&group_id);
                     info!(
                         "Joined convo {} via welcome (group={})",
-                        wm.convo_id,
-                        hex::encode(&group_id)
+                        wm.convo_id, group_id_hex
                     );
+                    // Encrypted-bootstrap (post-MLS-metadata cutover): fetch
+                    // and decrypt the metadata blob now that the group
+                    // exporter is live. Failure is non-fatal — the next
+                    // fetch_conversations cycle will retry.
+                    if let Err(e) = service
+                        .bootstrap_group_metadata(&wm.convo_id, &group_id_hex)
+                        .await
+                    {
+                        warn!(
+                            "Welcome bootstrap_group_metadata failed for {}: {e}",
+                            wm.convo_id
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to process welcome for convo {}: {e}", wm.convo_id);
@@ -233,8 +246,8 @@ impl MlsManager {
         );
 
         let identity = did.as_bytes().to_vec();
-        let ext_result = self
-            .with_context(|ctx| ctx.create_external_commit(group_info_bytes, identity))?;
+        let ext_result =
+            self.with_context(|ctx| ctx.create_external_commit(group_info_bytes, identity))?;
 
         debug!(
             "Created external commit for {convo_label} ({} bytes), group_id={}",
@@ -262,14 +275,26 @@ impl MlsManager {
             .await
         {
             Ok(_) => {
-                match self
-                    .with_context(|ctx| ctx.merge_pending_commit(ext_result.group_id.clone()))
+                match self.with_context(|ctx| ctx.merge_pending_commit(ext_result.group_id.clone()))
                 {
                     Ok(result) => {
                         info!(
                             "Joined conversation {convo_id} via external commit (epoch {})",
                             result.new_epoch
                         );
+                        // Encrypted-bootstrap after external-commit join.
+                        // `convo_id` here is the hex group id (matches how
+                        // `bootstrap_group_metadata` is wired in
+                        // sync_conversation). Failure is non-fatal.
+                        let group_id_hex = hex::encode(&ext_result.group_id);
+                        if let Err(e) = service
+                            .bootstrap_group_metadata(convo_id, &group_id_hex)
+                            .await
+                        {
+                            warn!(
+                                "external_commit_with_group_info: bootstrap_group_metadata failed for {convo_label}: {e}"
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!(
@@ -403,7 +428,7 @@ impl MlsManager {
                 "externalCommit",
                 Some(ext_result.commit_data.clone()),
                 None, // welcome: none for externalCommit (server
-                      // enforce_non_add_action_contract rejects it)
+                // enforce_non_add_action_contract rejects it)
                 ext_result.group_info.clone(),
                 tag_bytes,
                 None, // member_dids: none for externalCommit (same gate)
@@ -417,9 +442,9 @@ impl MlsManager {
                 Ok(_) => {
                     // Server accepted — merge the pending external join locally
                     // to finalize the new group state (spec compliance).
-                    match self.with_context(|ctx| {
-                        ctx.merge_pending_commit(ext_result.group_id.clone())
-                    }) {
+                    match self
+                        .with_context(|ctx| ctx.merge_pending_commit(ext_result.group_id.clone()))
+                    {
                         Ok(result) => {
                             info!(
                                 "Joined conversation {convo_id} via external commit (epoch {})",

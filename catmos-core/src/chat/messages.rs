@@ -87,6 +87,13 @@ pub(crate) struct GetConvosResp {
 }
 
 /// Thin deserialization wrapper matching the generated `ConvoView` field names.
+///
+/// Note: the server still emits a `metadata: { name, description }` field
+/// during the rollout window (it is removed from the lexicon in Phase D of
+/// the metadata cutover plan). We deserialize it tolerantly into
+/// `serde_json::Value` so a stale field doesn't break parsing, but it is
+/// **never read** — group titles are decrypted exclusively via
+/// `bootstrap_group_metadata` (`chat/metadata.rs`).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConvoViewResp {
@@ -102,15 +109,11 @@ pub(crate) struct ConvoViewResp {
     pub created_at: String,
     #[serde(default)]
     pub last_message_at: Option<String>,
+    /// Tolerated for forward/backward compatibility during the cutover.
+    /// Intentionally never read — see `convo_resp_to_conversation`.
     #[serde(default)]
-    pub metadata: Option<ConvoMetadataResp>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ConvoMetadataResp {
-    pub name: Option<String>,
-    pub description: Option<String>,
+    #[allow(dead_code)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Thin deserialization wrapper matching the generated `MemberView` field names.
@@ -169,6 +172,14 @@ pub(crate) struct CreateConvoResp {
 // ── Conversions from response types to domain types ─────────────────────
 
 /// Convert a `ConvoViewResp` into our domain `Conversation`.
+///
+/// **Title / description / avatar are intentionally `None`.** After the MLS
+/// metadata cutover the server is cryptographically blind to group metadata,
+/// so the only authoritative source is the locally-decrypted blob persisted
+/// via `bootstrap_group_metadata` (see `chat/metadata.rs`). The DB layer's
+/// `store_conversation` upsert uses `COALESCE(excluded.col, conversations.col)`
+/// to preserve any decrypted metadata already written, so callers don't need
+/// to merge by hand.
 pub(crate) fn convo_resp_to_conversation(view: &ConvoViewResp) -> Conversation {
     let members = view.members.iter().map(member_resp_to_member).collect();
 
@@ -178,8 +189,12 @@ pub(crate) fn convo_resp_to_conversation(view: &ConvoViewResp) -> Conversation {
             .clone()
             .unwrap_or_else(|| view.group_id.clone()),
         group_id: view.group_id.clone(),
-        name: view.metadata.as_ref().and_then(|m| m.name.clone()),
-        description: view.metadata.as_ref().and_then(|m| m.description.clone()),
+        // Encrypted-only path — never read view.metadata. The server returns
+        // `metadata: None` post-cutover; reading it would be an empty fallback
+        // anyway, but accepting any plaintext from the wire would normalise
+        // the leak we just plugged.
+        name: None,
+        description: None,
         creator: view.creator.clone(),
         epoch: view.epoch as u64,
         cipher_suite: view.cipher_suite.clone(),
@@ -194,6 +209,11 @@ pub(crate) fn convo_resp_to_conversation(view: &ConvoViewResp) -> Conversation {
         }),
         unread_count: 0,
         alias: None,
+        metadata_version: None,
+        metadata_blob_locator: None,
+        avatar_blob_locator: None,
+        avatar_bytes: None,
+        avatar_content_type: None,
     }
 }
 
@@ -304,9 +324,9 @@ impl ChatService {
                 }
 
                 // Re-encrypt at new epoch and retry once
-                let new_encrypt = self
-                    .mls
-                    .with_context(|ctx| ctx.encrypt_message(group_id_bytes.clone(), plaintext.clone()))?;
+                let new_encrypt = self.mls.with_context(|ctx| {
+                    ctx.encrypt_message(group_id_bytes.clone(), plaintext.clone())
+                })?;
                 let new_epoch = self.get_epoch(convo_id).unwrap_or(0);
                 let new_tag = self.get_confirmation_tag_b64(&group_id_bytes);
                 let new_padded = new_encrypt.ciphertext.len() as i64;
@@ -498,7 +518,36 @@ impl ChatService {
             .map(convo_resp_to_conversation)
             .collect();
 
-        // Attempt to decrypt MLS group metadata for richer names
+        // Hydrate locally-decrypted metadata into the freshly-built
+        // Conversation values BEFORE the COALESCE-aware DB upsert below.
+        // Without this step the in-memory cache published to the TUI
+        // would briefly show empty titles between the API response and
+        // the next bootstrap pass, causing visible flicker.
+        match self.db.list_conversations().await {
+            Ok(rows) => {
+                use std::collections::HashMap;
+                let local_by_id: HashMap<String, Conversation> = rows
+                    .into_iter()
+                    .map(|c| (c.conversation_id.clone(), c))
+                    .collect();
+                for c in convos.iter_mut() {
+                    if let Some(local) = local_by_id.get(&c.conversation_id) {
+                        c.name = local.name.clone();
+                        c.description = local.description.clone();
+                        c.metadata_version = local.metadata_version;
+                        c.metadata_blob_locator = local.metadata_blob_locator.clone();
+                        c.avatar_blob_locator = local.avatar_blob_locator.clone();
+                        c.avatar_bytes = local.avatar_bytes.clone();
+                        c.avatar_content_type = local.avatar_content_type.clone();
+                    }
+                }
+            }
+            Err(e) => debug!("fetch_conversations: list_conversations(local hydrate) failed: {e}"),
+        }
+
+        // Legacy fallback: try the deprecated 0xff00 plaintext extension
+        // for groups created pre-cutover. Returns None for groups born
+        // post-cutover (the only ones the new server emits).
         self.apply_group_metadata(&mut convos);
 
         // ── Resolve all unique user DIDs to handles ──────────────────────
@@ -591,6 +640,39 @@ impl ChatService {
         // Update cached conversations
         *self.conversations.write().await = convos.clone();
 
+        // Encrypted-bootstrap pass: for every conversation we have local MLS
+        // state for, fetch+decrypt the latest metadata blob and persist
+        // title/description/avatar. Skips quickly when the local
+        // metadata_version is already at-or-ahead of the server's
+        // MetadataReference. Errors are logged, not fatal — the legacy
+        // fallback above and the empty `name` carry the UX through to the
+        // next refresh.
+        for convo in &convos {
+            let group_id_hex = convo.group_id.clone();
+            let convo_id = convo.conversation_id.clone();
+            let group_id_bytes = match hex::decode(&group_id_hex) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let has_local_state = self
+                .mls
+                .with_context(|ctx| ctx.get_epoch(group_id_bytes.clone()))
+                .is_ok();
+            if !has_local_state {
+                continue;
+            }
+            if let Err(e) = self
+                .bootstrap_group_metadata(&convo_id, &group_id_hex)
+                .await
+            {
+                debug!(
+                    convo = %&convo_id[..12.min(convo_id.len())],
+                    error = %e,
+                    "fetch_conversations: bootstrap_group_metadata failed (non-fatal)"
+                );
+            }
+        }
+
         // Sync alias display names
         let mut aliases = self.aliases.write().await;
         for convo in &convos {
@@ -676,7 +758,10 @@ impl ChatService {
                 // Own-commit dedup (spec §5.4): skip commits we sent ourselves
                 let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
                 if self.own_commits.lock().await.remove(&hash).is_some() {
-                    debug!("sync: skipping own commit {} epoch={}", entry.id, entry.epoch);
+                    debug!(
+                        "sync: skipping own commit {} epoch={}",
+                        entry.id, entry.epoch
+                    );
                     total_processed += 1;
                     consecutive_failures = 0;
                     continue;
@@ -694,7 +779,18 @@ impl ChatService {
                     .mls
                     .with_context(|ctx| ctx.process_message(gid_bytes.clone(), ciphertext.clone()));
                 match process_result {
-                    Ok(catbird_mls::ProcessedContent::StagedCommit { new_epoch, .. }) => {
+                    Ok(catbird_mls::ProcessedContent::StagedCommit {
+                        new_epoch,
+                        commit_metadata,
+                        ..
+                    }) => {
+                        // Track whether the staged commit announced a metadata
+                        // update for the new epoch. After the merge succeeds we
+                        // re-bootstrap so the locally-decrypted title/desc/avatar
+                        // catch up to the new MetadataReference (per Phase B of
+                        // the metadata cutover plan). `commit_metadata.is_some()`
+                        // is the only signal — server can't tell us this.
+                        let metadata_updated = commit_metadata.is_some();
                         // Confirm the merge so the local epoch actually advances.
                         match self.mls.with_context(|ctx| {
                             ctx.merge_incoming_commit(gid_bytes.clone(), new_epoch)
@@ -706,6 +802,29 @@ impl ChatService {
                                     "sync: staged+merged commit {} epoch={} (local now {merged_epoch})",
                                     entry.id, entry.epoch
                                 );
+                                if metadata_updated {
+                                    // sync_conversation's `convo_id` parameter is actually
+                                    // the hex group id (it's hex-decoded into gid_bytes
+                                    // above). Resolve the stable conversation_id from the
+                                    // in-memory cache so the DB row update lands on the
+                                    // post-reset row when group_id != conversation_id.
+                                    let stable_convo_id = self
+                                        .conversations
+                                        .read()
+                                        .await
+                                        .iter()
+                                        .find(|c| c.group_id == convo_id)
+                                        .map(|c| c.conversation_id.clone())
+                                        .unwrap_or_else(|| convo_id.to_string());
+                                    if let Err(e) = self
+                                        .bootstrap_group_metadata(&stable_convo_id, convo_id)
+                                        .await
+                                    {
+                                        warn!(
+                                            "sync: bootstrap_group_metadata after metadata-update commit failed for {convo_label}: {e}"
+                                        );
+                                    }
+                                }
                             }
                             Err(e) => {
                                 consecutive_failures += 1;
@@ -784,11 +903,7 @@ impl ChatService {
     }
 
     /// Load messages from the local SQLCipher database (no server round-trip).
-    pub async fn load_local_messages(
-        &self,
-        convo_id: &str,
-        limit: u32,
-    ) -> Result<Vec<Message>> {
+    pub async fn load_local_messages(&self, convo_id: &str, limit: u32) -> Result<Vec<Message>> {
         self.db.get_messages(convo_id, limit, None).await
     }
 

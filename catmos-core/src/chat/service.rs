@@ -438,10 +438,7 @@ impl ChatService {
     /// code (AppPassword only — OAuth is refreshed server-side by nest).
     pub(crate) fn should_retry_after_refresh(&self, status: StatusCode) -> bool {
         self.token_session.is_some()
-            && matches!(
-                status,
-                StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
-            )
+            && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST)
     }
 
     /// Fetch the current bearer token for the active auth method.
@@ -458,9 +455,10 @@ impl ChatService {
     /// Force a `refreshSession` call on the AppPassword token session, persist
     /// the new tokens, and return the fresh bearer. Fails if no token session.
     pub(crate) async fn refresh_bearer(&self) -> Result<String> {
-        let sess = self.token_session.as_ref().ok_or_else(|| {
-            CatmosError::AuthFailed("no TokenSession — cannot refresh".into())
-        })?;
+        let sess = self
+            .token_session
+            .as_ref()
+            .ok_or_else(|| CatmosError::AuthFailed("no TokenSession — cannot refresh".into()))?;
         tracing::info!("Refreshing app-password session tokens");
         sess.refresh(&self.db).await
     }
@@ -468,11 +466,20 @@ impl ChatService {
     // ── Conversation management ──────────────────────────────────────────
 
     /// Create a new MLS group conversation on the server.
+    ///
+    /// Per the MLS metadata cutover (Phase C), this **does not** ship a
+    /// plaintext `metadata { name, description }` field on `createConvo`. The
+    /// returned `Conversation` has `name: None` / `description: None`; the
+    /// caller is expected to drive the encrypted-bootstrap path via
+    /// `bootstrap_group_metadata_for_convo` (see `chat/metadata.rs`) once the
+    /// local MLS group exists. `name` / `description` are persisted as part
+    /// of `GroupMetadataV1` and uploaded as an opaque blob through
+    /// `putGroupMetadataBlob`.
     pub async fn create_conversation(
         &self,
-        name: &str,
+        _name: &str,
         members: &[String],
-        description: Option<&str>,
+        _description: Option<&str>,
     ) -> Result<Conversation> {
         let req: mls_chat::create_convo::Input = mls_chat::create_convo::InputData {
             group_id: String::new(), // server assigns
@@ -487,13 +494,8 @@ impl ChatService {
                         .collect(),
                 )
             },
-            metadata: Some(
-                mls_chat::create_convo::MetadataInputData {
-                    name: Some(name.to_string()),
-                    description: description.map(String::from),
-                }
-                .into(),
-            ),
+            // Encrypted-only path: no plaintext name/description on the wire.
+            metadata: None,
             welcome_message: None,
             current_epoch: None,
             key_package_hashes: None,
@@ -529,6 +531,7 @@ impl ChatService {
     /// `welcome_message` is `None` because race-winners broadcast Welcome via
     /// the next `add_members` cycle (mirrors
     /// `catbird-mls/src/orchestrator/recovery.rs:1654`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn bootstrap_reset_group(
         &self,
         original_convo_id: &str,
@@ -536,12 +539,21 @@ impl ChatService {
         cipher_suite: &str,
         members: &[String],
         group_info: Vec<u8>,
+        metadata_blob_locator: Option<&str>,
+        metadata_version: Option<i64>,
     ) -> Result<()> {
         // Build the lexicon struct directly to dodge the InputData/Bytes
         // double-encoding bug documented above `build_commit_group_change`.
         // bootstrap_reset_group has no hand-written shim in
         // catbird-atproto/src/lib.rs as of commit `f6d7efc` so we construct
         // the generated `BootstrapResetGroup<'static>` ourselves.
+        //
+        // `metadata_blob_locator` / `metadata_version` are optional declarations
+        // for the encrypted metadata blob the reset winner re-publishes for the
+        // new group (see `republish_metadata_after_reset`). They are diagnostic
+        // — joining members fetch via `getGroupMetadataBlob` regardless — but
+        // surface a strong server-visible signal that the resetter has ownership
+        // of the new generation's metadata.
         use catbird_atproto::blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroup;
 
         const NSID: &str = "blue.catbird.mlsChat.bootstrapResetGroup";
@@ -558,6 +570,8 @@ impl ChatService {
             current_epoch: None,
             key_package_hashes: None,
             welcome_message: None,
+            metadata_blob_locator: metadata_blob_locator.map(|s| s.to_string().into()),
+            metadata_version,
             extra_data: Default::default(),
         };
 
@@ -610,7 +624,7 @@ impl ChatService {
         match resp.stats {
             Some(s) => Ok(KeyPackageStatus {
                 available: s.total_available as u64,
-                target: 50, // spec: KEY_PACKAGE_TARGET = 50
+                target: 50,                              // spec: KEY_PACKAGE_TARGET = 50
                 needs_replenish: s.total_available < 10, // spec: KEY_PACKAGE_LOW_THRESHOLD = 10
             }),
             None => Ok(KeyPackageStatus {
@@ -654,10 +668,8 @@ impl ChatService {
     ) -> Result<()> {
         // 1. Build the GroupMetadata JSON blob that MLS will embed in the
         //    group-context extension (matches iOS `GroupMetadataPayload`).
-        let metadata = GroupMetadata::new(
-            name.map(str::to_string),
-            description.map(str::to_string),
-        );
+        let metadata =
+            GroupMetadata::new(name.map(str::to_string), description.map(str::to_string));
         let metadata_json = metadata
             .to_extension_bytes()
             .map_err(|e| CatmosError::Other(format!("Failed to encode GroupMetadata: {e}")))?;
@@ -695,10 +707,7 @@ impl ChatService {
 
         let handle = plan.handle.clone();
         match self
-            .xrpc_procedure::<_, CommitGroupChangeResp>(
-                mls_chat::commit_group_change::NSID,
-                &req,
-            )
+            .xrpc_procedure::<_, CommitGroupChangeResp>(mls_chat::commit_group_change::NSID, &req)
             .await
         {
             Ok(resp) if resp.success => {
@@ -775,9 +784,7 @@ impl ChatService {
         })?;
 
         let welcome_bytes = plan.welcome_bytes.clone().ok_or_else(|| {
-            CatmosError::Other(
-                "stage_commit(AddMembers) did not return welcome bytes".to_string(),
-            )
+            CatmosError::Other("stage_commit(AddMembers) did not return welcome bytes".to_string())
         })?;
 
         // 3. POST commitGroupChange with commit + welcome + memberDids.
@@ -796,10 +803,7 @@ impl ChatService {
 
         let handle = plan.handle.clone();
         match self
-            .xrpc_procedure::<_, CommitGroupChangeResp>(
-                mls_chat::commit_group_change::NSID,
-                &req,
-            )
+            .xrpc_procedure::<_, CommitGroupChangeResp>(mls_chat::commit_group_change::NSID, &req)
             .await
         {
             Ok(resp) if resp.success => {
@@ -815,9 +819,7 @@ impl ChatService {
                     .mls
                     .with_commit_context(|ctx| ctx.confirm_commit(handle.clone(), server_epoch))
                 {
-                    warn!(
-                        "add_member: confirm_commit failed for {convo_id}: {e} — discarding"
-                    );
+                    warn!("add_member: confirm_commit failed for {convo_id}: {e} — discarding");
                     let _ = self
                         .mls
                         .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
@@ -879,10 +881,7 @@ impl ChatService {
 
         let handle = plan.handle.clone();
         match self
-            .xrpc_procedure::<_, CommitGroupChangeResp>(
-                mls_chat::commit_group_change::NSID,
-                &req,
-            )
+            .xrpc_procedure::<_, CommitGroupChangeResp>(mls_chat::commit_group_change::NSID, &req)
             .await
         {
             Ok(resp) if resp.success => {
@@ -898,9 +897,7 @@ impl ChatService {
                     .mls
                     .with_commit_context(|ctx| ctx.confirm_commit(handle.clone(), server_epoch))
                 {
-                    warn!(
-                        "remove_member: confirm_commit failed for {convo_id}: {e} — discarding"
-                    );
+                    warn!("remove_member: confirm_commit failed for {convo_id}: {e} — discarding");
                     let _ = self
                         .mls
                         .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
@@ -950,8 +947,7 @@ impl ChatService {
     ) -> Result<Vec<KeyPackageRefResp>> {
         // xrpc_query takes `&[(&str, &str)]`; `dids` is a repeated query
         // parameter per AT Protocol convention.
-        let params: Vec<(&str, &str)> =
-            dids.iter().map(|d| ("dids", d.as_str())).collect();
+        let params: Vec<(&str, &str)> = dids.iter().map(|d| ("dids", d.as_str())).collect();
         let resp: GetKeyPackagesResp = self
             .xrpc_query(mls_chat::get_key_packages::NSID, &params)
             .await?;
@@ -1085,9 +1081,12 @@ impl ChatService {
         let req: mls_chat::publish_key_packages::Input =
             mls_chat::publish_key_packages::InputData {
                 action: "publish".to_string(),
+                convo_id: None,
                 device_id: None,
                 key_packages: Some(key_packages),
                 local_hashes: None,
+                reason: None,
+                target_dids: None,
             }
             .into();
 
@@ -1269,11 +1268,7 @@ impl ChatService {
     ///
     /// - OAuth: routes through nest (confidential client proxy)
     /// - AppPassword: routes directly to mls-ds for `blue.catbird.mlsChat.*` endpoints
-    pub(crate) fn build_request(
-        &self,
-        nsid: &str,
-        bearer: &str,
-    ) -> Result<(String, HeaderMap)> {
+    pub(crate) fn build_request(&self, nsid: &str, bearer: &str) -> Result<(String, HeaderMap)> {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,

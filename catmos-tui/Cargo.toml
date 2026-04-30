@@ -3,6 +3,19 @@ name = "catmos-tui"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# Opt-in inline image rendering for conversation avatars. When enabled,
+# the TUI auto-detects kitty / xterm-sixel terminals via the standard
+# environment variables and emits inline-image escape sequences for the
+# decrypted avatar bytes. Off by default — adds no extra dependencies
+# at the moment (the protocol detection + serialization is implemented
+# directly), but reserves the feature flag for a future heavier crate
+# (`viuer`, `sixel-rs`, etc.) without forcing a behavior change on
+# existing builds. Avatar bytes are persisted to local storage
+# regardless of this flag — only the rendering path is gated.
+terminal-images = []
+
 [dependencies]
 catmos-core = { workspace = true }
 ratatui = "0.29"
@@ -12,3 +25,4 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 chrono = "0.4"
 serde_json = { workspace = true }
+base64 = "0.22"

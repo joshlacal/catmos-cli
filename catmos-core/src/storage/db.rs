@@ -133,6 +133,13 @@ impl Database {
         // probe `pragma_table_info` for the column name and only add it if
         // missing. Any other error is fatal (a real schema problem). This
         // keeps `migrate()` idempotent across restarts.
+        //
+        // The metadata columns (metadata_version, metadata_blob_locator,
+        // avatar_*) hold encrypted-blob bookkeeping. After the MLS metadata
+        // cutover the server stops returning plaintext titles/descriptions
+        // entirely; these columns are populated via `bootstrap_group_metadata`
+        // (catmos-core/src/chat/metadata.rs) after a Welcome / external-commit
+        // join / metadata-update commit merge.
         let recovery_columns: &[(&str, &str)] = &[
             ("needs_rejoin", "INTEGER NOT NULL DEFAULT 0"),
             ("reset_new_group_id", "TEXT NULL"),
@@ -141,6 +148,11 @@ impl Database {
             ("recovery_attempt_count", "INTEGER NOT NULL DEFAULT 0"),
             ("last_rejoin_attempt_ms", "INTEGER NULL"),
             ("unrecoverable_local", "INTEGER NOT NULL DEFAULT 0"),
+            ("metadata_version", "INTEGER NULL"),
+            ("metadata_blob_locator", "TEXT NULL"),
+            ("avatar_blob_locator", "TEXT NULL"),
+            ("avatar_bytes", "BLOB NULL"),
+            ("avatar_content_type", "TEXT NULL"),
         ];
         for (col, decl) in recovery_columns {
             let existing: Option<(String,)> = sqlx::query_as(
@@ -149,16 +161,15 @@ impl Database {
             .bind(col)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| {
-                CatmosError::Storage(format!("Probe column '{col}' failed: {e}"))
-            })?;
+            .map_err(|e| CatmosError::Storage(format!("Probe column '{col}' failed: {e}")))?;
             if existing.is_some() {
                 continue;
             }
             let stmt = format!("ALTER TABLE conversations ADD COLUMN {col} {decl}");
-            sqlx::query(&stmt).execute(&self.pool).await.map_err(|e| {
-                CatmosError::Storage(format!("Add column '{col}' failed: {e}"))
-            })?;
+            sqlx::query(&stmt)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| CatmosError::Storage(format!("Add column '{col}' failed: {e}")))?;
         }
 
         Ok(())
@@ -187,10 +198,44 @@ impl Database {
     // ── Conversations ────────────────────────────────────────────────────
 
     pub async fn store_conversation(&self, convo: &Conversation) -> Result<()> {
+        // Hydration-order safety (post-MLS-metadata-cutover):
+        // After the cutover the server returns no plaintext title/description,
+        // so `convo_resp_to_conversation` produces `name = None` /
+        // `description = None` from `getConvos` responses. A naive
+        // `INSERT OR REPLACE` would clobber any locally-decrypted metadata
+        // each time we refresh. We use `INSERT ... ON CONFLICT ... DO UPDATE`
+        // with `COALESCE(excluded.col, conversations.col)` for every field
+        // populated by the encrypted-bootstrap path (name, description,
+        // metadata_version, metadata_blob_locator, avatar_*) so that
+        // server-driven refreshes never overwrite local-only state with NULL.
+        //
+        // Server-authoritative columns (group_id, creator, epoch, members
+        // table, etc.) still take the new value unconditionally — those move
+        // forward on every refresh and must reflect the server's view.
         sqlx::query(
-            "INSERT OR REPLACE INTO conversations
-             (conversation_id, group_id, name, description, creator, epoch, cipher_suite, created_at, last_message_at, unread_count, alias)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO conversations
+             (conversation_id, group_id, name, description, creator, epoch,
+              cipher_suite, created_at, last_message_at, unread_count, alias,
+              metadata_version, metadata_blob_locator,
+              avatar_blob_locator, avatar_bytes, avatar_content_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     ?12, ?13, ?14, ?15, ?16)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 group_id        = excluded.group_id,
+                 name            = COALESCE(excluded.name,            conversations.name),
+                 description     = COALESCE(excluded.description,     conversations.description),
+                 creator         = excluded.creator,
+                 epoch           = excluded.epoch,
+                 cipher_suite    = excluded.cipher_suite,
+                 created_at      = excluded.created_at,
+                 last_message_at = excluded.last_message_at,
+                 unread_count    = excluded.unread_count,
+                 alias           = COALESCE(excluded.alias,           conversations.alias),
+                 metadata_version       = COALESCE(excluded.metadata_version,       conversations.metadata_version),
+                 metadata_blob_locator  = COALESCE(excluded.metadata_blob_locator,  conversations.metadata_blob_locator),
+                 avatar_blob_locator    = COALESCE(excluded.avatar_blob_locator,    conversations.avatar_blob_locator),
+                 avatar_bytes           = COALESCE(excluded.avatar_bytes,           conversations.avatar_bytes),
+                 avatar_content_type    = COALESCE(excluded.avatar_content_type,    conversations.avatar_content_type)",
         )
         .bind(&convo.conversation_id)
         .bind(&convo.group_id)
@@ -203,6 +248,11 @@ impl Database {
         .bind(convo.last_message_at.map(|t| t.to_rfc3339()))
         .bind(convo.unread_count as i32)
         .bind(&convo.alias)
+        .bind(convo.metadata_version)
+        .bind(&convo.metadata_blob_locator)
+        .bind(&convo.avatar_blob_locator)
+        .bind(convo.avatar_bytes.as_deref())
+        .bind(&convo.avatar_content_type)
         .execute(&self.pool)
         .await?;
 
@@ -231,7 +281,9 @@ impl Database {
     pub async fn list_conversations(&self) -> Result<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT conversation_id, group_id, name, description, creator, epoch, cipher_suite,
-                    created_at, last_message_at, unread_count, alias
+                    created_at, last_message_at, unread_count, alias,
+                    metadata_version, metadata_blob_locator,
+                    avatar_blob_locator, avatar_bytes, avatar_content_type
              FROM conversations ORDER BY last_message_at DESC NULLS LAST",
         )
         .fetch_all(&self.pool)
@@ -261,11 +313,56 @@ impl Database {
                     }),
                     unread_count: row.get::<i32, _>("unread_count") as u32,
                     alias: row.get("alias"),
+                    metadata_version: row.get("metadata_version"),
+                    metadata_blob_locator: row.get("metadata_blob_locator"),
+                    avatar_blob_locator: row.get("avatar_blob_locator"),
+                    avatar_bytes: row.get("avatar_bytes"),
+                    avatar_content_type: row.get("avatar_content_type"),
                 }
             })
             .collect();
 
         Ok(convos)
+    }
+
+    /// Persist decrypted group metadata for a conversation. Called from
+    /// `bootstrap_group_metadata` after a successful Welcome / external-commit
+    /// join / metadata-update commit merge. NULLs the avatar columns when the
+    /// caller supplies `avatar_bytes = None` so an avatar removal is reflected.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_decrypted_metadata(
+        &self,
+        convo_id: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        metadata_version: Option<i64>,
+        metadata_blob_locator: Option<&str>,
+        avatar_blob_locator: Option<&str>,
+        avatar_bytes: Option<&[u8]>,
+        avatar_content_type: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE conversations SET
+                 name                  = ?1,
+                 description           = ?2,
+                 metadata_version      = ?3,
+                 metadata_blob_locator = ?4,
+                 avatar_blob_locator   = ?5,
+                 avatar_bytes          = ?6,
+                 avatar_content_type   = ?7
+             WHERE conversation_id = ?8",
+        )
+        .bind(title)
+        .bind(description)
+        .bind(metadata_version)
+        .bind(metadata_blob_locator)
+        .bind(avatar_blob_locator)
+        .bind(avatar_bytes)
+        .bind(avatar_content_type)
+        .bind(convo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     // ── Messages ─────────────────────────────────────────────────────────
@@ -327,12 +424,11 @@ impl Database {
     /// Get the highest seq number stored locally for a conversation.
     /// Used to request only newer messages from the server via `sinceSeq`.
     pub async fn get_max_seq(&self, convo_id: &str) -> Result<Option<i64>> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT MAX(seq) FROM messages WHERE convo_id = ?1 AND seq > 0",
-        )
-        .bind(convo_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT MAX(seq) FROM messages WHERE convo_id = ?1 AND seq > 0")
+                .bind(convo_id)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|(seq,)| seq))
     }
 
@@ -386,12 +482,10 @@ impl Database {
     /// Mark a conversation as needing a deferred External Commit rejoin
     /// (§8.2). Idempotent.
     pub async fn mark_needs_rejoin(&self, convo_id: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE conversations SET needs_rejoin = 1 WHERE conversation_id = ?1",
-        )
-        .bind(convo_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE conversations SET needs_rejoin = 1 WHERE conversation_id = ?1")
+            .bind(convo_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -447,12 +541,10 @@ impl Database {
     /// Clear the `UNRECOVERABLE_LOCAL` flag (e.g. after server reset
     /// `GroupResetEvent` rescues us).
     pub async fn clear_unrecoverable_local(&self, convo_id: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE conversations SET unrecoverable_local = 0 WHERE conversation_id = ?1",
-        )
-        .bind(convo_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE conversations SET unrecoverable_local = 0 WHERE conversation_id = ?1")
+            .bind(convo_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -553,6 +645,11 @@ mod reset_pending_tests {
             last_message_at: None,
             unread_count: 0,
             alias: None,
+            metadata_version: None,
+            metadata_blob_locator: None,
+            avatar_blob_locator: None,
+            avatar_bytes: None,
+            avatar_content_type: None,
         }
     }
 
@@ -568,8 +665,8 @@ mod reset_pending_tests {
 
     #[tokio::test]
     async fn clear_reset_pending_swaps_group_id() {
-        let path = std::env::temp_dir()
-            .join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open_unencrypted(&path).await.unwrap();
 
         let convo_id = "convo-1";
@@ -611,8 +708,8 @@ mod reset_pending_tests {
     /// underlying DB invariant that makes that policy safe.
     #[tokio::test]
     async fn mark_reset_pending_is_idempotent_at_same_generation() {
-        let path = std::env::temp_dir()
-            .join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open_unencrypted(&path).await.unwrap();
 
         let convo_id = "convo-dual-emit";
@@ -662,8 +759,8 @@ mod reset_pending_tests {
     /// would chase the wrong group id.
     #[tokio::test]
     async fn mark_reset_pending_higher_generation_supersedes() {
-        let path = std::env::temp_dir()
-            .join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open_unencrypted(&path).await.unwrap();
 
         let convo_id = "convo-supersede";
@@ -698,8 +795,8 @@ mod reset_pending_tests {
     ///   would keep retrying a convo we just declared dead)
     #[tokio::test]
     async fn mark_unrecoverable_local_sets_flag_and_clears_needs_rejoin() {
-        let path = std::env::temp_dir()
-            .join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open_unencrypted(&path).await.unwrap();
 
         let convo_id = "convo-exhausted";
@@ -709,7 +806,10 @@ mod reset_pending_tests {
         db.mark_needs_rejoin(convo_id).await.unwrap();
 
         let pre = db.get_recovery_flags(convo_id).await.unwrap();
-        assert!(pre.needs_rejoin, "needs_rejoin must be set before exhaustion");
+        assert!(
+            pre.needs_rejoin,
+            "needs_rejoin must be set before exhaustion"
+        );
         assert!(!pre.unrecoverable_local);
 
         db.mark_unrecoverable_local(convo_id).await.unwrap();
@@ -723,6 +823,161 @@ mod reset_pending_tests {
             !post.needs_rejoin,
             "mark_unrecoverable_local must clear needs_rejoin so deferred recovery stops"
         );
+    }
+
+    /// Hydration-order safety for the MLS metadata cutover: after the
+    /// server stops returning plaintext titles, every refresh
+    /// (`fetch_conversations` → `convo_resp_to_conversation`) hands the
+    /// DB layer a `Conversation` with `name: None` / `description: None`.
+    /// The COALESCE upsert on `store_conversation` MUST preserve the
+    /// locally-decrypted fields written by `update_decrypted_metadata`.
+    /// Without this guarantee group titles vanish on every refresh —
+    /// silent regression that would only show up when a user logs in,
+    /// opens the TUI, and sees blanks where their group titles used to be.
+    #[tokio::test]
+    async fn store_conversation_preserves_decrypted_metadata_across_refresh() {
+        let path =
+            std::env::temp_dir().join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_unencrypted(&path).await.unwrap();
+
+        let convo_id = "convo-coalesce";
+        let group_id = "group-coalesce";
+
+        // 1. Initial insert from a server refresh — name/description are
+        //    None because the API no longer carries plaintext metadata.
+        db.store_conversation(&fixture_convo(convo_id, group_id))
+            .await
+            .unwrap();
+
+        // 2. Encrypted-bootstrap pipeline writes the decrypted metadata.
+        db.update_decrypted_metadata(
+            convo_id,
+            Some("Saved Title"),
+            Some("Saved Description"),
+            Some(7),
+            Some("locator-uuid-7"),
+            Some("avatar-uuid-7"),
+            Some(&[1u8, 2, 3]),
+            Some("image/png"),
+        )
+        .await
+        .unwrap();
+
+        let after_bootstrap = db.list_conversations().await.unwrap();
+        let row = after_bootstrap
+            .iter()
+            .find(|c| c.conversation_id == convo_id)
+            .expect("convo present after bootstrap");
+        assert_eq!(row.name.as_deref(), Some("Saved Title"));
+        assert_eq!(row.description.as_deref(), Some("Saved Description"));
+        assert_eq!(row.metadata_version, Some(7));
+        assert_eq!(row.metadata_blob_locator.as_deref(), Some("locator-uuid-7"));
+        assert_eq!(row.avatar_blob_locator.as_deref(), Some("avatar-uuid-7"));
+        assert_eq!(row.avatar_bytes.as_deref(), Some(&[1u8, 2, 3][..]));
+        assert_eq!(row.avatar_content_type.as_deref(), Some("image/png"));
+
+        // 3. The exact thing fetch_conversations does on the next refresh:
+        //    overwrite the row with a server-derived `Conversation` whose
+        //    name/description/metadata_* are all None.
+        db.store_conversation(&fixture_convo(convo_id, group_id))
+            .await
+            .unwrap();
+
+        let after_refresh = db.list_conversations().await.unwrap();
+        let row = after_refresh
+            .iter()
+            .find(|c| c.conversation_id == convo_id)
+            .expect("convo present after refresh");
+        assert_eq!(
+            row.name.as_deref(),
+            Some("Saved Title"),
+            "name must survive a NULL refresh via COALESCE"
+        );
+        assert_eq!(
+            row.description.as_deref(),
+            Some("Saved Description"),
+            "description must survive a NULL refresh via COALESCE"
+        );
+        assert_eq!(
+            row.metadata_version,
+            Some(7),
+            "metadata_version must survive a NULL refresh via COALESCE"
+        );
+        assert_eq!(
+            row.metadata_blob_locator.as_deref(),
+            Some("locator-uuid-7"),
+            "metadata_blob_locator must survive a NULL refresh via COALESCE"
+        );
+        assert_eq!(
+            row.avatar_blob_locator.as_deref(),
+            Some("avatar-uuid-7"),
+            "avatar_blob_locator must survive a NULL refresh via COALESCE"
+        );
+        assert_eq!(
+            row.avatar_bytes.as_deref(),
+            Some(&[1u8, 2, 3][..]),
+            "avatar_bytes must survive a NULL refresh via COALESCE"
+        );
+        assert_eq!(
+            row.avatar_content_type.as_deref(),
+            Some("image/png"),
+            "avatar_content_type must survive a NULL refresh via COALESCE"
+        );
+    }
+
+    /// Sanity check the inverse: when `update_decrypted_metadata` is
+    /// called with explicit `None` for the avatar columns, the row should
+    /// reflect the deletion. This is the "user removed the avatar" path —
+    /// COALESCE only protects against NULLs from the *refresh* path, not
+    /// against an authoritative bootstrap that says "the avatar is gone".
+    #[tokio::test]
+    async fn update_decrypted_metadata_can_clear_avatar() {
+        let path =
+            std::env::temp_dir().join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_unencrypted(&path).await.unwrap();
+
+        let convo_id = "convo-avatar-clear";
+        db.store_conversation(&fixture_convo(convo_id, "g"))
+            .await
+            .unwrap();
+        db.update_decrypted_metadata(
+            convo_id,
+            Some("T"),
+            None,
+            Some(1),
+            Some("loc"),
+            Some("avatar-loc"),
+            Some(&[9u8]),
+            Some("image/png"),
+        )
+        .await
+        .unwrap();
+
+        // Now publish v=2 with no avatar.
+        db.update_decrypted_metadata(
+            convo_id,
+            Some("T"),
+            None,
+            Some(2),
+            Some("loc-2"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let row = db
+            .list_conversations()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.conversation_id == convo_id)
+            .unwrap();
+        assert_eq!(row.metadata_version, Some(2));
+        assert_eq!(row.avatar_blob_locator, None);
+        assert_eq!(row.avatar_bytes, None);
+        assert_eq!(row.avatar_content_type, None);
     }
 }
 
