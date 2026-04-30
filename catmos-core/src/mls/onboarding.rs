@@ -598,41 +598,10 @@ impl MlsManager {
         Ok(())
     }
 
-    /// Decrypt group metadata from MLS group context extensions.
-    ///
-    /// Returns `Ok(None)` if the group has no metadata set or if the group is
-    /// not found in local MLS state.
-    pub fn decrypt_group_metadata(&self, group_id: &[u8]) -> Result<Option<GroupMetadata>> {
-        if group_id.is_empty() {
-            return Ok(None);
-        }
-
-        let metadata_bytes = self.with_context(|ctx| ctx.get_group_metadata(group_id.to_vec()))?;
-
-        if metadata_bytes.is_empty() {
-            return Ok(None);
-        }
-
-        // Parse as {"v":1,"name":"...","description":"..."}
-        #[derive(Deserialize)]
-        struct MetadataJson {
-            #[serde(default)]
-            name: Option<String>,
-            #[serde(default)]
-            description: Option<String>,
-        }
-
-        match serde_json::from_slice::<MetadataJson>(&metadata_bytes) {
-            Ok(meta) => Ok(Some(GroupMetadata {
-                name: meta.name,
-                description: meta.description,
-            })),
-            Err(e) => {
-                warn!("Failed to parse group metadata JSON: {e}");
-                Ok(None)
-            }
-        }
-    }
+    // `decrypt_group_metadata` (legacy 0xff00 plaintext reader) removed in
+    // Phase F. Encrypted metadata is fetched via
+    // `chat/metadata.rs::bootstrap_group_metadata` which decodes the
+    // ciphertext blob from the DS using the per-epoch exporter-derived key.
 
     /// Main entry point: ensure this device is registered and has joined all
     /// available conversations.
@@ -708,36 +677,12 @@ impl MlsManager {
     }
 }
 
+// `apply_group_metadata` (legacy 0xff00 fallback for fetch_conversations)
+// removed in Phase F. The encrypted bootstrap path
+// (chat/metadata.rs::bootstrap_group_metadata) handles all post-cutover
+// metadata population.
+
 impl ChatService {
-    /// After fetching conversations, try to decrypt MLS group metadata
-    /// for each conversation to populate names/descriptions.
-    pub fn apply_group_metadata(&self, convos: &mut [crate::types::Conversation]) {
-        for convo in convos.iter_mut() {
-            let group_id_bytes = match hex::decode(&convo.group_id) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-
-            match self.mls.decrypt_group_metadata(&group_id_bytes) {
-                Ok(Some(meta)) => {
-                    if convo.name.is_none() {
-                        convo.name = meta.name;
-                    }
-                    if convo.description.is_none() {
-                        convo.description = meta.description;
-                    }
-                }
-                Ok(None) => {} // no metadata
-                Err(e) => {
-                    debug!(
-                        "Could not decrypt metadata for {}: {e}",
-                        &convo.group_id[..12.min(convo.group_id.len())]
-                    );
-                }
-            }
-        }
-    }
-
     /// Attempt to join conversations that this device doesn't have local
     /// MLS state for, via external commit.
     pub async fn join_missing_conversations(&self, did: &str) {

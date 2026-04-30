@@ -11,7 +11,6 @@ use tracing::{debug, info, warn};
 
 use catbird_atproto::blue_catbird::mlsChat::commit_group_change::CommitGroupChange;
 use catbird_atproto::catbird::mls_chat;
-use catbird_mls::group_metadata::GroupMetadata;
 use catbird_mls::orchestrator_bridge::FFICommitKind;
 
 use crate::auth::{AuthMethod, TokenSession};

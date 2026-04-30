@@ -545,10 +545,10 @@ impl ChatService {
             Err(e) => debug!("fetch_conversations: list_conversations(local hydrate) failed: {e}"),
         }
 
-        // Legacy fallback: try the deprecated 0xff00 plaintext extension
-        // for groups created pre-cutover. Returns None for groups born
-        // post-cutover (the only ones the new server emits).
-        self.apply_group_metadata(&mut convos);
+        // Phase F: legacy 0xff00 plaintext fallback removed. Conversation
+        // names / descriptions now come exclusively from the encrypted
+        // bootstrap path (chat/metadata.rs::bootstrap_group_metadata)
+        // which lifts decrypted state into the conversations row.
 
         // ── Resolve all unique user DIDs to handles ──────────────────────
         let my_did = self.did().to_string();
