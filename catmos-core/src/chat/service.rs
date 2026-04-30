@@ -666,34 +666,58 @@ impl ChatService {
         name: Option<&str>,
         description: Option<&str>,
     ) -> Result<()> {
-        // 1. Build the GroupMetadata JSON blob that MLS will embed in the
-        //    group-context extension (matches iOS `GroupMetadataPayload`).
-        let metadata =
-            GroupMetadata::new(name.map(str::to_string), description.map(str::to_string));
-        let metadata_json = metadata
-            .to_extension_bytes()
-            .map_err(|e| CatmosError::Other(format!("Failed to encode GroupMetadata: {e}")))?;
-
-        // 2. Stage the updateMetadata commit locally (not yet merged, not yet
-        //    sent to the DS).
-        let did = self.did().to_string();
-        let plan = self.mls.with_commit_context(|ctx| {
-            ctx.stage_commit(
-                convo_id.to_string(),
-                FFICommitKind::UpdateMetadata {
-                    group_info_extension: metadata_json,
-                },
-                did.as_bytes().to_vec(),
+        // Phase A.2 encrypted-only path. The previous plaintext-0xff00 +
+        // FFICommitKind::UpdateMetadata route is retired; the MLS group
+        // context only carries an encrypted MetadataReference (see
+        // catbird-mls/src/metadata.rs), and the title/description/avatar
+        // live in a ChaCha20-Poly1305 blob the DS holds opaquely.
+        //
+        // 1. Stage commit + derive post-commit metadata key + encrypt
+        //    `GroupMetadataV1` payload + assemble artifacts in one FFI call.
+        let group_id_bytes = hex::decode(convo_id)
+            .map_err(|_| CatmosError::Other(format!("Invalid hex group ID: {convo_id}")))?;
+        let result = self.mls.with_context(|ctx| {
+            ctx.update_group_metadata_encrypted(
+                group_id_bytes.clone(),
+                name.map(str::to_string),
+                description.map(str::to_string),
+                None, // avatar_blob_locator (separate flow when wired)
+                None, // avatar_content_type
             )
         })?;
 
-        // 3. POST commitGroupChange carrying the raw commit bytes. welcome /
-        //    memberDids MUST be None for updateMetadata (server-side
-        //    enforce_non_add_action_contract gate).
+        // Track our own commit BEFORE shipping it so the incoming sync/WS
+        // path doesn't reprocess (spec §5.4 — own-commit dedup).
+        self.track_own_commit(&result.commit_bytes).await;
+
+        // 2. Upload the encrypted blob FIRST. If the upload fails we must
+        //    clear the local pending commit so the local epoch doesn't
+        //    advance past a state other clients can't reach (no blob → no
+        //    decryptable metadata).
+        if let Err(e) = self
+            .put_group_metadata_blob(
+                &result.metadata_blob_locator,
+                Some(convo_id),
+                convo_id,
+                Some("metadata"),
+                Some(result.metadata_version as i64),
+                None,
+                result.metadata_blob_ciphertext.clone(),
+            )
+            .await
+        {
+            let _ = self
+                .mls
+                .with_context(|ctx| ctx.clear_pending_commit(group_id_bytes.clone()));
+            return Err(e);
+        }
+
+        // 3. POST commitGroupChange. Server enforces non-add-action contract:
+        //    welcome / memberDids must be None for updateMetadata.
         let req = build_commit_group_change(
             convo_id,
             "updateMetadata",
-            Some(plan.commit_bytes.clone()),
+            Some(result.commit_bytes.clone()),
             None,
             None,
             None,
@@ -701,53 +725,41 @@ impl ChatService {
             Some(ulid::Ulid::new().to_string()),
         );
 
-        // Track our own commit so the incoming sync/WS path doesn't
-        // redundantly process it (spec §5.4 — own-commit dedup).
-        self.track_own_commit(&plan.commit_bytes).await;
-
-        let handle = plan.handle.clone();
         match self
             .xrpc_procedure::<_, CommitGroupChangeResp>(mls_chat::commit_group_change::NSID, &req)
             .await
         {
             Ok(resp) if resp.success => {
-                // commitGroupChange does not reliably echo newEpoch for the
-                // `updateMetadata` path — fence with the skip sentinel and
-                // trust the staged target epoch (mirrors iOS).
-                let server_epoch = catbird_mls::mls_skip_server_epoch_fence();
+                // 4. Merge locally — advances epoch, applies the new
+                //    MetadataReference in AppDataDictionary 0x8001.
                 if let Err(e) = self
                     .mls
-                    .with_commit_context(|ctx| ctx.confirm_commit(handle.clone(), server_epoch))
+                    .with_context(|ctx| ctx.merge_pending_commit(group_id_bytes.clone()))
                 {
                     warn!(
-                        "update_conversation: confirm_commit failed for {convo_id}: {e} — \
-                         discarding staged commit to avoid leaking pending state"
+                        "update_conversation: merge_pending_commit failed for {convo_id}: {e}"
                     );
-                    // TODO(#63): if `e` is an unflattened EpochMismatch, we
-                    // could surface { local, remote } to the caller.
-                    let _ = self
-                        .mls
-                        .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
                     return Err(e);
                 }
-                info!("Updated metadata for conversation {convo_id}");
+                info!(
+                    "Updated metadata for conversation {convo_id} \
+                     (encrypted, version={}, locator={})",
+                    result.metadata_version, result.metadata_blob_locator
+                );
                 Ok(())
             }
             Ok(_) => {
-                // Server returned 200 but success=false — treat as failure.
                 let _ = self
                     .mls
-                    .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
+                    .with_context(|ctx| ctx.clear_pending_commit(group_id_bytes.clone()));
                 Err(CatmosError::Xrpc(format!(
                     "commitGroupChange[updateMetadata] returned success=false for {convo_id}"
                 )))
             }
             Err(e) => {
-                // Server rejected the commit — discard the staged handle so
-                // OpenMLS's one-pending-commit invariant is restored.
                 let _ = self
                     .mls
-                    .with_commit_context(|ctx| ctx.discard_pending(handle.clone()));
+                    .with_context(|ctx| ctx.clear_pending_commit(group_id_bytes));
                 Err(e)
             }
         }
