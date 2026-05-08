@@ -16,11 +16,34 @@ use catbird_mls::orchestrator_bridge::FFICommitKind;
 use crate::auth::{AuthMethod, TokenSession};
 use crate::error::{CatmosError, Result};
 use crate::mls::MlsManager;
-use crate::recovery::{GroupInfo404Tracker, RecoveryTracker};
+use crate::recovery::{
+    GroupInfo404Tracker, QuarantineExitReason, QuarantineReason, RecoveryTracker,
+};
 use crate::storage::aliases::AliasStore;
 use crate::storage::config::Config;
 use crate::storage::db::Database;
 use crate::types::{BlobUsage, Conversation, Device, KeyPackageStatus};
+
+/// Layer 3 quarantine event published on the broadcast channel held by
+/// `ChatService::quarantine_events`. The TUI subscribes and translates these
+/// into `AppEvent::Quarantined` / `AppEvent::QuarantineCleared`. Mirrors the
+/// `OrchestratorEventCallback::on_conversation_quarantined` /
+/// `_quarantine_cleared` pair from `catbird-mls/src/orchestrator_bridge.rs`
+/// (f363fd1) — catmos-cli doesn't consume the orchestrator bridge, so we
+/// publish at the platform layer instead.
+#[derive(Debug, Clone)]
+pub enum QuarantineEvent {
+    Entered {
+        convo_id: String,
+        reason: QuarantineReason,
+        suspected_dids: Vec<String>,
+        since_ms: i64,
+    },
+    Cleared {
+        convo_id: String,
+        via: QuarantineExitReason,
+    },
+}
 
 // ── Thin response wrappers for endpoints not covered in messages.rs ─────
 //
@@ -239,6 +262,12 @@ pub struct ChatService {
     /// Own-commit SHA256 dedup: hash → timestamp. Prevents processing our own commits
     /// as incoming messages (spec §5.4). Entries expire after 5 minutes.
     pub(crate) own_commits: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
+    /// Broadcast channel for Layer 3 quarantine state changes. The TUI
+    /// subscribes via `subscribe_quarantine_events`; off-the-record
+    /// listeners (tests, future telemetry) can also subscribe. Capacity 32
+    /// keeps slow consumers from blocking the sender; a missed event just
+    /// means the next `get_recovery_flags` read will reconcile state.
+    pub(crate) quarantine_events: tokio::sync::broadcast::Sender<QuarantineEvent>,
 }
 
 impl ChatService {
@@ -265,7 +294,17 @@ impl ChatService {
             decrypt_fail_counts: Arc::new(Mutex::new(HashMap::new())),
             epoch_divergence_counts: Arc::new(Mutex::new(HashMap::new())),
             own_commits: Arc::new(Mutex::new(HashMap::new())),
+            quarantine_events: tokio::sync::broadcast::channel(32).0,
         }
+    }
+
+    /// Subscribe to Layer 3 quarantine state changes (TUI banner / status
+    /// line, tests). Receivers fall behind safely — bursts of >32 events
+    /// drop oldest first.
+    pub fn subscribe_quarantine_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<QuarantineEvent> {
+        self.quarantine_events.subscribe()
     }
 
     /// The authenticated user's DID.
@@ -557,6 +596,18 @@ impl ChatService {
 
         const NSID: &str = "blue.catbird.mlsChat.bootstrapResetGroup";
 
+        // TODO(workspace task #20): catbird-atproto regen pending. The lexicon
+        // gained `metadataBlobLocator` + `metadataVersion` (Phase B encrypted
+        // metadata cutover, see commit 5dd85dc) but the generated
+        // `BootstrapResetGroup<'a>` struct in
+        // `catbird-atproto/src/generated/blue_catbird/mlsChat/bootstrap_reset_group.rs`
+        // does NOT have those fields yet. The two metadata fields are
+        // diagnostic only — joining members fetch via `getGroupMetadataBlob`
+        // regardless, per the existing comment above. Drop the forward-
+        // referenced field assignments so the workspace builds; restore
+        // when regen lands. `extra_data` is still injected by the
+        // `#[jacquard_derive::lexicon]` proc-macro, so we keep that one.
+        let _ = (metadata_blob_locator, metadata_version);
         let req = BootstrapResetGroup {
             original_convo_id: original_convo_id.to_string().into(),
             new_group_id: new_group_id_hex.to_string().into(),
@@ -569,8 +620,6 @@ impl ChatService {
             current_epoch: None,
             key_package_hashes: None,
             welcome_message: None,
-            metadata_blob_locator: metadata_blob_locator.map(|s| s.to_string().into()),
-            metadata_version,
             extra_data: Default::default(),
         };
 

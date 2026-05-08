@@ -26,11 +26,15 @@ use tracing::{debug, error, info, warn};
 use super::service::ChatService;
 use crate::error::{CatmosError, Result};
 use crate::mls::MlsManager;
-use crate::recovery::{constants, RecoveryState, ResetPendingPayload};
+use crate::recovery::{
+    constants, QuarantineDecision, QuarantineExitReason, QuarantineReason, RecoveryState,
+    ResetPendingPayload,
+};
 
 /// `failureType` strings the server understands (§8.6).
 const FAILURE_EXTERNAL_COMMIT_EXHAUSTED: &str = "external_commit_exhausted";
 const FAILURE_REMOTE_DATA_ERROR: &str = "remote_data_error";
+const FAILURE_USER_INITIATED_QUARANTINE: &str = "user_initiated_quarantine";
 
 /// Classify an error string as a §9.2 remote data error (malformed
 /// server-side data — must NOT wipe local state, MUST mark
@@ -119,6 +123,183 @@ struct ReportRecoveryFailureReq<'a> {
 }
 
 impl ChatService {
+    // ── Layer 3 quarantine ─────────────────────────────────────────────
+
+    /// True when the conversation is quarantined in memory or in persisted
+    /// flags. The persisted read keeps send/rejoin gates effective after a
+    /// process restart before any new bad commit rehydrates the tracker.
+    pub(crate) async fn is_quarantined(&self, convo_id: &str) -> bool {
+        if self.recovery_tracker.lock().await.is_quarantined(convo_id) {
+            return true;
+        }
+        self.db
+            .get_recovery_flags(convo_id)
+            .await
+            .ok()
+            .and_then(|flags| flags.quarantine)
+            .is_some()
+    }
+
+    /// Classify a commit-processing error as peer-bad (Layer 3 Signal A/B).
+    /// If local state is behind the message context, treat it as catch-up
+    /// instead of peer poisoning.
+    pub(crate) fn classify_peer_bad_error(
+        err: &CatmosError,
+        local_epoch: Option<u64>,
+        message_epoch: u64,
+    ) -> bool {
+        if let Some(local) = local_epoch {
+            if local < message_epoch {
+                return false;
+            }
+        }
+        let CatmosError::Mls(mls_err) = err else {
+            return false;
+        };
+        if mls_err.is_wrong_epoch() {
+            return false;
+        }
+        match mls_err {
+            catbird_mls::MLSError::InvalidCommit
+            | catbird_mls::MLSError::WireFormatPolicyViolation { .. }
+            | catbird_mls::MLSError::InvalidProposalRef
+            | catbird_mls::MLSError::TlsCodec(_) => true,
+            catbird_mls::MLSError::CommitProcessingFailed { message }
+            | catbird_mls::MLSError::OpenMLS(message) => {
+                let m = message.to_lowercase();
+                m.contains("leafnodevalidation")
+                    || m.contains("invalidgroupinfo")
+                    || m.contains("authenticationfailed")
+                    || m.contains("invalidcredential")
+                    || m.contains("proposalvalidationerror")
+            }
+            _ => false,
+        }
+    }
+
+    /// Record a peer-bad commit observation. Returns true when this call put
+    /// the conversation into quarantine.
+    pub(crate) async fn note_peer_bad_commit(
+        &self,
+        convo_id: &str,
+        message_id: &str,
+        sender_did: Option<&str>,
+    ) -> bool {
+        let decision = {
+            let mut tracker = self.recovery_tracker.lock().await;
+            tracker.record_peer_bad_commit(convo_id, sender_did, message_id)
+        };
+        let QuarantineDecision::Quarantine {
+            reason,
+            suspected_dids,
+        } = decision
+        else {
+            return false;
+        };
+        self.enter_quarantine(convo_id, reason, suspected_dids)
+            .await;
+        true
+    }
+
+    pub(crate) async fn enter_quarantine(
+        &self,
+        convo_id: &str,
+        reason: QuarantineReason,
+        suspected_dids: Vec<String>,
+    ) {
+        if self.is_quarantined(convo_id).await {
+            return;
+        }
+        let since_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let mut tracker = self.recovery_tracker.lock().await;
+            tracker.mark_quarantined(convo_id);
+        }
+        self.reset_recovery_counters(convo_id).await;
+        if let Err(e) = self
+            .db
+            .mark_quarantined(convo_id, reason, since_ms, &suspected_dids)
+            .await
+        {
+            warn!(
+                convo = %&convo_id[..12.min(convo_id.len())],
+                error = %e,
+                "Failed to persist quarantine state"
+            );
+        }
+        let _ = self
+            .quarantine_events
+            .send(super::service::QuarantineEvent::Entered {
+                convo_id: convo_id.to_string(),
+                reason,
+                suspected_dids: suspected_dids.clone(),
+                since_ms,
+            });
+        warn!(
+            convo = %&convo_id[..12.min(convo_id.len())],
+            reason = reason.tag(),
+            suspected_count = suspected_dids.len(),
+            "Conversation quarantined; suppressing auto-rejoin"
+        );
+    }
+
+    pub(crate) async fn exit_quarantine(&self, convo_id: &str, via: QuarantineExitReason) {
+        let was_persisted = self
+            .db
+            .get_recovery_flags(convo_id)
+            .await
+            .ok()
+            .and_then(|flags| flags.quarantine)
+            .is_some();
+        let was_quarantined = {
+            let mut tracker = self.recovery_tracker.lock().await;
+            tracker.clear_quarantine(convo_id)
+        };
+        if let Err(e) = self.db.clear_quarantine(convo_id).await {
+            warn!(
+                convo = %&convo_id[..12.min(convo_id.len())],
+                error = %e,
+                "Failed to clear persisted quarantine state"
+            );
+        }
+        if was_quarantined || was_persisted {
+            let _ = self
+                .quarantine_events
+                .send(super::service::QuarantineEvent::Cleared {
+                    convo_id: convo_id.to_string(),
+                    via,
+                });
+            info!(
+                convo = %&convo_id[..12.min(convo_id.len())],
+                via = via.tag(),
+                "Conversation quarantine cleared"
+            );
+        }
+    }
+
+    pub(crate) async fn note_healthy_peer_commit(&self, convo_id: &str) {
+        if self.is_quarantined(convo_id).await {
+            self.exit_quarantine(convo_id, QuarantineExitReason::PeerCommitSucceeded)
+                .await;
+        } else {
+            self.recovery_tracker
+                .lock()
+                .await
+                .record_healthy_peer_commit(convo_id);
+        }
+    }
+
+    /// User-confirmed manual reset for a quarantined conversation. This feeds
+    /// the server reset-vote path, then clears local quarantine so the deferred
+    /// reset ladder can proceed from the next server event.
+    pub async fn user_confirmed_manual_reset(&self, convo_id: &str) -> Result<()> {
+        self.report_recovery_failure(convo_id, FAILURE_USER_INITIATED_QUARANTINE)
+            .await;
+        self.exit_quarantine(convo_id, QuarantineExitReason::UserConfirmedReset)
+            .await;
+        Ok(())
+    }
+
     // ── Threshold counters ─────────────────────────────────────────────
 
     /// Reset both threshold counters (decrypt-failure + epoch-divergence) on a
@@ -132,6 +313,9 @@ impl ChatService {
     /// `NEEDS_REJOIN`. Returns `true` if the threshold was hit (caller can
     /// then bail out of the current decrypt loop).
     pub(crate) async fn note_decrypt_failure(&self, convo_id: &str) -> bool {
+        if self.is_quarantined(convo_id).await {
+            return false;
+        }
         let count = {
             let mut counts = self.decrypt_fail_counts.lock().await;
             let c = counts.entry(convo_id.to_string()).or_insert(0);
@@ -155,6 +339,9 @@ impl ChatService {
     /// hit, in which case `NEEDS_REJOIN` is flagged and the caller should
     /// abort the sync for this conversation.
     pub(crate) async fn note_epoch_divergence(&self, convo_id: &str) -> bool {
+        if self.is_quarantined(convo_id).await {
+            return false;
+        }
         let count = {
             let mut counts = self.epoch_divergence_counts.lock().await;
             let c = counts.entry(convo_id.to_string()).or_insert(0);
@@ -176,6 +363,13 @@ impl ChatService {
     /// Persist the `NEEDS_REJOIN` flag and reset the in-memory threshold
     /// counters. Idempotent.
     pub async fn flag_needs_rejoin(&self, convo_id: &str) {
+        if self.is_quarantined(convo_id).await {
+            debug!(
+                convo = %&convo_id[..12.min(convo_id.len())],
+                "Suppressing NEEDS_REJOIN because conversation is quarantined"
+            );
+            return;
+        }
         if let Err(e) = self.db.mark_needs_rejoin(convo_id).await {
             warn!(
                 convo = %&convo_id[..12.min(convo_id.len())],
@@ -201,6 +395,7 @@ impl ChatService {
         // MLSRecoveryManager classifier.
         let failure_mode: Option<&str> = match failure_type {
             FAILURE_REMOTE_DATA_ERROR => Some("group_state_unrecoverable"),
+            FAILURE_USER_INITIATED_QUARANTINE => Some("group_state_unrecoverable"),
             FAILURE_EXTERNAL_COMMIT_EXHAUSTED => Some("local_state_loss"),
             _ => None,
         };
@@ -261,6 +456,11 @@ impl ChatService {
         // 1. Gate on tracker (max-attempts / per-convo cooldown / global floor)
         {
             let tracker = self.recovery_tracker.lock().await;
+            if tracker.is_quarantined(convo_id) {
+                return Err(CatmosError::Other(format!(
+                    "Rejoin suppressed for {convo_label}: conversation quarantined"
+                )));
+            }
             if tracker.is_maxed_out(convo_id) {
                 drop(tracker);
                 warn!(
@@ -684,6 +884,8 @@ impl ChatService {
         self.recovery_tracker.lock().await.clear_convo(convo_id);
         self.groupinfo_404_tracker.lock().await.clear(convo_id);
         self.reset_recovery_counters(convo_id).await;
+        self.exit_quarantine(convo_id, QuarantineExitReason::ServerReset)
+            .await;
         if let Err(e) = self.db.clear_unrecoverable_local(convo_id).await {
             warn!(
                 convo = %&convo_id[..12.min(convo_id.len())],
@@ -825,6 +1027,8 @@ impl ChatService {
         self.recovery_tracker.lock().await.clear_convo(convo_id);
         self.groupinfo_404_tracker.lock().await.clear(convo_id);
         self.reset_recovery_counters(convo_id).await;
+        self.exit_quarantine(convo_id, QuarantineExitReason::ServerReset)
+            .await;
         if let Err(e) = self.db.clear_unrecoverable_local(convo_id).await {
             warn!(
                 convo = %&convo_id[..12.min(convo_id.len())],
@@ -1192,6 +1396,31 @@ mod bootstrap_classifier_tests {
             !is_bootstrap_already_bootstrapped(&err),
             "non-Xrpc variants must not classify"
         );
+    }
+
+    #[test]
+    fn peer_bad_classifier_accepts_invalid_commit_when_local_is_current() {
+        let err = CatmosError::Mls(catbird_mls::MLSError::InvalidCommit);
+        assert!(ChatService::classify_peer_bad_error(&err, Some(10), 10));
+    }
+
+    #[test]
+    fn peer_bad_classifier_rejects_catchup_and_wrong_epoch() {
+        let invalid_commit = CatmosError::Mls(catbird_mls::MLSError::InvalidCommit);
+        assert!(!ChatService::classify_peer_bad_error(
+            &invalid_commit,
+            Some(9),
+            10
+        ));
+
+        let wrong_epoch = CatmosError::Mls(catbird_mls::MLSError::OpenMLS(
+            "ValidationError(WrongEpoch)".to_string(),
+        ));
+        assert!(!ChatService::classify_peer_bad_error(
+            &wrong_epoch,
+            Some(10),
+            10
+        ));
     }
 
     /// Phase 2.5 indirect case (locked decision §1): server omits

@@ -248,6 +248,17 @@ impl ChatService {
     /// On a 409 epoch conflict, syncs commits to advance the local epoch,
     /// re-encrypts at the new epoch, and retries once.
     pub async fn send_message(&self, convo_id: &str, text: &str) -> Result<Message> {
+        // Layer 3 quarantine gate (catbird-mls f363fd1): if the conversation is
+        // quarantined we refuse to send. No API call, no encrypt, no preSend
+        // sync. The user must `:reset` (TUI) or call
+        // `user_confirmed_manual_reset` to exit quarantine first.
+        if self.is_quarantined(convo_id).await {
+            return Err(CatmosError::Other(format!(
+                "Conversation paused. Type :reset to continue. (convo={})",
+                &convo_id[..12.min(convo_id.len())]
+            )));
+        }
+
         // Build the plaintext payload (matches iOS MLSMessagePayload format)
         let payload = MlsMessagePayload::text(text);
         let plaintext = serde_json::to_vec(&payload)?;
@@ -798,6 +809,7 @@ impl ChatService {
                             Ok(merged_epoch) => {
                                 total_processed += 1;
                                 consecutive_failures = 0;
+                                self.note_healthy_peer_commit(convo_id).await;
                                 debug!(
                                     "sync: staged+merged commit {} epoch={} (local now {merged_epoch})",
                                     entry.id, entry.epoch
@@ -860,6 +872,22 @@ impl ChatService {
                         );
                     }
                     Err(e) => {
+                        let local_epoch = self
+                            .mls
+                            .with_context(|ctx| ctx.get_epoch(gid_bytes.clone()))
+                            .ok();
+                        if Self::classify_peer_bad_error(&e, local_epoch, current_epoch) {
+                            let quarantined =
+                                self.note_peer_bad_commit(convo_id, &entry.id, None).await;
+                            debug!(
+                                "sync: peer-bad commit {} epoch={} classified for quarantine: {e}",
+                                entry.id, entry.epoch
+                            );
+                            if quarantined {
+                                break;
+                            }
+                            continue;
+                        }
                         consecutive_failures += 1;
                         debug!("sync: skip commit {} epoch={}: {e}", entry.id, entry.epoch);
                         // Bail early: if 3+ consecutive commits fail, the rest likely will too

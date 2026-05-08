@@ -17,5 +17,8 @@ pub mod constants;
 pub mod state;
 pub mod tracker;
 
-pub use state::{PersistedRecoveryFlags, RecoveryState, ResetPendingPayload};
-pub use tracker::{GroupInfo404Tracker, RecoveryTracker};
+pub use state::{
+    PersistedRecoveryFlags, QuarantineExitReason, QuarantinePayload, QuarantineReason,
+    RecoveryState, ResetPendingPayload,
+};
+pub use tracker::{GroupInfo404Tracker, QuarantineDecision, RecoveryTracker};

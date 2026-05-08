@@ -5,8 +5,22 @@ use std::path::Path;
 use std::str::FromStr;
 
 use crate::error::{CatmosError, Result};
-use crate::recovery::{PersistedRecoveryFlags, ResetPendingPayload};
+use crate::recovery::{
+    PersistedRecoveryFlags, QuarantinePayload, QuarantineReason, ResetPendingPayload,
+};
 use crate::types::{Conversation, Member, Message, MessageContent};
+
+/// Map a persisted quarantine reason tag back into the enum. Unknown tags
+/// fall back to `RepeatedFramingFailures` — the most generic reason — so a
+/// future server-side or upstream-enum addition can't break rehydration.
+fn quarantine_reason_from_tag(tag: &str) -> QuarantineReason {
+    match tag {
+        "peer_bad_commit" => QuarantineReason::PeerBadCommit,
+        "multi_peer_bad_commits" => QuarantineReason::MultiPeerBadCommits,
+        "repeated_framing_failures" => QuarantineReason::RepeatedFramingFailures,
+        _ => QuarantineReason::RepeatedFramingFailures,
+    }
+}
 
 /// SQLCipher-encrypted database for per-account storage.
 pub struct Database {
@@ -153,6 +167,14 @@ impl Database {
             ("avatar_blob_locator", "TEXT NULL"),
             ("avatar_bytes", "BLOB NULL"),
             ("avatar_content_type", "TEXT NULL"),
+            // ── Layer 3 quarantine (catbird-mls f363fd1) ──
+            // `quarantine_reason_tag` matches `QuarantineReason::tag()` so
+            // we never serialize the enum directly — keeps schema robust
+            // across enum extensions in catbird-mls.
+            ("quarantine_reason_tag", "TEXT NULL"),
+            ("quarantine_since_ms", "INTEGER NULL"),
+            // JSON array of suspected DID strings.
+            ("quarantine_suspected_dids", "TEXT NULL"),
         ];
         for (col, decl) in recovery_columns {
             let existing: Option<(String,)> = sqlx::query_as(
@@ -442,7 +464,9 @@ impl Database {
         let row = sqlx::query(
             "SELECT needs_rejoin, reset_new_group_id, reset_generation,
                     reset_notified_at_ms, recovery_attempt_count,
-                    last_rejoin_attempt_ms, unrecoverable_local
+                    last_rejoin_attempt_ms, unrecoverable_local,
+                    quarantine_reason_tag, quarantine_since_ms,
+                    quarantine_suspected_dids
              FROM conversations WHERE conversation_id = ?1",
         )
         .bind(convo_id)
@@ -460,6 +484,9 @@ impl Database {
         let reset_notified_at_ms: Option<i64> = row.get("reset_notified_at_ms");
         let recovery_attempt_count: i64 = row.get("recovery_attempt_count");
         let last_rejoin_attempt_ms: Option<i64> = row.get("last_rejoin_attempt_ms");
+        let q_tag: Option<String> = row.get("quarantine_reason_tag");
+        let q_since: Option<i64> = row.get("quarantine_since_ms");
+        let q_dids_json: Option<String> = row.get("quarantine_suspected_dids");
 
         let reset = match (reset_new_group_id, reset_generation, reset_notified_at_ms) {
             (Some(gid), Some(gen), Some(ts)) => Some(ResetPendingPayload {
@@ -470,13 +497,72 @@ impl Database {
             _ => None,
         };
 
+        let quarantine = match (q_tag, q_since) {
+            (Some(tag), Some(since_ms)) => {
+                let reason = quarantine_reason_from_tag(&tag);
+                let suspected_dids = q_dids_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                    .unwrap_or_default();
+                Some(QuarantinePayload {
+                    reason,
+                    since_ms,
+                    suspected_dids,
+                })
+            }
+            _ => None,
+        };
+
         Ok(PersistedRecoveryFlags {
             needs_rejoin: needs_rejoin != 0,
             unrecoverable_local: unrecoverable_local != 0,
             reset,
             recovery_attempt_count: recovery_attempt_count.max(0) as u32,
             last_rejoin_attempt_ms,
+            quarantine,
         })
+    }
+
+    /// Persist a quarantine payload (Layer 3, mirrors
+    /// `MLSStorageBackend::mark_quarantined` from catbird-mls f363fd1).
+    pub async fn mark_quarantined(
+        &self,
+        convo_id: &str,
+        reason: QuarantineReason,
+        since_ms: i64,
+        suspected_dids: &[String],
+    ) -> Result<()> {
+        let dids_json = serde_json::to_string(suspected_dids).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query(
+            "UPDATE conversations
+             SET quarantine_reason_tag = ?1,
+                 quarantine_since_ms = ?2,
+                 quarantine_suspected_dids = ?3
+             WHERE conversation_id = ?4",
+        )
+        .bind(reason.tag())
+        .bind(since_ms)
+        .bind(dids_json)
+        .bind(convo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear the persisted quarantine state. Mirrors
+    /// `MLSStorageBackend::clear_quarantine`.
+    pub async fn clear_quarantine(&self, convo_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE conversations
+             SET quarantine_reason_tag = NULL,
+                 quarantine_since_ms = NULL,
+                 quarantine_suspected_dids = NULL
+             WHERE conversation_id = ?1",
+        )
+        .bind(convo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Mark a conversation as needing a deferred External Commit rejoin
@@ -978,6 +1064,64 @@ mod reset_pending_tests {
         assert_eq!(row.avatar_blob_locator, None);
         assert_eq!(row.avatar_bytes, None);
         assert_eq!(row.avatar_content_type, None);
+    }
+
+    /// Layer 3 quarantine persistence: mark → drop the `Database` instance
+    /// → reopen against the same path → `get_recovery_flags` must return
+    /// the persisted reason / timestamp / suspected DIDs. This is the
+    /// fundamental invariant the task requires (quarantine survives a CLI
+    /// restart). Mirrors the iOS `MLSConversationModel.isQuarantined` GRDB
+    /// migration test.
+    #[tokio::test]
+    async fn quarantine_persists_across_database_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+
+        let convo_id = "convo-quarantined";
+        let suspected = vec![
+            "did:plc:peer-one".to_string(),
+            "did:plc:peer-two".to_string(),
+        ];
+
+        // ── 1. Mark and drop ───────────────────────────────────────────
+        {
+            let db = Database::open_unencrypted(&path).await.unwrap();
+            db.store_conversation(&fixture_convo(convo_id, "group-q"))
+                .await
+                .unwrap();
+            db.mark_quarantined(
+                convo_id,
+                QuarantineReason::MultiPeerBadCommits,
+                1_700_000_000_000,
+                &suspected,
+            )
+            .await
+            .unwrap();
+        } // db dropped here — pool flushed.
+
+        // ── 2. Reopen and verify rehydration ───────────────────────────
+        {
+            let db = Database::open_unencrypted(&path).await.unwrap();
+            let flags = db.get_recovery_flags(convo_id).await.unwrap();
+            let q = flags
+                .quarantine
+                .as_ref()
+                .expect("quarantine must rehydrate after reopen");
+            assert_eq!(q.reason, QuarantineReason::MultiPeerBadCommits);
+            assert_eq!(q.since_ms, 1_700_000_000_000);
+            assert_eq!(q.suspected_dids, suspected);
+
+            // ── 3. Clear and verify it sticks across another reopen ────
+            db.clear_quarantine(convo_id).await.unwrap();
+        }
+        {
+            let db = Database::open_unencrypted(&path).await.unwrap();
+            let flags = db.get_recovery_flags(convo_id).await.unwrap();
+            assert!(
+                flags.quarantine.is_none(),
+                "clear_quarantine must remove the persisted payload"
+            );
+        }
     }
 }
 
