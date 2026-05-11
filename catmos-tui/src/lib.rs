@@ -16,9 +16,7 @@ use ratatui::Terminal;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use catmos_core::auth::app_password::AppPasswordAuth;
-use catmos_core::auth::oauth::OAuthAuth;
-use catmos_core::auth::AuthMethod;
+use catmos_core::auth::restore_saved_auth;
 use catmos_core::chat::service::ChatService;
 use catmos_core::mls::context::MlsManager;
 use catmos_core::storage::aliases::AliasStore;
@@ -46,30 +44,12 @@ pub async fn run() -> anyhow::Result<()> {
     let db_key = catmos_core::mls::context::get_or_create_db_key(&did)?;
     let db = Arc::new(Database::open(&db_path, &db_key).await?);
 
-    // Try OAuth first, then AppPassword
-    let (auth, token_session) = if let Some(oauth) = OAuthAuth::load(&db).await? {
-        info!("Restored OAuth session for {did}");
-        (
-            AuthMethod::OAuth {
-                session_cookie: oauth.session_cookie,
-                did: oauth.did.clone(),
-                nest_url: oauth.nest_url,
-            },
-            None,
-        )
-    } else if let Some(ap) = AppPasswordAuth::load(&db).await? {
-        info!("Restored app password session for {}", ap.handle);
-        (
-            AuthMethod::AppPassword {
-                handle: ap.handle,
-                did: ap.did,
-                pds_url: ap.pds_url,
-            },
-            Some(ap.session),
-        )
-    } else {
-        anyhow::bail!("No saved session found. Run `catmos login` first.");
-    };
+    let restored = restore_saved_auth(&db, &did)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("No saved session found. Run `catmos login` first."))?;
+    info!("Restored validated session for {did}");
+    let auth = restored.auth;
+    let token_session = restored.token_session;
 
     // ── 3. Initialize MLS ──────────────────────────────────────────────
     let mls_dir = Config::data_dir()?.join("mls");
@@ -334,7 +314,9 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         consecutive_failures += 1;
-                        debug!("Background sync error (consecutive: {consecutive_failures}): {e:?}");
+                        debug!(
+                            "Background sync error (consecutive: {consecutive_failures}): {e:?}"
+                        );
 
                         if consecutive_failures >= SYNC_CIRCUIT_BREAKER_THRESHOLD {
                             // Exponential cooldown: min(30 * 2^(failures-1), 300) seconds
@@ -502,9 +484,7 @@ async fn main_loop(
                     // Commit. Flag the conversation as NEEDS_REJOIN and let
                     // deferred recovery (post-sync) handle it.
                     let label = &convo_id[..12.min(convo_id.len())];
-                    warn!(
-                        "Tree diverged for {label} — flagging NEEDS_REJOIN (deferred recovery)"
-                    );
+                    warn!("Tree diverged for {label} — flagging NEEDS_REJOIN (deferred recovery)");
                     let svc = Arc::clone(&app.service);
                     let cid = convo_id.clone();
                     tokio::spawn(async move {
@@ -538,7 +518,11 @@ async fn main_loop(
 }
 
 /// Handle a key event in the Chat screen.
-async fn handle_chat_key(app: &mut App, key: crossterm::event::KeyEvent, event_tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>) {
+async fn handle_chat_key(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
+) {
     let action = map_key(key);
 
     match action {

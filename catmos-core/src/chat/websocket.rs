@@ -154,7 +154,11 @@ struct SubscriptionTicketResponse {
 
 impl ChatService {
     /// Build a WebSocket URL from a subscription ticket.
-    fn build_ws_url(config: &crate::storage::config::Config, ticket: &str, endpoint: Option<&str>) -> String {
+    fn build_ws_url(
+        config: &crate::storage::config::Config,
+        ticket: &str,
+        endpoint: Option<&str>,
+    ) -> String {
         let endpoint = endpoint.map(String::from).unwrap_or_else(|| {
             let base = config.server.mls_url.clone();
             format!("{base}/xrpc/blue.catbird.mlsChat.subscribeEvents?ticket={ticket}")
@@ -233,7 +237,8 @@ impl ChatService {
                             Ok(tungstenite::Message::Binary(data)) => {
                                 match SubscribeEventsMessage::decode_framed(&data) {
                                     Ok(event) => {
-                                        let ws_event = convert_event(event, &mls, &own_commits).await;
+                                        let ws_event =
+                                            convert_event(event, &mls, &own_commits).await;
                                         if tx.send(ws_event).is_err() {
                                             debug!("WsEvent receiver dropped, stopping reader");
                                             return;
@@ -283,9 +288,7 @@ impl ChatService {
                 attempt += 1;
                 let backoff_secs = std::cmp::min(2u64.saturating_pow(attempt), 30);
                 let _ = tx.send(WsEvent::Reconnecting);
-                info!(
-                    "WebSocket reconnecting in {backoff_secs}s (attempt {attempt})"
-                );
+                info!("WebSocket reconnecting in {backoff_secs}s (attempt {attempt})");
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
 
                 // Get a fresh subscription ticket using a temporary client
@@ -389,7 +392,10 @@ async fn get_subscription_ticket_standalone(
 
     // Retry once after token refresh if AppPassword + unauthorized
     let should_refresh = token_session.is_some()
-        && matches!(resp.status(), StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST);
+        && matches!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
+        );
     let resp = if should_refresh {
         let sess = token_session.expect("checked above");
         let new_bearer = sess
@@ -486,7 +492,9 @@ async fn convert_event(
                         }
                     }
                     Ok(_) => {
-                        debug!("WS commit {message_id}: non-commit content returned, nothing to merge");
+                        debug!(
+                            "WS commit {message_id}: non-commit content returned, nothing to merge"
+                        );
                     }
                     Err(e) => {
                         debug!("Failed to process WS commit {message_id}: {e}");
@@ -589,10 +597,9 @@ async fn convert_event(
             let local_tag = mls
                 .with_context(|ctx| ctx.get_confirmation_tag(gid_bytes))
                 .ok()
-                .map(|tag| base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &tag,
-                ));
+                .map(|tag| {
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tag)
+                });
 
             if local_tag.as_deref() == Some(server_tag.as_str()) {
                 debug!("treeChanged for {convo_id}: local tag matches canonical, no action needed");
@@ -624,8 +631,7 @@ async fn convert_event(
 /// Attempt to decode a raw framed binary message for event types not yet in the
 /// generated `SubscribeEventsMessage` enum. Returns `Some(WsEvent)` on success.
 fn try_decode_unknown_event(data: &[u8]) -> Option<WsEvent> {
-    let (header, body) =
-        jacquard_common::xrpc::subscription::parse_event_header(data).ok()?;
+    let (header, body) = jacquard_common::xrpc::subscription::parse_event_header(data).ok()?;
 
     match header.t.as_str() {
         "#groupResetEvent" => {
@@ -726,9 +732,10 @@ mod tests {
             "requestEventId": request_event_id,
         });
         if let Some(g) = expected_new_mls_group_id {
-            obj.as_object_mut()
-                .unwrap()
-                .insert("expectedNewMlsGroupId".into(), serde_json::Value::String(g.into()));
+            obj.as_object_mut().unwrap().insert(
+                "expectedNewMlsGroupId".into(),
+                serde_json::Value::String(g.into()),
+            );
         }
         obj
     }

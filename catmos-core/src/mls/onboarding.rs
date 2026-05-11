@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use catbird_atproto::catbird::mls_chat;
 
-use super::MlsManager;
+use super::{MlsManager, MLS_CIPHER_SUITE};
 use crate::chat::ChatService;
 use crate::error::{CatmosError, Result};
 use crate::storage::db::Database;
@@ -111,7 +111,7 @@ impl MlsManager {
             .iter()
             .map(|kp| {
                 mls_chat::register_device::KeyPackageItemData {
-                    cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
+                    cipher_suite: MLS_CIPHER_SUITE.to_string(),
                     expires: expires_str.parse().expect("valid datetime"),
                     key_package: kp.key_package_data.clone(),
                 }

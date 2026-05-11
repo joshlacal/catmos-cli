@@ -85,7 +85,7 @@ impl Database {
                 description   TEXT,
                 creator       TEXT NOT NULL,
                 epoch         INTEGER NOT NULL DEFAULT 0,
-                cipher_suite  TEXT NOT NULL DEFAULT 'MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519',
+                cipher_suite  TEXT NOT NULL DEFAULT 'MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519',
                 created_at    TEXT NOT NULL,
                 last_message_at TEXT,
                 unread_count  INTEGER NOT NULL DEFAULT 0,
@@ -215,6 +215,30 @@ impl Database {
             .await?;
 
         Ok(row.map(|r| r.get("value")))
+    }
+
+    pub async fn delete_session_value(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM session WHERE key = ?1")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn clear_auth_session(&self) -> Result<()> {
+        for key in [
+            "auth_method",
+            "session_cookie",
+            "did",
+            "handle",
+            "nest_url",
+            "access_jwt",
+            "refresh_jwt",
+            "pds_url",
+        ] {
+            self.delete_session_value(key).await?;
+        }
+        Ok(())
     }
 
     // ── Conversations ────────────────────────────────────────────────────

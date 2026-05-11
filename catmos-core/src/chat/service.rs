@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,13 +9,15 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+use catbird_atproto::blue_catbird;
 use catbird_atproto::blue_catbird::mlsChat::commit_group_change::CommitGroupChange;
 use catbird_atproto::catbird::mls_chat;
 use catbird_mls::orchestrator_bridge::FFICommitKind;
+use catbird_mls::{GroupConfig, KeyPackageData};
 
 use crate::auth::{AuthMethod, TokenSession};
 use crate::error::{CatmosError, Result};
-use crate::mls::MlsManager;
+use crate::mls::{MlsManager, MLS_CIPHER_SUITE};
 use crate::recovery::{
     GroupInfo404Tracker, QuarantineExitReason, QuarantineReason, RecoveryTracker,
 };
@@ -143,7 +145,7 @@ struct CommitGroupChangeResp {
 #[allow(dead_code)] // did / cipher_suite / key_package_hash are parsed but
                     // not yet consumed — kept for log-line surface and for
                     // future `keyPackageHashes` commit-group-change field.
-struct KeyPackageRefResp {
+pub(crate) struct KeyPackageRefResp {
     did: String,
     cipher_suite: String,
     #[serde(with = "serde_bytes_wrapper")]
@@ -230,6 +232,51 @@ pub(crate) fn build_commit_group_change(
     }
 }
 
+pub(crate) fn build_create_convo_request(
+    group_id: &str,
+    initial_members: &[String],
+    welcome_message: Option<Vec<u8>>,
+    key_package_hashes: Vec<(String, String)>,
+) -> blue_catbird::mlsChat::create_convo::CreateConvo<'static> {
+    let current_epoch = if welcome_message.is_some() { 1 } else { 0 };
+
+    blue_catbird::mlsChat::create_convo::CreateConvo {
+        group_id: group_id.to_string().into(),
+        cipher_suite: MLS_CIPHER_SUITE.into(),
+        initial_members: if initial_members.is_empty() {
+            None
+        } else {
+            Some(
+                initial_members
+                    .iter()
+                    .cloned()
+                    .map(catbird_atproto::types::string::Did::from)
+                    .collect(),
+            )
+        },
+        metadata: None,
+        welcome_message: welcome_message.map(bytes::Bytes::from),
+        current_epoch: Some(current_epoch),
+        key_package_hashes: if key_package_hashes.is_empty() {
+            None
+        } else {
+            Some(
+                key_package_hashes
+                    .into_iter()
+                    .map(
+                        |(did, hash)| blue_catbird::mlsChat::create_convo::KeyPackageHashEntry {
+                            did: catbird_atproto::types::string::Did::from(did),
+                            hash: hash.into(),
+                            extra_data: Default::default(),
+                        },
+                    )
+                    .collect(),
+            )
+        },
+        ..Default::default()
+    }
+}
+
 /// Central coordinator for chat operations: XRPC calls, message encryption,
 /// WebSocket subscriptions, and local storage.
 pub struct ChatService {
@@ -301,9 +348,7 @@ impl ChatService {
     /// Subscribe to Layer 3 quarantine state changes (TUI banner / status
     /// line, tests). Receivers fall behind safely — bursts of >32 events
     /// drop oldest first.
-    pub fn subscribe_quarantine_events(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<QuarantineEvent> {
+    pub fn subscribe_quarantine_events(&self) -> tokio::sync::broadcast::Receiver<QuarantineEvent> {
         self.quarantine_events.subscribe()
     }
 
@@ -515,36 +560,155 @@ impl ChatService {
     /// `putGroupMetadataBlob`.
     pub async fn create_conversation(
         &self,
-        _name: &str,
+        name: &str,
         members: &[String],
-        _description: Option<&str>,
+        description: Option<&str>,
     ) -> Result<Conversation> {
-        let req: mls_chat::create_convo::Input = mls_chat::create_convo::InputData {
-            group_id: String::new(), // server assigns
-            cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
-            initial_members: if members.is_empty() {
-                None
-            } else {
-                Some(
-                    members
-                        .iter()
-                        .map(|m| catbird_atproto::types::string::Did::from(m.clone()))
-                        .collect(),
-                )
-            },
-            // Encrypted-only path: no plaintext name/description on the wire.
-            metadata: None,
-            welcome_message: None,
-            current_epoch: None,
-            key_package_hashes: None,
+        let creator_did = self.did().to_string();
+        let mut seen = HashSet::new();
+        let initial_members: Vec<String> = members
+            .iter()
+            .filter(|did| did.as_str() != creator_did)
+            .filter(|did| seen.insert((*did).clone()))
+            .cloned()
+            .collect();
+
+        let key_packages = if initial_members.is_empty() {
+            Vec::new()
+        } else {
+            self.fetch_key_packages(&initial_members).await?
+        };
+
+        if !initial_members.is_empty() {
+            let available: HashSet<&str> = key_packages.iter().map(|kp| kp.did.as_str()).collect();
+            let missing: Vec<&str> = initial_members
+                .iter()
+                .map(String::as_str)
+                .filter(|did| !available.contains(did))
+                .collect();
+            if !missing.is_empty() {
+                return Err(CatmosError::Other(format!(
+                    "No key packages available for initial member(s): {}",
+                    missing.join(", ")
+                )));
+            }
         }
-        .into();
 
-        let resp: super::messages::CreateConvoResp = self
+        let group_id_bytes = rand::random::<[u8; 16]>().to_vec();
+        let group_id_hex = hex::encode(&group_id_bytes);
+
+        self.mls.with_context(|ctx| {
+            ctx.create_group_with_id(
+                creator_did.as_bytes().to_vec(),
+                group_id_bytes.clone(),
+                Some(GroupConfig::default()),
+            )
+        })?;
+
+        let initial_add = if key_packages.is_empty() {
+            None
+        } else {
+            let kp_data: Vec<KeyPackageData> = key_packages
+                .iter()
+                .map(|kp| KeyPackageData {
+                    data: kp.key_package.clone(),
+                })
+                .collect();
+            match self
+                .mls
+                .with_context(|ctx| ctx.add_members(group_id_bytes.clone(), kp_data))
+            {
+                Ok(add) => Some(add),
+                Err(e) => {
+                    let _ = self
+                        .mls
+                        .with_context(|ctx| ctx.delete_group(group_id_bytes.clone()));
+                    return Err(e);
+                }
+            }
+        };
+
+        let key_package_hashes: Vec<(String, String)> = key_packages
+            .iter()
+            .filter_map(|kp| {
+                kp.key_package_hash
+                    .as_ref()
+                    .map(|hash| (kp.did.clone(), hash.clone()))
+            })
+            .collect();
+
+        let req = build_create_convo_request(
+            &group_id_hex,
+            &initial_members,
+            initial_add.as_ref().map(|add| add.welcome_data.clone()),
+            key_package_hashes,
+        );
+
+        let resp: super::messages::CreateConvoResp = match self
             .xrpc_procedure(mls_chat::create_convo::NSID, &req)
-            .await?;
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                let _ = self
+                    .mls
+                    .with_context(|ctx| ctx.delete_group(group_id_bytes.clone()));
+                return Err(e);
+            }
+        };
 
-        Ok(super::messages::convo_resp_to_conversation(&resp.convo))
+        if initial_add.is_some() {
+            self.mls
+                .with_context(|ctx| ctx.merge_pending_commit(group_id_bytes.clone()))?;
+        }
+
+        let mut convo = super::messages::convo_resp_to_conversation(&resp.convo);
+
+        if !name.trim().is_empty() || description.is_some() {
+            self.update_conversation(&group_id_hex, Some(name), description)
+                .await?;
+            let epoch = self
+                .mls
+                .with_context(|ctx| ctx.get_epoch(group_id_bytes.clone()))?;
+            convo.epoch = epoch;
+            convo.name = Some(name.to_string());
+            convo.description = description.map(str::to_string);
+        }
+
+        match self.mls.with_context(|ctx| {
+            ctx.export_group_info(group_id_bytes.clone(), creator_did.as_bytes().to_vec())
+        }) {
+            Ok(group_info) => {
+                if let Err(e) = self.publish_group_info(&group_id_hex, &group_info).await {
+                    warn!(
+                        "create_conversation: failed to publish GroupInfo for {group_id_hex}: {e}"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("create_conversation: failed to export GroupInfo for {group_id_hex}: {e}");
+            }
+        }
+
+        Ok(convo)
+    }
+
+    async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
+        let req = build_commit_group_change(
+            convo_id,
+            "updateGroupInfo",
+            None,
+            None,
+            Some(group_info.to_vec()),
+            None,
+            None,
+            None,
+        );
+
+        let _: CommitGroupChangeResp = self
+            .xrpc_procedure(mls_chat::commit_group_change::NSID, &req)
+            .await?;
+        Ok(())
     }
 
     /// Submit a `bootstrapResetGroup` call for the first-responder bootstrap
@@ -784,9 +948,7 @@ impl ChatService {
                     .mls
                     .with_context(|ctx| ctx.merge_pending_commit(group_id_bytes.clone()))
                 {
-                    warn!(
-                        "update_conversation: merge_pending_commit failed for {convo_id}: {e}"
-                    );
+                    warn!("update_conversation: merge_pending_commit failed for {convo_id}: {e}");
                     return Err(e);
                 }
                 info!(
@@ -1117,8 +1279,6 @@ impl ChatService {
 
     /// Replenish key packages on the server.
     pub async fn replenish_key_packages(&self) -> Result<u32> {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-
         let identity = self.did().as_bytes().to_vec();
         let packages = self.mls.create_key_packages(&identity, 50)?;
 
@@ -1130,7 +1290,7 @@ impl ChatService {
             .iter()
             .map(|kp| {
                 mls_chat::publish_key_packages::KeyPackageItemData {
-                    cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
+                    cipher_suite: MLS_CIPHER_SUITE.to_string(),
                     expires: expires_str.parse().expect("valid datetime"),
                     key_package: kp.key_package_data.clone(),
                 }
@@ -1350,5 +1510,54 @@ impl ChatService {
         };
 
         Ok((url, headers))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+
+    const KNOWN_BYTES: &[u8] = &[0, 1, 2, 3, 4, 0xde, 0xad, 0xbe, 0xef];
+    const SINGLE_ENCODED: &str = "AAECAwTerb7v";
+    const DOUBLE_ENCODED: &str = "QUFFQ0F3VGVyYjd2";
+
+    #[test]
+    fn build_create_convo_request_uses_xwing_and_raw_welcome_bytes() {
+        assert_eq!(B64.encode(KNOWN_BYTES), SINGLE_ENCODED);
+        assert_eq!(B64.encode(SINGLE_ENCODED.as_bytes()), DOUBLE_ENCODED);
+
+        let input = build_create_convo_request(
+            "deadbeef",
+            &["did:plc:alice".to_string()],
+            Some(KNOWN_BYTES.to_vec()),
+            vec![("did:plc:alice".to_string(), "hash-a".to_string())],
+        );
+
+        let json = serde_json::to_value(&input).expect("serialize CreateConvo");
+        assert_eq!(json["cipherSuite"], MLS_CIPHER_SUITE);
+        assert_eq!(json["currentEpoch"], 1);
+        assert_eq!(json["initialMembers"][0], "did:plc:alice");
+        assert_eq!(json["keyPackageHashes"][0]["did"], "did:plc:alice");
+        assert_eq!(json["keyPackageHashes"][0]["hash"], "hash-a");
+
+        let encoded = json["welcomeMessage"]["$bytes"]
+            .as_str()
+            .expect("welcomeMessage $bytes envelope");
+        assert_eq!(encoded, SINGLE_ENCODED);
+        assert_ne!(encoded, DOUBLE_ENCODED);
+    }
+
+    #[test]
+    fn build_create_convo_request_seeds_empty_create_at_epoch_zero() {
+        let input = build_create_convo_request("deadbeef", &[], None, vec![]);
+
+        let json = serde_json::to_value(&input).expect("serialize CreateConvo");
+        assert_eq!(json["cipherSuite"], MLS_CIPHER_SUITE);
+        assert_eq!(json["currentEpoch"], 0);
+        assert!(json.get("initialMembers").is_none());
+        assert!(json.get("welcomeMessage").is_none());
+        assert!(json.get("keyPackageHashes").is_none());
     }
 }

@@ -69,15 +69,10 @@ impl TokenSession {
             .await
             .ok_or_else(|| CatmosError::AuthFailed("no session after login".into()))?;
         let did = key.0.clone();
-        let atp = store
-            .get(&key)
-            .await
-            .ok_or_else(|| CatmosError::AuthFailed("session missing from store after login".into()))?;
-        let pds_url = session
-            .endpoint()
-            .await
-            .trim_end_matches('/')
-            .to_string();
+        let atp = store.get(&key).await.ok_or_else(|| {
+            CatmosError::AuthFailed("session missing from store after login".into())
+        })?;
+        let pds_url = session.endpoint().await.trim_end_matches('/').to_string();
 
         Ok(Self {
             session: Arc::new(session),
@@ -100,10 +95,12 @@ impl TokenSession {
         refresh_jwt: String,
         pds_url: String,
     ) -> Result<Self> {
-        let did = Did::new_owned(&did_str)
-            .map_err(|e| CatmosError::AuthFailed(format!("invalid did in stored session: {e:?}")))?;
-        let handle_parsed = Handle::new_owned(&handle)
-            .map_err(|e| CatmosError::AuthFailed(format!("invalid handle in stored session: {e:?}")))?;
+        let did = Did::new_owned(&did_str).map_err(|e| {
+            CatmosError::AuthFailed(format!("invalid did in stored session: {e:?}"))
+        })?;
+        let handle_parsed = Handle::new_owned(&handle).map_err(|e| {
+            CatmosError::AuthFailed(format!("invalid handle in stored session: {e:?}"))
+        })?;
 
         let atp = AtpSession {
             access_jwt: CowStr::from(access_jwt),
@@ -175,7 +172,8 @@ impl TokenSession {
             .await
             .ok_or_else(|| CatmosError::AuthFailed("session missing from store".into()))?;
 
-        db.store_session_value("auth_method", "app_password").await?;
+        db.store_session_value("auth_method", "app_password")
+            .await?;
         db.store_session_value("handle", &self.handle).await?;
         db.store_session_value("did", self.did.as_str()).await?;
         db.store_session_value("access_jwt", atp.access_jwt.as_ref())

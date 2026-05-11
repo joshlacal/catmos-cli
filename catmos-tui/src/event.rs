@@ -20,7 +20,11 @@ pub enum AppEvent {
     /// The MLS tree diverged for a conversation — needs silent repair.
     TreeDiverged { convo_id: String },
     /// The MLS group was reset by an admin — rejoin with new group ID.
-    GroupReset { convo_id: String, new_group_id: String, reset_generation: u64 },
+    GroupReset {
+        convo_id: String,
+        new_group_id: String,
+        reset_generation: u64,
+    },
     /// Phase 2.5 indirect-trigger reset request — server has not minted a new
     /// group ID; this client may participate in the first-responder bootstrap
     /// race via the deferred-recovery loop after `RESET_PENDING` is persisted.

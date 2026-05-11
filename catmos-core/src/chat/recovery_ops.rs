@@ -1162,8 +1162,7 @@ impl ChatService {
                 .find(|c| c.conversation_id == convo_id)
                 .map(|c| c.cipher_suite.clone())
         };
-        let cipher_suite = cipher_suite
-            .unwrap_or_else(|| "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string());
+        let cipher_suite = cipher_suite.unwrap_or_else(|| crate::mls::MLS_CIPHER_SUITE.to_string());
 
         info!(
             convo = %convo_label,

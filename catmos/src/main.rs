@@ -6,9 +6,9 @@ use tracing::info;
 
 use catmos_core::auth::app_password::AppPasswordAuth;
 use catmos_core::auth::oauth::OAuthAuth;
-use catmos_core::auth::AuthMethod;
+use catmos_core::auth::restore_saved_auth;
 use catmos_core::chat::ChatService;
-use catmos_core::mls::MlsManager;
+use catmos_core::mls::{MlsManager, MLS_CIPHER_SUITE};
 use catmos_core::storage::aliases::AliasStore;
 use catmos_core::storage::config::Config;
 use catmos_core::storage::db::Database;
@@ -207,30 +207,12 @@ async fn init_service() -> anyhow::Result<ChatService> {
     let db_key = catmos_core::mls::context::get_or_create_db_key(&did)?;
     let db = Database::open(&db_path, &db_key).await?;
 
-    // Try to restore auth: OAuth first, then AppPassword
-    let (auth, token_session) = if let Some(oauth) = OAuthAuth::load(&db).await? {
-        info!("Restored OAuth session for {did}");
-        (
-            AuthMethod::OAuth {
-                session_cookie: oauth.session_cookie,
-                did: oauth.did.clone(),
-                nest_url: oauth.nest_url,
-            },
-            None,
-        )
-    } else if let Some(ap) = AppPasswordAuth::load(&db).await? {
-        info!("Restored app password session for {}", ap.handle);
-        (
-            AuthMethod::AppPassword {
-                handle: ap.handle,
-                did: ap.did,
-                pds_url: ap.pds_url,
-            },
-            Some(ap.session),
-        )
-    } else {
-        anyhow::bail!("No saved session found. Run `catmos login` first.");
-    };
+    let restored = restore_saved_auth(&db, &did)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("No saved session found. Run `catmos login` first."))?;
+    info!("Restored validated session for {did}");
+    let auth = restored.auth;
+    let token_session = restored.token_session;
 
     let mls_dir = Config::data_dir()?.join("mls");
     let mls = Arc::new(MlsManager::new(&mls_dir, &did)?);
@@ -273,9 +255,7 @@ async fn init_service() -> anyhow::Result<ChatService> {
                                 .conversations()
                                 .await
                                 .into_iter()
-                                .filter(|c| {
-                                    c.members.iter().any(|m| blocked.contains(&m.user_did))
-                                })
+                                .filter(|c| c.members.iter().any(|m| blocked.contains(&m.user_did)))
                                 .map(|c| c.group_id)
                                 .collect();
 
@@ -771,7 +751,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             let req = serde_json::json!({
                 "convoId": convo_id,
                 "newGroupId": new_group_id,
-                "cipherSuite": "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+                "cipherSuite": MLS_CIPHER_SUITE,
                 "reason": reason,
             });
 
@@ -885,7 +865,10 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                         Err(e) => eprintln!("leave {id} failed: {e}"),
                     }
                 }
-                println!("Blocked {did} and left {left}/{} conversations.", affected.len());
+                println!(
+                    "Blocked {did} and left {left}/{} conversations.",
+                    affected.len()
+                );
             }
             BlockCommands::Remove { did } => {
                 let svc = init_service().await?;
