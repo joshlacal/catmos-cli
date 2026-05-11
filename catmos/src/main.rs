@@ -217,6 +217,18 @@ async fn init_service() -> anyhow::Result<ChatService> {
     let mls_dir = Config::data_dir()?.join("mls");
     let mls = Arc::new(MlsManager::new(&mls_dir, &did)?);
 
+    // Install the per-DID content-root key for the MLS field-level
+    // encryption layer (`catbird_mls::field_encryption`). Materialized to
+    // `{config_dir}/mls-content-root/{sha256(did)}.key` on first call;
+    // shared between the orchestrator's `MLSContext` and the `Database`
+    // write/read paths so encrypted rows round-trip.
+    let content_root_key = catmos_core::storage::keys::load_or_create_content_root_key(
+        &Config::config_dir()?,
+        &did,
+    )?;
+    mls.context().set_content_root_key(content_root_key.clone())?;
+    db.set_content_root_key(content_root_key);
+
     let aliases = Arc::new(RwLock::new(AliasStore::load()?));
 
     let db = Arc::new(db);

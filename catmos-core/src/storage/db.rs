@@ -3,12 +3,32 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::RwLock;
 
 use crate::error::{CatmosError, Result};
 use crate::recovery::{
     PersistedRecoveryFlags, QuarantinePayload, QuarantineReason, ResetPendingPayload,
 };
 use crate::types::{Conversation, Member, Message, MessageContent};
+
+/// Version tag stamped into `payload_key_version` on every encrypted row.
+/// Field-level encryption layer v1: AES-256-GCM payload + HMAC-SHA256 entry
+/// chain, both keyed off the per-DID content root key (see
+/// `crate::storage::keys`).
+const PAYLOAD_KEY_VERSION_V1: i64 = 1;
+
+/// JSON-shaped canonical plaintext that gets sealed by the field-level
+/// encryption layer before persistence. Storing the rich payload (rather
+/// than only the bare `content_json` column) means encrypted rows retain
+/// enough fidelity to rebuild the in-memory `MessageContent` enum after a
+/// round-trip, while the `content_type`/`content_json NOT NULL` schema
+/// constraints are satisfied by writing placeholder values to those legacy
+/// columns when the encrypted payload is the source of truth.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CanonicalMessageBody {
+    content_type: String,
+    content_json: String,
+}
 
 /// Map a persisted quarantine reason tag back into the enum. Unknown tags
 /// fall back to `RepeatedFramingFailures` — the most generic reason — so a
@@ -25,6 +45,15 @@ fn quarantine_reason_from_tag(tag: &str) -> QuarantineReason {
 /// SQLCipher-encrypted database for per-account storage.
 pub struct Database {
     pool: SqlitePool,
+    /// Per-DID content-root key for the field-level encryption layer
+    /// (`catbird_mls::field_encryption`). Installed via
+    /// [`Database::set_content_root_key`] from the session bootstrap path
+    /// after `load_or_create_content_root_key` returns. When `None` — or
+    /// before login completes — `store_message` falls back to the legacy
+    /// plaintext columns so the orchestrator can keep functioning during
+    /// the bootstrap window (initial sync may run before login installs
+    /// the key).
+    content_root_key: RwLock<Option<Vec<u8>>>,
 }
 
 impl Database {
@@ -51,7 +80,10 @@ impl Database {
                 CatmosError::Storage("Database key incorrect or database corrupted".into())
             })?;
 
-        let db = Self { pool };
+        let db = Self {
+            pool,
+            content_root_key: RwLock::new(None),
+        };
         db.migrate().await?;
         Ok(db)
     }
@@ -69,9 +101,55 @@ impl Database {
             .connect_with(options)
             .await?;
 
-        let db = Self { pool };
+        let db = Self {
+            pool,
+            content_root_key: RwLock::new(None),
+        };
         db.migrate().await?;
         Ok(db)
+    }
+
+    /// Install the per-DID content-root key for the field-level encryption
+    /// layer. Called once from the session bootstrap path
+    /// (`catmos/src/main.rs::init_service` and
+    /// `catmos-tui/src/lib.rs::run`) after the key file is materialized via
+    /// `crate::storage::keys::load_or_create_content_root_key`. Idempotent;
+    /// later calls replace the binding. Sync (RwLock write, no await needed).
+    pub fn set_content_root_key(&self, key: Vec<u8>) {
+        if let Ok(mut guard) = self.content_root_key.write() {
+            *guard = Some(key);
+        }
+    }
+
+    /// Drop the in-memory content-root key. Called from logout. Existing
+    /// encrypted rows remain readable on the next session bootstrap (the
+    /// key file on disk is what makes that possible).
+    #[allow(dead_code)]
+    pub fn clear_content_root_key(&self) {
+        if let Ok(mut guard) = self.content_root_key.write() {
+            *guard = None;
+        }
+    }
+
+    /// Snapshot the current content-root key, if installed. Returns `None`
+    /// when the bootstrap path has not yet called
+    /// [`set_content_root_key`] (e.g. the initial sync racing against
+    /// login completion).
+    fn content_root_key_snapshot(&self) -> Option<Vec<u8>> {
+        self.content_root_key
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+    }
+
+    /// Test-only accessor for the underlying `SqlitePool`. Integration
+    /// tests in `tests/` need to issue raw `PRAGMA` / `SELECT` queries to
+    /// inspect the schema and the encrypted/legacy column populations.
+    /// Not part of the public API — `#[doc(hidden)]` keeps it out of
+    /// rustdoc but still reachable from the integration test crate.
+    #[doc(hidden)]
+    pub fn pool_for_test(&self) -> &SqlitePool {
+        &self.pool
     }
 
     async fn migrate(&self) -> Result<()> {
@@ -192,6 +270,93 @@ impl Database {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| CatmosError::Storage(format!("Add column '{col}' failed: {e}")))?;
+        }
+
+        // ── Field-level encryption columns on `messages` ──────────────────
+        //
+        // Adds the columns that hold the AES-GCM ciphertext, the HMAC entry
+        // tag, and the key-version stamp for the field-level encryption
+        // layer (`catbird_mls::field_encryption`). `content_type` /
+        // `content_json` stay `NOT NULL` because making them nullable
+        // requires a full SQLite table rebuild; encrypted rows write
+        // placeholder values into those legacy columns and put the real
+        // payload in `payload_encrypted`.
+        //
+        // The tombstone columns are added now for schema parity with
+        // iOS/Android. catmos-cli does not currently expose user-initiated
+        // message delete, but landing the columns up-front means a later
+        // delete path can soft-delete without another schema migration
+        // breaking the HMAC chain. Read paths filter
+        // `COALESCE(is_tombstone, 0) = 0` so existing rows surface
+        // unaffected.
+        let message_columns: &[(&str, &str)] = &[
+            ("payload_encrypted", "BLOB"),
+            ("entry_hmac", "BLOB"),
+            ("payload_key_version", "INTEGER"),
+            ("is_tombstone", "INTEGER NOT NULL DEFAULT 0"),
+            ("deleted_at", "INTEGER"),
+        ];
+        for (col, decl) in message_columns {
+            let existing: Option<(String,)> = sqlx::query_as(
+                "SELECT name FROM pragma_table_info('messages') WHERE name = ?1",
+            )
+            .bind(col)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                CatmosError::Storage(format!("Probe messages column '{col}' failed: {e}"))
+            })?;
+            if existing.is_some() {
+                continue;
+            }
+            let stmt = format!("ALTER TABLE messages ADD COLUMN {col} {decl}");
+            sqlx::query(&stmt).execute(&self.pool).await.map_err(|e| {
+                CatmosError::Storage(format!("Add messages column '{col}' failed: {e}"))
+            })?;
+        }
+
+        // ── MLSMessageFieldMigrationV1: drop pre-cutover plaintext rows ──
+        //
+        // First-run drop of any pre-field-encryption message rows. Matches
+        // the `MLSPlaintextHeaderMigration` precedent on iOS / Android /
+        // catmos desktop: existing transcripts cannot satisfy the
+        // encrypted-row invariants (no HMAC chain seed, no per-conversation
+        // content key derivation history), so we drop them once and record
+        // the migration in a `migration_status` table so it never re-runs.
+        // The DROP is bounded — fresh installs have no messages yet, so
+        // this is a no-op on first boot.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS migration_status (
+                name TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CatmosError::Storage(format!("Create migration_status failed: {e}")))?;
+
+        let applied: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM migration_status WHERE name = 'MLSMessageFieldMigrationV1'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CatmosError::Storage(format!("Probe migration_status failed: {e}")))?;
+        if applied == 0 {
+            sqlx::query("DELETE FROM messages")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    CatmosError::Storage(format!("Drop pre-cutover messages failed: {e}"))
+                })?;
+            sqlx::query(
+                "INSERT INTO migration_status (name, applied_at) VALUES (?1, strftime('%s','now'))",
+            )
+            .bind("MLSMessageFieldMigrationV1")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                CatmosError::Storage(format!("Record MLSMessageFieldMigrationV1 failed: {e}"))
+            })?;
         }
 
         Ok(())
@@ -415,22 +580,146 @@ impl Database {
 
     pub async fn store_message(&self, msg: &Message) -> Result<()> {
         let (content_type, content_json) = serialize_content(&msg.content);
-        sqlx::query(
-            "INSERT OR REPLACE INTO messages
-             (id, convo_id, sender_did, content_type, content_json, epoch, seq, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        )
-        .bind(&msg.id)
-        .bind(&msg.convo_id)
-        .bind(&msg.sender_did)
-        .bind(&content_type)
-        .bind(&content_json)
-        .bind(msg.epoch as i64)
-        .bind(msg.seq as i64)
-        .bind(msg.created_at.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+
+        // Attempt field-level encryption. Falls back to legacy plaintext
+        // when the content-root key is not yet installed (initial sync may
+        // run before login completes). Encryption + HMAC failures also fall
+        // back with a warning rather than panic — the row still lands so
+        // the orchestrator can keep going, and a later session with the
+        // key bound will surface the plaintext columns.
+        let sealed = self.try_encrypt_message_body(msg, &content_type, &content_json).await;
+
+        match sealed {
+            Some((encrypted, entry_hmac)) => {
+                sqlx::query(
+                    "INSERT OR REPLACE INTO messages
+                     (id, convo_id, sender_did, content_type, content_json, epoch, seq, created_at,
+                      payload_encrypted, entry_hmac, payload_key_version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )
+                .bind(&msg.id)
+                .bind(&msg.convo_id)
+                .bind(&msg.sender_did)
+                // Placeholder values for the NOT NULL legacy columns when
+                // the encrypted payload is the source of truth. The read
+                // path checks `payload_encrypted IS NOT NULL` first and
+                // ignores these on sealed rows.
+                .bind("sealed")
+                .bind("")
+                .bind(msg.epoch as i64)
+                .bind(msg.seq as i64)
+                .bind(msg.created_at.to_rfc3339())
+                .bind(encrypted)
+                .bind(entry_hmac)
+                .bind(PAYLOAD_KEY_VERSION_V1)
+                .execute(&self.pool)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "INSERT OR REPLACE INTO messages
+                     (id, convo_id, sender_did, content_type, content_json, epoch, seq, created_at,
+                      payload_encrypted, entry_hmac, payload_key_version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL)",
+                )
+                .bind(&msg.id)
+                .bind(&msg.convo_id)
+                .bind(&msg.sender_did)
+                .bind(&content_type)
+                .bind(&content_json)
+                .bind(msg.epoch as i64)
+                .bind(msg.seq as i64)
+                .bind(msg.created_at.to_rfc3339())
+                .execute(&self.pool)
+                .await?;
+            }
+        }
         Ok(())
+    }
+
+    /// Look up the most recent (highest seq) `entry_hmac` for a
+    /// conversation so the next encrypted row can extend the HMAC chain.
+    /// Returns `None` for the first row in a conversation (chain seed = 32
+    /// zero bytes is supplied by `compute_entry_hmac` when `prev_hmac =
+    /// None`) or when prior rows are legacy plaintext (no chain to extend).
+    async fn last_entry_hmac(&self, convo_id: &str) -> Option<Vec<u8>> {
+        sqlx::query_scalar::<_, Option<Vec<u8>>>(
+            "SELECT entry_hmac FROM messages
+             WHERE convo_id = ?1 AND entry_hmac IS NOT NULL
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(convo_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+    }
+
+    /// Seal a message body via `catbird_mls::field_encryption`. Returns
+    /// `None` when the content-root key is not installed, so the caller can
+    /// fall back to legacy plaintext columns and keep the orchestrator
+    /// running through the bootstrap window. Errors from the encryption /
+    /// HMAC primitives are also surfaced as `None` (with a `warn!` log)
+    /// rather than panicking — landing the row is more important than the
+    /// field-level layer for a transient cryptographic edge case, and a
+    /// later session can replay the row.
+    async fn try_encrypt_message_body(
+        &self,
+        msg: &Message,
+        content_type: &str,
+        content_json: &str,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let root = self.content_root_key_snapshot()?;
+        let body = CanonicalMessageBody {
+            content_type: content_type.to_string(),
+            content_json: content_json.to_string(),
+        };
+        let plaintext = match serde_json::to_vec(&body) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    message_id = %msg.id,
+                    error = %err,
+                    "try_encrypt_message_body: canonical body serialization failed; falling back to plaintext"
+                );
+                return None;
+            }
+        };
+        let encrypted = match catbird_mls::field_encryption::encrypt_payload(
+            &root,
+            &msg.convo_id,
+            &plaintext,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    message_id = %msg.id,
+                    error = %err,
+                    "try_encrypt_message_body: encrypt_payload failed; falling back to plaintext"
+                );
+                return None;
+            }
+        };
+        let prev_hmac = self.last_entry_hmac(&msg.convo_id).await;
+        let hmac = match catbird_mls::field_encryption::compute_entry_hmac(
+            &root,
+            &msg.convo_id,
+            prev_hmac.as_deref(),
+            &msg.id,
+            &encrypted,
+        ) {
+            Ok(tag) => tag,
+            Err(err) => {
+                tracing::warn!(
+                    message_id = %msg.id,
+                    error = %err,
+                    "try_encrypt_message_body: compute_entry_hmac failed; falling back to plaintext"
+                );
+                return None;
+            }
+        };
+        Some((encrypted, hmac.to_vec()))
     }
 
     pub async fn get_messages(
@@ -441,8 +730,10 @@ impl Database {
     ) -> Result<Vec<Message>> {
         let rows = if let Some(seq) = before_seq {
             sqlx::query(
-                "SELECT id, convo_id, sender_did, content_type, content_json, epoch, seq, created_at
+                "SELECT id, convo_id, sender_did, content_type, content_json, epoch, seq, created_at,
+                        payload_encrypted
                  FROM messages WHERE convo_id = ?1 AND seq < ?2
+                   AND COALESCE(is_tombstone, 0) = 0
                  ORDER BY seq DESC LIMIT ?3",
             )
             .bind(convo_id)
@@ -452,8 +743,10 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                "SELECT id, convo_id, sender_did, content_type, content_json, epoch, seq, created_at
+                "SELECT id, convo_id, sender_did, content_type, content_json, epoch, seq, created_at,
+                        payload_encrypted
                  FROM messages WHERE convo_id = ?1
+                   AND COALESCE(is_tombstone, 0) = 0
                  ORDER BY seq DESC LIMIT ?2",
             )
             .bind(convo_id)
@@ -462,7 +755,9 @@ impl Database {
             .await?
         };
 
-        let mut messages: Vec<Message> = rows.iter().map(map_message_row).collect();
+        let root = self.content_root_key_snapshot();
+        let mut messages: Vec<Message> =
+            rows.iter().map(|r| map_message_row(r, root.as_deref())).collect();
         messages.reverse(); // return in chronological order
         Ok(messages)
     }
@@ -1195,14 +1490,58 @@ fn deserialize_content(content_type: &str, content_json: &str) -> MessageContent
     }
 }
 
-fn map_message_row(row: &sqlx::sqlite::SqliteRow) -> Message {
-    let content_type: String = row.get("content_type");
-    let content_json: String = row.get("content_json");
+fn map_message_row(row: &sqlx::sqlite::SqliteRow, root_key: Option<&[u8]>) -> Message {
+    let id: String = row.get("id");
+    let convo_id: String = row.get("convo_id");
+    let legacy_content_type: String = row.get("content_type");
+    let legacy_content_json: String = row.get("content_json");
     let created_str: String = row.get("created_at");
+    let payload_encrypted: Option<Vec<u8>> = row.get("payload_encrypted");
+
+    // Prefer the encrypted column when present and the content-root key is
+    // installed; fall back to the legacy plaintext columns for rows written
+    // during a bootstrap-race window or before the field-encryption
+    // migration ran. A sealed row read without a key bound surfaces as
+    // `MessageContent::Unknown` (placeholder `content_type = "sealed"` is
+    // not parseable as plaintext) — preferable to a panic.
+    let (content_type, content_json) = match (payload_encrypted.as_deref(), root_key) {
+        (Some(wire), Some(root)) if !wire.is_empty() => {
+            match catbird_mls::field_encryption::decrypt_payload(root, &convo_id, wire) {
+                Ok(plaintext) => match serde_json::from_slice::<CanonicalMessageBody>(&plaintext) {
+                    Ok(body) => (body.content_type, body.content_json),
+                    Err(err) => {
+                        tracing::warn!(
+                            message_id = %id,
+                            error = %err,
+                            "map_message_row: canonical body deserialize failed; row will surface as Unknown"
+                        );
+                        (legacy_content_type, legacy_content_json)
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        message_id = %id,
+                        error = %err,
+                        "map_message_row: decrypt_payload failed; falling back to legacy columns"
+                    );
+                    (legacy_content_type, legacy_content_json)
+                }
+            }
+        }
+        (Some(_), None) => {
+            tracing::error!(
+                message_id = %id,
+                "map_message_row: sealed row read with no content-root key bound; \
+                 payload will surface as Unknown until the key is installed"
+            );
+            (legacy_content_type, legacy_content_json)
+        }
+        _ => (legacy_content_type, legacy_content_json),
+    };
 
     Message {
-        id: row.get("id"),
-        convo_id: row.get("convo_id"),
+        id,
+        convo_id,
         sender_did: row.get("sender_did"),
         content: deserialize_content(&content_type, &content_json),
         epoch: row.get::<i64, _>("epoch") as u64,
