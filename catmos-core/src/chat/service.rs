@@ -254,7 +254,6 @@ pub(crate) fn build_create_convo_request(
                     .collect(),
             )
         },
-        metadata: None,
         welcome_message: welcome_message.map(bytes::Bytes::from),
         current_epoch: Some(current_epoch),
         key_package_hashes: if key_package_hashes.is_empty() {
@@ -760,18 +759,12 @@ impl ChatService {
 
         const NSID: &str = "blue.catbird.mlsChat.bootstrapResetGroup";
 
-        // TODO(workspace task #20): catbird-atproto regen pending. The lexicon
-        // gained `metadataBlobLocator` + `metadataVersion` (Phase B encrypted
-        // metadata cutover, see commit 5dd85dc) but the generated
-        // `BootstrapResetGroup<'a>` struct in
-        // `catbird-atproto/src/generated/blue_catbird/mlsChat/bootstrap_reset_group.rs`
-        // does NOT have those fields yet. The two metadata fields are
-        // diagnostic only — joining members fetch via `getGroupMetadataBlob`
-        // regardless, per the existing comment above. Drop the forward-
-        // referenced field assignments so the workspace builds; restore
-        // when regen lands. `extra_data` is still injected by the
-        // `#[jacquard_derive::lexicon]` proc-macro, so we keep that one.
-        let _ = (metadata_blob_locator, metadata_version);
+        // `metadata_blob_locator` / `metadata_version` declare the encrypted
+        // metadata blob the reset winner re-publishes for the new group (see
+        // `republish_metadata_after_reset`). They are diagnostic — joining
+        // members fetch via `getGroupMetadataBlob` regardless — but surface a
+        // server-visible signal that the resetter owns the new generation's
+        // metadata. The generated `BootstrapResetGroup` now carries both fields.
         let req = BootstrapResetGroup {
             original_convo_id: original_convo_id.to_string().into(),
             new_group_id: new_group_id_hex.to_string().into(),
@@ -783,6 +776,8 @@ impl ChatService {
                 .collect(),
             current_epoch: None,
             key_package_hashes: None,
+            metadata_blob_locator: metadata_blob_locator.map(|s| s.to_string().into()),
+            metadata_version,
             welcome_message: None,
             extra_data: Default::default(),
         };
