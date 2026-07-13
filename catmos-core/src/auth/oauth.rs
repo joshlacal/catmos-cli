@@ -4,7 +4,10 @@ use axum::extract::{Query, State};
 use axum::response::Html;
 use axum::routing::get;
 use axum::Router;
+use base64::Engine as _;
+use rand::RngCore;
 use tokio::sync::oneshot;
+use url::Url;
 
 use crate::error::{CatmosError, Result};
 use crate::storage::db::Database;
@@ -17,10 +20,22 @@ pub struct OAuthAuth {
     pub nest_url: String,
 }
 
-/// The callback from nest redirects to `http://127.0.0.1:{port}/callback?session_id={UUID}`.
+/// The callback carries only a short-lived, single-use exchange code.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CallbackParams {
-    session_id: Option<String>,
+    code: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ExchangeRequest<'a> {
+    code: &'a str,
+    browser_nonce: &'a str,
+}
+
+#[derive(serde::Deserialize)]
+struct ExchangeResponse {
+    session_id: String,
 }
 
 /// Response from `GET {nest_url}/auth/session` with the session cookie.
@@ -37,7 +52,133 @@ pub struct OAuthSessionInfo {
 }
 
 struct CallbackState {
-    tx: std::sync::Mutex<Option<oneshot::Sender<String>>>,
+    pending: std::sync::Mutex<Option<PendingCallback>>,
+}
+
+struct PendingCallback {
+    tx: oneshot::Sender<PendingExchange>,
+    browser_nonce: String,
+}
+
+struct PendingExchange {
+    code: String,
+    browser_nonce: String,
+}
+
+impl CallbackState {
+    fn new(tx: oneshot::Sender<PendingExchange>, browser_nonce: String) -> Self {
+        Self {
+            pending: std::sync::Mutex::new(Some(PendingCallback { tx, browser_nonce })),
+        }
+    }
+
+    fn deliver(&self, code: String) -> bool {
+        if code.len() != 43
+            || !code
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return false;
+        }
+        let Some(pending) = self.pending.lock().unwrap().take() else {
+            return false;
+        };
+        pending
+            .tx
+            .send(PendingExchange {
+                code,
+                browser_nonce: pending.browser_nonce,
+            })
+            .is_ok()
+    }
+}
+
+const MAX_EXCHANGE_RESPONSE_BYTES: usize = 16 * 1024;
+
+fn generate_browser_nonce() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn build_login_url(
+    nest_url: &str,
+    handle: &str,
+    redirect_to: &str,
+    browser_nonce: &str,
+) -> Result<Url> {
+    let mut url = Url::parse(&format!("{}/auth/login", nest_url.trim_end_matches('/')))
+        .map_err(|e| CatmosError::Network(format!("invalid Nest URL: {e}")))?;
+    url.query_pairs_mut()
+        .append_pair("identifier", handle)
+        .append_pair("client", "catmos")
+        .append_pair("redirect_to", redirect_to)
+        .append_pair("browser_nonce", browser_nonce);
+    Ok(url)
+}
+
+fn build_oauth_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(tokio::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| CatmosError::Network(format!("failed to build HTTP client: {e}")))
+}
+
+async fn read_bounded_response(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_EXCHANGE_RESPONSE_BYTES as u64)
+    {
+        return Err(CatmosError::AuthFailed(
+            "OAuth exchange response exceeded size limit".into(),
+        ));
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| CatmosError::Network(format!("failed to read OAuth exchange response: {e}")))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_EXCHANGE_RESPONSE_BYTES {
+            return Err(CatmosError::AuthFailed(
+                "OAuth exchange response exceeded size limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn redeem_exchange(
+    http: &reqwest::Client,
+    nest_url: &str,
+    origin: &str,
+    code: &str,
+    browser_nonce: &str,
+) -> Result<String> {
+    let response = http
+        .post(format!("{}/auth/exchange", nest_url.trim_end_matches('/')))
+        .header(reqwest::header::ORIGIN, origin)
+        .json(&ExchangeRequest {
+            code,
+            browser_nonce,
+        })
+        .send()
+        .await
+        .map_err(|e| CatmosError::Network(format!("OAuth exchange failed: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(CatmosError::AuthFailed("OAuth exchange failed".into()));
+    }
+    let body = read_bounded_response(response).await?;
+    let exchange: ExchangeResponse = serde_json::from_slice(&body)
+        .map_err(|_| CatmosError::AuthFailed("OAuth exchange failed".into()))?;
+    if exchange.session_id.is_empty() {
+        return Err(CatmosError::AuthFailed("OAuth exchange failed".into()));
+    }
+    Ok(exchange.session_id)
 }
 
 impl OAuthAuth {
@@ -45,8 +186,8 @@ impl OAuthAuth {
     ///
     /// 1. Bind a local TCP listener on a random port
     /// 2. Open the browser to the nest auth URL with a redirect back to localhost
-    /// 3. Wait up to 2 minutes for the callback with session_id
-    /// 4. Exchange session_id for DID and handle via `GET /auth/session`
+    /// 3. Wait up to 2 minutes for the callback with an opaque exchange code
+    /// 4. Redeem the code and locally retained nonce, then fetch session identity
     pub async fn login(handle: &str, nest_url: &str) -> Result<Self> {
         let nest_url = nest_url.trim_end_matches('/');
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -59,15 +200,14 @@ impl OAuthAuth {
             .port();
 
         let redirect_to = format!("http://127.0.0.1:{port}/callback");
-        let auth_url = format!(
-            "{nest_url}/auth/login?identifier={handle}&client=catmos-web&redirect_to={redirect_to}"
-        );
+        let redirect_url = Url::parse(&redirect_to)
+            .map_err(|e| CatmosError::Network(format!("invalid loopback redirect: {e}")))?;
+        let redirect_origin = redirect_url.origin().ascii_serialization();
+        let browser_nonce = generate_browser_nonce();
+        let auth_url = build_login_url(nest_url, handle, &redirect_to, &browser_nonce)?;
 
-        // Channel for the callback result (just the session_id)
-        let (tx, rx) = oneshot::channel::<String>();
-        let state = Arc::new(CallbackState {
-            tx: std::sync::Mutex::new(Some(tx)),
-        });
+        let (tx, rx) = oneshot::channel::<PendingExchange>();
+        let state = Arc::new(CallbackState::new(tx, browser_nonce));
 
         let app = Router::new()
             .route("/callback", get(handle_callback))
@@ -75,7 +215,7 @@ impl OAuthAuth {
 
         // Open the browser
         tracing::info!("Opening browser for authentication...");
-        if let Err(e) = open::that(&auth_url) {
+        if let Err(e) = open::that(auth_url.as_str()) {
             tracing::warn!("Failed to open browser: {e}");
             eprintln!("Open this URL in your browser to log in:\n  {auth_url}");
         }
@@ -85,7 +225,7 @@ impl OAuthAuth {
         let timeout = tokio::time::Duration::from_secs(120);
 
         // Race the server against a 2-minute timeout
-        let session_id = tokio::select! {
+        let pending = tokio::select! {
             result = rx => {
                 result.map_err(|_| CatmosError::AuthFailed("callback channel closed".into()))
             }
@@ -100,8 +240,17 @@ impl OAuthAuth {
             }
         }?;
 
-        // Exchange session_id for DID + handle via GET /auth/session
-        let http = reqwest::Client::new();
+        let http = build_oauth_http_client()?;
+        let session_id = redeem_exchange(
+            &http,
+            nest_url,
+            &redirect_origin,
+            &pending.code,
+            &pending.browser_nonce,
+        )
+        .await?;
+
+        // Fetch DID + handle with the newly issued credential.
         let session_resp = http
             .get(format!("{nest_url}/auth/session"))
             .header("Cookie", format!("catbird_session={session_id}"))
@@ -202,16 +351,103 @@ impl OAuthAuth {
     }
 }
 
+async fn handle_callback(
+    State(state): State<Arc<CallbackState>>,
+    Query(params): Query<CallbackParams>,
+) -> Html<String> {
+    let code = match params.code {
+        Some(s) => s,
+        None => {
+            return Html(
+                "<html><body><h1>Login failed</h1><p>Missing exchange code.</p></body></html>"
+                    .to_string(),
+            );
+        }
+    };
+
+    if !state.deliver(code) {
+        return Html(
+            "<html><body><h1>Login failed</h1><p>This callback was already used.</p></body></html>"
+                .to_string(),
+        );
+    }
+
+    Html(
+        "<html><body><h1>Login successful!</h1><p>You can close this tab and return to the terminal.</p></body></html>"
+            .to_string(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::json;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn callback_accepts_only_an_opaque_exchange_code() {
+        let params: CallbackParams =
+            serde_json::from_value(json!({ "code": "opaque-exchange-code" })).unwrap();
+        assert_eq!(params.code.as_deref(), Some("opaque-exchange-code"));
+
+        assert!(serde_json::from_value::<CallbackParams>(
+            json!({ "session_id": "live-session-credential" })
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn callback_atomically_consumes_the_locally_retained_nonce() {
+        let (tx, rx) = oneshot::channel();
+        let state = CallbackState::new(tx, "local-browser-nonce".to_string());
+
+        let code = "A".repeat(43);
+        assert!(state.deliver(code.clone()));
+        assert!(!state.deliver("B".repeat(43)));
+
+        let pending = rx.await.unwrap();
+        assert_eq!(pending.code, code);
+        assert_eq!(pending.browser_nonce, "local-browser-nonce");
+    }
+
+    #[tokio::test]
+    async fn callback_rejects_malformed_code_without_consuming_nonce() {
+        let (tx, rx) = oneshot::channel();
+        let state = CallbackState::new(tx, "local-browser-nonce".to_string());
+
+        assert!(!state.deliver("not-an-exchange-code".to_string()));
+        assert!(state.deliver("A".repeat(43)));
+        assert_eq!(rx.await.unwrap().code, "A".repeat(43));
+    }
+
+    #[test]
+    fn login_url_binds_nonce_and_exact_loopback_redirect() {
+        let url = build_login_url(
+            "https://api.catbird.blue",
+            "alice.test",
+            "http://127.0.0.1:49152/callback",
+            "0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+
+        assert_eq!(query.get("identifier").unwrap(), "alice.test");
+        assert_eq!(query.get("client").unwrap(), "catmos");
+        assert_eq!(
+            query.get("redirect_to").unwrap(),
+            "http://127.0.0.1:49152/callback"
+        );
+        assert_eq!(
+            query.get("browser_nonce").unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
+    }
 
     async fn session_handler(headers: HeaderMap) -> impl IntoResponse {
         let cookie = headers
@@ -241,6 +477,106 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    async fn exchange_handler(
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        assert_eq!(
+            headers.get("origin").and_then(|value| value.to_str().ok()),
+            Some("http://127.0.0.1:49152")
+        );
+        assert_eq!(body["code"], "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(body["browser_nonce"], "0123456789abcdef0123456789abcdef");
+        Json(json!({ "session_id": "new-session-credential" }))
+    }
+
+    async fn oversized_exchange_handler() -> impl IntoResponse {
+        "x".repeat(MAX_EXCHANGE_RESPONSE_BYTES + 1)
+    }
+
+    async fn spawn_exchange_server(oversized: bool) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let app = if oversized {
+            Router::new().route("/auth/exchange", post(oversized_exchange_handler))
+        } else {
+            Router::new().route("/auth/exchange", post(exchange_handler))
+        };
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn exchange_posts_code_nonce_and_exact_origin() {
+        let nest_url = spawn_exchange_server(false).await;
+        let session = redeem_exchange(
+            &reqwest::Client::new(),
+            &nest_url,
+            "http://127.0.0.1:49152",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session, "new-session-credential");
+    }
+
+    #[tokio::test]
+    async fn exchange_rejects_oversized_response() {
+        let nest_url = spawn_exchange_server(true).await;
+        let error = redeem_exchange(
+            &reqwest::Client::new(),
+            &nest_url,
+            "http://127.0.0.1:49152",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exceeded size limit"));
+    }
+
+    #[tokio::test]
+    async fn exchange_never_follows_redirects_with_credentials() {
+        let followed = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let counter = followed.clone();
+        let app = Router::new()
+            .route(
+                "/auth/exchange",
+                post(|| async { (StatusCode::FOUND, [("location", "/credential-sink")]) }),
+            )
+            .route(
+                "/credential-sink",
+                get(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "session_id": "stolen" }))
+                    }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = redeem_exchange(
+            &build_oauth_http_client().unwrap(),
+            &format!("http://{addr}"),
+            "http://127.0.0.1:49152",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("OAuth exchange failed"));
+        assert_eq!(followed.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -277,29 +613,4 @@ mod tests {
             "unexpected error: {err}"
         );
     }
-}
-
-async fn handle_callback(
-    State(state): State<Arc<CallbackState>>,
-    Query(params): Query<CallbackParams>,
-) -> Html<String> {
-    let session_id = match params.session_id {
-        Some(s) => s,
-        None => {
-            return Html(
-                "<html><body><h1>Login failed</h1><p>Missing session_id parameter.</p></body></html>"
-                    .to_string(),
-            );
-        }
-    };
-
-    // Send session_id through the channel
-    if let Some(tx) = state.tx.lock().unwrap().take() {
-        let _ = tx.send(session_id);
-    }
-
-    Html(
-        "<html><body><h1>Login successful!</h1><p>You can close this tab and return to the terminal.</p></body></html>"
-            .to_string(),
-    )
 }
