@@ -39,7 +39,7 @@ struct ExchangeResponse {
 }
 
 /// Response from `GET {nest_url}/auth/session` with the session cookie.
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct SessionResponse {
     did: String,
     handle: String,
@@ -93,7 +93,7 @@ impl CallbackState {
     }
 }
 
-const MAX_EXCHANGE_RESPONSE_BYTES: usize = 16 * 1024;
+const MAX_OAUTH_RESPONSE_BYTES: usize = 16 * 1024;
 
 fn generate_browser_nonce() -> String {
     let mut bytes = [0_u8; 32];
@@ -128,10 +128,10 @@ fn build_oauth_http_client() -> Result<reqwest::Client> {
 async fn read_bounded_response(mut response: reqwest::Response) -> Result<Vec<u8>> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_EXCHANGE_RESPONSE_BYTES as u64)
+        .is_some_and(|length| length > MAX_OAUTH_RESPONSE_BYTES as u64)
     {
         return Err(CatmosError::AuthFailed(
-            "OAuth exchange response exceeded size limit".into(),
+            "OAuth response exceeded size limit".into(),
         ));
     }
 
@@ -141,14 +141,42 @@ async fn read_bounded_response(mut response: reqwest::Response) -> Result<Vec<u8
         .await
         .map_err(|e| CatmosError::Network(format!("failed to read OAuth exchange response: {e}")))?
     {
-        if body.len().saturating_add(chunk.len()) > MAX_EXCHANGE_RESPONSE_BYTES {
+        if body.len().saturating_add(chunk.len()) > MAX_OAUTH_RESPONSE_BYTES {
             return Err(CatmosError::AuthFailed(
-                "OAuth exchange response exceeded size limit".into(),
+                "OAuth response exceeded size limit".into(),
             ));
         }
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+async fn fetch_session_info(
+    http: &reqwest::Client,
+    nest_url: &str,
+    session_id: &str,
+) -> Result<SessionResponse> {
+    let response = http
+        .get(format!("{}/auth/session", nest_url.trim_end_matches('/')))
+        .header("Cookie", format!("catbird_session={session_id}"))
+        .send()
+        .await
+        .map_err(|e| CatmosError::Network(format!("failed to validate OAuth session: {e}")))?;
+    let status = response.status();
+    let body = read_bounded_response(response).await;
+
+    if !status.is_success() {
+        // Drain through the bounded reader, but never surface an upstream body
+        // (which may contain credentials or attacker-controlled diagnostics).
+        let _ = body;
+        return Err(CatmosError::AuthFailed(
+            "OAuth session validation failed".into(),
+        ));
+    }
+
+    let body = body?;
+    serde_json::from_slice(&body)
+        .map_err(|_| CatmosError::AuthFailed("OAuth session validation failed".into()))
 }
 
 async fn redeem_exchange(
@@ -251,23 +279,7 @@ impl OAuthAuth {
         .await?;
 
         // Fetch DID + handle with the newly issued credential.
-        let session_resp = http
-            .get(format!("{nest_url}/auth/session"))
-            .header("Cookie", format!("catbird_session={session_id}"))
-            .send()
-            .await
-            .map_err(|e| CatmosError::Network(format!("failed to fetch session: {e}")))?;
-
-        if !session_resp.status().is_success() {
-            let body = session_resp.text().await.unwrap_or_default();
-            return Err(CatmosError::AuthFailed(format!(
-                "session endpoint returned error: {body}"
-            )));
-        }
-
-        let session_info: SessionResponse = session_resp.json().await.map_err(|e| {
-            CatmosError::AuthFailed(format!("failed to parse session response: {e}"))
-        })?;
+        let session_info = fetch_session_info(&http, nest_url, &session_id).await?;
 
         Ok(Self {
             session_cookie: session_id,
@@ -316,26 +328,9 @@ impl OAuthAuth {
     /// JWTs, so a stale cookie must fail fast instead of letting the first MLS
     /// maintenance request surface a noisy 401.
     pub async fn validate_for_did(&self, expected_did: &str) -> Result<OAuthSessionInfo> {
-        let http = reqwest::Client::new();
+        let http = build_oauth_http_client()?;
         let nest_url = self.nest_url.trim_end_matches('/');
-        let session_resp = http
-            .get(format!("{nest_url}/auth/session"))
-            .header("Cookie", format!("catbird_session={}", self.session_cookie))
-            .send()
-            .await
-            .map_err(|e| CatmosError::Network(format!("failed to validate OAuth session: {e}")))?;
-
-        if !session_resp.status().is_success() {
-            let status = session_resp.status();
-            let body = session_resp.text().await.unwrap_or_default();
-            return Err(CatmosError::AuthFailed(format!(
-                "restored OAuth session is invalid ({status}): {body}. Run `catmos login` again."
-            )));
-        }
-
-        let session_info: SessionResponse = session_resp.json().await.map_err(|e| {
-            CatmosError::AuthFailed(format!("failed to parse restored OAuth session: {e}"))
-        })?;
+        let session_info = fetch_session_info(&http, nest_url, &self.session_cookie).await?;
 
         if session_info.did != expected_did || self.did != expected_did {
             return Err(CatmosError::AuthFailed(format!(
@@ -381,8 +376,9 @@ async fn handle_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
     use axum::http::{HeaderMap, StatusCode};
-    use axum::response::IntoResponse;
+    use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::json;
@@ -493,7 +489,25 @@ mod tests {
     }
 
     async fn oversized_exchange_handler() -> impl IntoResponse {
-        "x".repeat(MAX_EXCHANGE_RESPONSE_BYTES + 1)
+        "x".repeat(MAX_OAUTH_RESPONSE_BYTES + 1)
+    }
+
+    fn chunked_oversized_response(status: StatusCode) -> Response {
+        let chunks = futures_util::stream::iter([
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(vec![
+                b'x';
+                MAX_OAUTH_RESPONSE_BYTES
+            ])),
+            Ok(bytes::Bytes::from_static(b"x")),
+        ]);
+        Response::builder()
+            .status(status)
+            .body(Body::from_stream(chunks))
+            .unwrap()
+    }
+
+    async fn chunked_oversized_exchange_handler() -> Response {
+        chunked_oversized_response(StatusCode::OK)
     }
 
     async fn spawn_exchange_server(oversized: bool) -> String {
@@ -540,6 +554,102 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("exceeded size limit"));
+    }
+
+    #[tokio::test]
+    async fn exchange_rejects_chunked_oversized_response_without_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let app = Router::new().route("/auth/exchange", post(chunked_oversized_exchange_handler));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = redeem_exchange(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            "http://127.0.0.1:49152",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exceeded size limit"));
+    }
+
+    #[tokio::test]
+    async fn identity_hydration_rejects_oversized_success_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/auth/session",
+            get(|| async { "x".repeat(MAX_OAUTH_RESPONSE_BYTES + 1) }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = fetch_session_info(&reqwest::Client::new(), &format!("http://{addr}"), "token")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exceeded size limit"));
+    }
+
+    #[tokio::test]
+    async fn identity_hydration_rejects_chunked_oversized_success_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/auth/session",
+            get(|| async { chunked_oversized_response(StatusCode::OK) }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = fetch_session_info(&reqwest::Client::new(), &format!("http://{addr}"), "token")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exceeded size limit"));
+    }
+
+    #[tokio::test]
+    async fn identity_hydration_sanitizes_error_body_after_bounded_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/auth/session",
+            get(|| async { (StatusCode::UNAUTHORIZED, "sensitive-upstream-detail") }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = fetch_session_info(&reqwest::Client::new(), &format!("http://{addr}"), "token")
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert_eq!(
+            message,
+            "Authentication failed: OAuth session validation failed"
+        );
+        assert!(!message.contains("sensitive-upstream-detail"));
+    }
+
+    #[tokio::test]
+    async fn identity_hydration_sanitizes_chunked_oversized_error_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/auth/session",
+            get(|| async { chunked_oversized_response(StatusCode::UNAUTHORIZED) }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = fetch_session_info(&reqwest::Client::new(), &format!("http://{addr}"), "token")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Authentication failed: OAuth session validation failed"
+        );
     }
 
     #[tokio::test]
