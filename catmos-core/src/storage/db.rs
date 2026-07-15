@@ -1045,10 +1045,14 @@ impl Database {
         convo_id: &str,
         expected_generation: i64,
         expected_new_target: &str,
+        landed_epoch: u64,
     ) -> Result<bool> {
+        let landed_epoch = i64::try_from(landed_epoch)
+            .map_err(|_| CatmosError::Storage("landed reset epoch exceeds SQLite range".into()))?;
         let result = sqlx::query(
             "UPDATE conversations
              SET group_id = ?1,
+                 epoch = ?4,
                  reset_new_group_id = NULL,
                  reset_generation = NULL,
                  reset_notified_at_ms = NULL,
@@ -1062,6 +1066,7 @@ impl Database {
         .bind(expected_new_target)
         .bind(convo_id)
         .bind(expected_generation)
+        .bind(landed_epoch)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -1156,17 +1161,17 @@ mod reset_pending_tests {
         assert_eq!(pre, old_group_id);
 
         assert!(!db
-            .complete_reset_pending(convo_id, 0, new_group_id)
+            .complete_reset_pending(convo_id, 0, new_group_id, 1)
             .await
             .unwrap());
         assert!(!db
-            .complete_reset_pending(convo_id, 1, "attacker-group")
+            .complete_reset_pending(convo_id, 1, "attacker-group", 1)
             .await
             .unwrap());
         assert_eq!(read_group_id(&db, convo_id).await, old_group_id);
 
         assert!(db
-            .complete_reset_pending(convo_id, 1, new_group_id)
+            .complete_reset_pending(convo_id, 1, new_group_id, 1)
             .await
             .unwrap());
 
@@ -1181,6 +1186,53 @@ mod reset_pending_tests {
             .unwrap()
             .reset
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn completion_atomically_projects_landed_epoch_and_preserves_mismatch() {
+        let path =
+            std::env::temp_dir().join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_unencrypted(&path).await.unwrap();
+        let convo_id = "convo-landed-epoch";
+        db.store_conversation(&fixture_convo(convo_id, "old-group"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET epoch = 741 WHERE conversation_id = ?1")
+            .bind(convo_id)
+            .execute(db.pool_for_test())
+            .await
+            .unwrap();
+        db.mark_needs_rejoin(convo_id).await.unwrap();
+        db.mark_reset_pending(convo_id, "new-group", 23, 1_717_000_000_023)
+            .await
+            .unwrap();
+
+        let snapshot = || async {
+            sqlx::query_as::<_, (String, i64, Option<String>, Option<i64>, Option<i64>, i64)>(
+                "SELECT group_id, epoch, reset_new_group_id, reset_generation,
+                        reset_notified_at_ms, needs_rejoin
+                 FROM conversations WHERE conversation_id = ?1",
+            )
+            .bind(convo_id)
+            .fetch_one(db.pool_for_test())
+            .await
+            .unwrap()
+        };
+        let pending = snapshot().await;
+        assert!(!db
+            .complete_reset_pending(convo_id, 22, "new-group", 3)
+            .await
+            .unwrap());
+        assert_eq!(snapshot().await, pending, "mismatch preserves every field");
+
+        assert!(db
+            .complete_reset_pending(convo_id, 23, "new-group", 3)
+            .await
+            .unwrap());
+        assert_eq!(
+            snapshot().await,
+            ("new-group".into(), 3, None, None, None, 0)
+        );
     }
 
     #[tokio::test]

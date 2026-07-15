@@ -451,6 +451,15 @@ impl ChatService {
     /// `MAX_REJOIN_ATTEMPTS`, transition to `UNRECOVERABLE_LOCAL` and fire
     /// `reportRecoveryFailure`.
     pub async fn external_commit_rejoin(&self, convo_id: &str) -> Result<()> {
+        self.external_commit_rejoin_with_policy(convo_id, true)
+            .await
+    }
+
+    async fn external_commit_rejoin_with_policy(
+        &self,
+        convo_id: &str,
+        clear_needs_rejoin_on_success: bool,
+    ) -> Result<()> {
         let convo_label = &convo_id[..12.min(convo_id.len())];
 
         // 1. Gate on tracker (max-attempts / per-convo cooldown / global floor)
@@ -620,12 +629,14 @@ impl ChatService {
                 }
                 self.groupinfo_404_tracker.lock().await.clear(convo_id);
                 self.reset_recovery_counters(convo_id).await;
-                if let Err(e) = self.db.clear_needs_rejoin(convo_id).await {
-                    warn!(
-                        convo = %convo_label,
-                        error = %e,
-                        "Failed to clear NEEDS_REJOIN flag after success"
-                    );
+                if clear_needs_rejoin_on_success {
+                    if let Err(e) = self.db.clear_needs_rejoin(convo_id).await {
+                        warn!(
+                            convo = %convo_label,
+                            error = %e,
+                            "Failed to clear NEEDS_REJOIN flag after success"
+                        );
+                    }
                 }
                 info!(convo = %convo_label, "External Commit rejoin succeeded");
             }
@@ -762,7 +773,8 @@ impl ChatService {
             self.groupinfo_404_tracker.lock().await.clear(convo_id);
 
             // Step 1: try Welcome. Cheapest, no MLS state mutation.
-            if let Some(winner_group_id) = self.try_pending_welcome(convo_id).await {
+            if let Some((winner_group_id, landed_epoch)) = self.try_pending_welcome(convo_id).await
+            {
                 let adopted = match self
                     .db
                     .adopt_reset_pending_target(
@@ -802,6 +814,7 @@ impl ChatService {
                             convo_id,
                             payload.reset_generation,
                             &winner_group_id,
+                            landed_epoch,
                         )
                         .await
                     {
@@ -828,16 +841,38 @@ impl ChatService {
             // Step 2: try External Commit. Internally fetches GroupInfo;
             // returns Err with `is_group_info_unavailable` when the server has
             // none yet (post-reset window before any responder publishes).
-            match self.external_commit_rejoin(convo_id).await {
+            match self
+                .external_commit_rejoin_with_policy(convo_id, false)
+                .await
+            {
                 Ok(()) => {
                     let authoritative = self.fetch_authoritative_group_id(convo_id).await;
                     if matches!(&authoritative, Ok(Some(group)) if group == &payload.new_group_id) {
+                        let landed_epoch = match hex::decode(&payload.new_group_id)
+                            .map_err(|e| e.to_string())
+                            .and_then(|group_id| {
+                                self.mls
+                                    .with_context(|ctx| ctx.get_epoch(group_id))
+                                    .map_err(|e| e.to_string())
+                            }) {
+                            Ok(epoch) => epoch,
+                            Err(error) => {
+                                warn!(
+                                    convo = %&convo_id[..12.min(convo_id.len())],
+                                    error = %error,
+                                    "deferred_recovery: refusing External Commit completion without target epoch"
+                                );
+                                tokio::time::sleep(constants::DEFERRED_RECOVERY_PAUSE).await;
+                                continue;
+                            }
+                        };
                         match self
                             .db
                             .complete_reset_pending(
                                 convo_id,
                                 payload.reset_generation,
                                 &payload.new_group_id,
+                                landed_epoch,
                             )
                             .await
                         {
@@ -1127,7 +1162,7 @@ impl ChatService {
     /// caller falls through to the next ladder step in either case — a
     /// processing failure here is not fatal because External Commit and
     /// bootstrap remain as fallbacks).
-    async fn try_pending_welcome(&self, convo_id: &str) -> Option<String> {
+    async fn try_pending_welcome(&self, convo_id: &str) -> Option<(String, u64)> {
         let convo_label = &convo_id[..12.min(convo_id.len())];
         let welcome_b64 = match self.mls.fetch_pending_welcome(self, convo_id).await {
             Ok(Some(w)) => w,
@@ -1195,7 +1230,19 @@ impl ChatService {
                         "try_pending_welcome: bootstrap_group_metadata failed (non-fatal; will retry next cycle)"
                     );
                 }
-                Some(group_id_hex)
+                let landed_epoch = match self.mls.with_context(|ctx| ctx.get_epoch(group_id)) {
+                    Ok(epoch) => epoch,
+                    Err(e) => {
+                        warn!(
+                            convo = %convo_label,
+                            group = %group_id_hex,
+                            error = %e,
+                            "try_pending_welcome: refusing reset completion without target epoch"
+                        );
+                        return None;
+                    }
+                };
+                Some((group_id_hex, landed_epoch))
             }
             Err(e) => {
                 warn!(
@@ -1349,6 +1396,21 @@ impl ChatService {
             )
             .await;
 
+        let landed_epoch = match self
+            .mls
+            .with_context(|ctx| ctx.get_epoch(new_group_id_bytes.clone()))
+        {
+            Ok(epoch) => epoch,
+            Err(e) => {
+                warn!(
+                    convo = %convo_label,
+                    error = %e,
+                    "bootstrap: refusing reset completion without target epoch"
+                );
+                return;
+            }
+        };
+
         match submit_result {
             Ok(()) => {
                 info!(
@@ -1363,6 +1425,7 @@ impl ChatService {
                         convo_id,
                         payload.reset_generation,
                         &payload.new_group_id,
+                        landed_epoch,
                     )
                     .await
                 {
