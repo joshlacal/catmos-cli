@@ -762,18 +762,65 @@ impl ChatService {
             self.groupinfo_404_tracker.lock().await.clear(convo_id);
 
             // Step 1: try Welcome. Cheapest, no MLS state mutation.
-            if self.try_pending_welcome(convo_id).await {
-                if let Err(e) = self.db.clear_reset_pending(convo_id).await {
-                    warn!(
-                        convo = %&convo_id[..12.min(convo_id.len())],
-                        error = %e,
-                        "deferred_recovery: failed to clear RESET_PENDING after Welcome"
-                    );
+            if let Some(winner_group_id) = self.try_pending_welcome(convo_id).await {
+                let adopted = match self
+                    .db
+                    .adopt_reset_pending_target(
+                        convo_id,
+                        payload.reset_generation,
+                        &payload.new_group_id,
+                        &winner_group_id,
+                    )
+                    .await
+                {
+                    Ok(true) => true,
+                    Ok(false) => self
+                        .db
+                        .reset_pending_matches(convo_id, payload.reset_generation, &winner_group_id)
+                        .await
+                        .unwrap_or(false),
+                    Err(e) => {
+                        warn!(
+                            convo = %&convo_id[..12.min(convo_id.len())],
+                            error = %e,
+                            "deferred_recovery: winner-target CAS errored; rereading commit-ambiguous authority"
+                        );
+                        self.db
+                            .reset_pending_matches(
+                                convo_id,
+                                payload.reset_generation,
+                                &winner_group_id,
+                            )
+                            .await
+                            .unwrap_or(false)
+                    }
+                };
+                if adopted {
+                    match self
+                        .db
+                        .complete_reset_pending(
+                            convo_id,
+                            payload.reset_generation,
+                            &winner_group_id,
+                        )
+                        .await
+                    {
+                        Ok(true) => info!(
+                            convo = %&convo_id[..12.min(convo_id.len())],
+                            group = %winner_group_id,
+                            "deferred_recovery: RESET_PENDING adopted via verified Welcome"
+                        ),
+                        Ok(false) => warn!(
+                            convo = %&convo_id[..12.min(convo_id.len())],
+                            "deferred_recovery: exact RESET_PENDING completion lost its CAS"
+                        ),
+                        Err(e) => warn!(
+                            convo = %&convo_id[..12.min(convo_id.len())],
+                            error = %e,
+                            "deferred_recovery: exact RESET_PENDING completion errored"
+                        ),
+                    }
                 }
-                info!(
-                    convo = %&convo_id[..12.min(convo_id.len())],
-                    "deferred_recovery: RESET_PENDING adopted via Welcome"
-                );
                 tokio::time::sleep(constants::DEFERRED_RECOVERY_PAUSE).await;
                 continue;
             }
@@ -783,11 +830,33 @@ impl ChatService {
             // none yet (post-reset window before any responder publishes).
             match self.external_commit_rejoin(convo_id).await {
                 Ok(()) => {
-                    if let Err(e) = self.db.clear_reset_pending(convo_id).await {
+                    let authoritative = self.fetch_authoritative_group_id(convo_id).await;
+                    if matches!(&authoritative, Ok(Some(group)) if group == &payload.new_group_id) {
+                        match self
+                            .db
+                            .complete_reset_pending(
+                                convo_id,
+                                payload.reset_generation,
+                                &payload.new_group_id,
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => warn!(
+                                convo = %&convo_id[..12.min(convo_id.len())],
+                                "deferred_recovery: External Commit completion lost its exact reset CAS"
+                            ),
+                            Err(e) => warn!(
+                                convo = %&convo_id[..12.min(convo_id.len())],
+                                error = %e,
+                                "deferred_recovery: External Commit completion errored"
+                            ),
+                        }
+                    } else {
                         warn!(
                             convo = %&convo_id[..12.min(convo_id.len())],
-                            error = %e,
-                            "deferred_recovery: failed to clear RESET_PENDING after External Commit"
+                            expected_group = %payload.new_group_id,
+                            "deferred_recovery: preserving RESET_PENDING because fresh server view did not bind External Commit target"
                         );
                     }
                     info!(
@@ -1051,23 +1120,25 @@ impl ChatService {
     // ── §8.5 Phase 1 ladder helpers (Welcome → ExternalCommit → Bootstrap) ──
 
     /// Try to adopt the post-reset group via a server-published Welcome.
-    /// Returns `true` if a Welcome existed and was processed successfully.
-    /// Returns `false` if no Welcome is available or processing failed (the
+    /// Returns the processed group only when a fresh server conversation view
+    /// binds it to this stable conversation. Returns `None` if no Welcome is
+    /// available, processing failed, or the authoritative binding is absent
+    /// (the
     /// caller falls through to the next ladder step in either case — a
     /// processing failure here is not fatal because External Commit and
     /// bootstrap remain as fallbacks).
-    async fn try_pending_welcome(&self, convo_id: &str) -> bool {
+    async fn try_pending_welcome(&self, convo_id: &str) -> Option<String> {
         let convo_label = &convo_id[..12.min(convo_id.len())];
         let welcome_b64 = match self.mls.fetch_pending_welcome(self, convo_id).await {
             Ok(Some(w)) => w,
-            Ok(None) => return false,
+            Ok(None) => return None,
             Err(e) => {
                 debug!(
                     convo = %convo_label,
                     error = %e,
                     "try_pending_welcome: getGroupState include=welcome failed"
                 );
-                return false;
+                return None;
             }
         };
 
@@ -1075,6 +1146,39 @@ impl ChatService {
         match self.mls.process_welcome_b64(&welcome_b64, &did) {
             Ok(group_id) => {
                 let group_id_hex = hex::encode(&group_id);
+                match self.fetch_authoritative_group_id(convo_id).await {
+                    Ok(Some(authoritative_group)) if authoritative_group == group_id_hex => {}
+                    Ok(Some(authoritative_group)) => {
+                        warn!(
+                            convo = %convo_label,
+                            processed_group = %group_id_hex,
+                            authoritative_group = %authoritative_group,
+                            "try_pending_welcome: processed Welcome is not the authoritative server group"
+                        );
+                        let _ = self.mls.with_context(|ctx| {
+                            let _ = ctx.delete_group(group_id.clone());
+                            Ok::<_, catbird_mls::MLSError>(())
+                        });
+                        return None;
+                    }
+                    Ok(None) => {
+                        warn!(
+                            convo = %convo_label,
+                            group = %group_id_hex,
+                            "try_pending_welcome: stable conversation absent from fresh server view; preserving local group and reset authority"
+                        );
+                        return None;
+                    }
+                    Err(e) => {
+                        warn!(
+                            convo = %convo_label,
+                            group = %group_id_hex,
+                            error = %e,
+                            "try_pending_welcome: authoritative server binding unavailable; preserving local group and reset authority"
+                        );
+                        return None;
+                    }
+                }
                 info!(
                     convo = %convo_label,
                     group = %group_id_hex,
@@ -1091,7 +1195,7 @@ impl ChatService {
                         "try_pending_welcome: bootstrap_group_metadata failed (non-fatal; will retry next cycle)"
                     );
                 }
-                true
+                Some(group_id_hex)
             }
             Err(e) => {
                 warn!(
@@ -1099,7 +1203,7 @@ impl ChatService {
                     error = %e,
                     "try_pending_welcome: process_welcome failed (will retry next cycle)"
                 );
-                false
+                None
             }
         }
     }
@@ -1253,12 +1357,25 @@ impl ChatService {
                     reset_generation = payload.reset_generation,
                     "bootstrap: race won — clearing RESET_PENDING"
                 );
-                if let Err(e) = self.db.clear_reset_pending(convo_id).await {
-                    warn!(
+                match self
+                    .db
+                    .complete_reset_pending(
+                        convo_id,
+                        payload.reset_generation,
+                        &payload.new_group_id,
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        convo = %convo_label,
+                        "bootstrap: exact RESET_PENDING completion lost its CAS"
+                    ),
+                    Err(e) => warn!(
                         convo = %convo_label,
                         error = %e,
-                        "bootstrap: failed to clear RESET_PENDING after winning bootstrap"
-                    );
+                        "bootstrap: exact RESET_PENDING completion errored"
+                    ),
                 }
             }
             Err(e) if is_bootstrap_already_bootstrapped(&e) => {
@@ -1325,6 +1442,30 @@ impl ChatService {
             }
         }
         Ok(roster)
+    }
+
+    /// Fetch the unique current group bound to a stable conversation ID.
+    /// Ambiguous duplicate rows fail closed.
+    async fn fetch_authoritative_group_id(&self, convo_id: &str) -> Result<Option<String>> {
+        let resp: super::messages::GetConvosResp = self
+            .xrpc_query(catbird_atproto::catbird::mls_chat::get_convos::NSID, &[])
+            .await?;
+        let mut matches = resp.conversations.into_iter().filter(|conversation| {
+            conversation
+                .conversation_id
+                .as_deref()
+                .unwrap_or(&conversation.group_id)
+                == convo_id
+        });
+        let Some(first) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(CatmosError::Other(format!(
+                "ambiguous authoritative conversation rows for {convo_id}"
+            )));
+        }
+        Ok(Some(first.group_id))
     }
 }
 

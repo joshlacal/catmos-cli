@@ -978,26 +978,93 @@ impl Database {
         Ok(())
     }
 
-    /// Clear the persisted `RESET_PENDING` payload (after Phase 1 deferred
-    /// recovery succeeds in adopting the new group).
-    pub async fn clear_reset_pending(&self, convo_id: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-
-        // Swap group_id from the persisted reset_new_group_id, then clear all reset columns.
-        sqlx::query(
+    /// Atomically replace the target of an already committed ResetPending
+    /// tuple with a server-verified winner. A mismatch is a clean CAS miss.
+    pub async fn adopt_reset_pending_target(
+        &self,
+        convo_id: &str,
+        expected_generation: i64,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> Result<bool> {
+        if authoritative_new_target.is_empty() {
+            return Ok(false);
+        }
+        let result = sqlx::query(
             "UPDATE conversations
-             SET group_id = COALESCE(reset_new_group_id, group_id),
-                 reset_new_group_id = NULL,
-                 reset_generation = NULL,
-                 reset_notified_at_ms = NULL
-             WHERE conversation_id = ?1",
+             SET reset_new_group_id = ?1,
+                 needs_rejoin = 1
+             WHERE conversation_id = ?2
+               AND ?1 <> ''
+               AND reset_new_group_id = ?3
+               AND reset_new_group_id <> ''
+               AND reset_generation = ?4
+               AND reset_notified_at_ms IS NOT NULL",
+        )
+        .bind(authoritative_new_target)
+        .bind(convo_id)
+        .bind(expected_old_target)
+        .bind(expected_generation)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Reread durable ResetPending authority after a clean CAS miss or a
+    /// commit-ambiguous storage error.
+    pub async fn reset_pending_matches(
+        &self,
+        convo_id: &str,
+        expected_generation: i64,
+        expected_target: &str,
+    ) -> Result<bool> {
+        if expected_target.is_empty() {
+            return Ok(false);
+        }
+        let row = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM conversations
+             WHERE conversation_id = ?1
+               AND reset_new_group_id = ?2
+               AND reset_new_group_id <> ''
+               AND reset_generation = ?3
+               AND reset_notified_at_ms IS NOT NULL
+             LIMIT 1",
         )
         .bind(convo_id)
-        .execute(&mut *tx)
+        .bind(expected_target)
+        .bind(expected_generation)
+        .fetch_optional(&self.pool)
         .await?;
+        Ok(row.is_some())
+    }
 
-        tx.commit().await?;
-        Ok(())
+    /// Project a completed reset only when the durable generation and target
+    /// exactly match the MLS/server-verified group.
+    pub async fn complete_reset_pending(
+        &self,
+        convo_id: &str,
+        expected_generation: i64,
+        expected_new_target: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE conversations
+             SET group_id = ?1,
+                 reset_new_group_id = NULL,
+                 reset_generation = NULL,
+                 reset_notified_at_ms = NULL,
+                 needs_rejoin = 0
+             WHERE conversation_id = ?2
+               AND reset_new_group_id = ?1
+               AND reset_new_group_id <> ''
+               AND reset_generation = ?3
+               AND reset_notified_at_ms IS NOT NULL",
+        )
+        .bind(expected_new_target)
+        .bind(convo_id)
+        .bind(expected_generation)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn get_members(&self, group_id: &str) -> Result<Vec<Member>> {
@@ -1069,7 +1136,7 @@ mod reset_pending_tests {
     }
 
     #[tokio::test]
-    async fn clear_reset_pending_swaps_group_id() {
+    async fn complete_reset_pending_requires_exact_generation_and_target() {
         let path =
             std::env::temp_dir().join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open_unencrypted(&path).await.unwrap();
@@ -1088,13 +1155,85 @@ mod reset_pending_tests {
         let pre = read_group_id(&db, convo_id).await;
         assert_eq!(pre, old_group_id);
 
-        db.clear_reset_pending(convo_id).await.unwrap();
+        assert!(!db
+            .complete_reset_pending(convo_id, 0, new_group_id)
+            .await
+            .unwrap());
+        assert!(!db
+            .complete_reset_pending(convo_id, 1, "attacker-group")
+            .await
+            .unwrap());
+        assert_eq!(read_group_id(&db, convo_id).await, old_group_id);
+
+        assert!(db
+            .complete_reset_pending(convo_id, 1, new_group_id)
+            .await
+            .unwrap());
 
         let post = read_group_id(&db, convo_id).await;
         assert_eq!(
             post, new_group_id,
-            "clear_reset_pending must swap group_id from reset_new_group_id"
+            "exact completion must project the verified reset target"
         );
+        assert!(db
+            .get_recovery_flags(convo_id)
+            .await
+            .unwrap()
+            .reset
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn adopt_reset_pending_target_is_exact_and_preserves_authority() {
+        let path =
+            std::env::temp_dir().join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_unencrypted(&path).await.unwrap();
+        let convo_id = "convo-competing-reset-winners";
+        db.store_conversation(&fixture_convo(convo_id, "old-group"))
+            .await
+            .unwrap();
+        db.mark_needs_rejoin(convo_id).await.unwrap();
+        db.mark_reset_pending(convo_id, "losing-group", 23, 1_717_000_000_023)
+            .await
+            .unwrap();
+
+        assert!(!db
+            .adopt_reset_pending_target(convo_id, 23, "losing-group", "")
+            .await
+            .unwrap());
+
+        assert!(!db
+            .adopt_reset_pending_target(convo_id, 22, "losing-group", "winner-a")
+            .await
+            .unwrap());
+        assert!(!db
+            .adopt_reset_pending_target(convo_id, 23, "other-loser", "winner-a")
+            .await
+            .unwrap());
+        assert!(db
+            .adopt_reset_pending_target(convo_id, 23, "losing-group", "winner-a")
+            .await
+            .unwrap());
+        assert!(db
+            .reset_pending_matches(convo_id, 23, "winner-a")
+            .await
+            .expect("durable reread confirms winner after a response-loss equivalent"));
+        assert!(db
+            .adopt_reset_pending_target(convo_id, 23, "winner-a", "winner-a")
+            .await
+            .unwrap());
+        assert!(!db
+            .adopt_reset_pending_target(convo_id, 23, "losing-group", "winner-b")
+            .await
+            .unwrap());
+
+        let flags = db.get_recovery_flags(convo_id).await.unwrap();
+        let pending = flags.reset.expect("reset authority remains pending");
+        assert_eq!(pending.new_group_id, "winner-a");
+        assert_eq!(pending.reset_generation, 23);
+        assert_eq!(pending.notified_at_ms, 1_717_000_000_023);
+        assert!(flags.needs_rejoin);
+        assert_eq!(read_group_id(&db, convo_id).await, "old-group");
     }
 
     /// Phase 2.5 Stage 1 dual-emission safety: the server emits BOTH
