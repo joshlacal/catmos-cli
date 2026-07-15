@@ -955,6 +955,17 @@ impl Database {
 
     /// Persist a `RESET_PENDING` payload received via `GroupResetEvent`
     /// (§8.2 / §8.6). The triple is required.
+    ///
+    /// The same statement also clears any persisted quarantine. A server
+    /// reset is a documented quarantine exit (ruling 2a, 2026-08-15), so the
+    /// payload and the quarantine clear are one commit — not a commit
+    /// followed by a separate clear. The callers still invoke
+    /// `exit_quarantine` afterwards for the in-memory tracker and the
+    /// `QuarantineEvent::Cleared` notification, but that call is now a
+    /// backstop rather than the only thing standing between a crash and a row
+    /// that is simultaneously reset-pending and quarantined. Such a row
+    /// rehydrates quarantined forever, because a replayed reset event resolves
+    /// to the same generation and never re-clears it.
     pub async fn mark_reset_pending(
         &self,
         convo_id: &str,
@@ -966,7 +977,10 @@ impl Database {
             "UPDATE conversations
              SET reset_new_group_id = ?1,
                  reset_generation = ?2,
-                 reset_notified_at_ms = ?3
+                 reset_notified_at_ms = ?3,
+                 quarantine_reason_tag = NULL,
+                 quarantine_since_ms = NULL,
+                 quarantine_suspected_dids = NULL
              WHERE conversation_id = ?4",
         )
         .bind(new_group_id)
@@ -1345,6 +1359,63 @@ mod reset_pending_tests {
             payload_second.reset_generation, 5,
             "generation must not regress on a same-generation re-write"
         );
+    }
+
+    /// Ruling 2a (2026-08-15): a server reset is a documented quarantine
+    /// exit, and the exit must be committed by the same statement that
+    /// publishes the reset authority. The callers in `recovery_ops` do call
+    /// `exit_quarantine` right after this, but a crash (or a failed clear)
+    /// between the two writes would mint a row that is simultaneously
+    /// reset-pending and quarantined — and that row rehydrates quarantined
+    /// forever, because the replayed reset event lands on the same generation
+    /// and never reaches the clear again. Mirrors the same requirement on
+    /// `MLSStorageBackend::mark_reset_pending` in
+    /// `catbird-mls/src/orchestrator/storage.rs`.
+    #[tokio::test]
+    async fn mark_reset_pending_clears_quarantine_in_the_same_commit() {
+        let path =
+            std::env::temp_dir().join(format!("catmos-core-test-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_unencrypted(&path).await.unwrap();
+
+        let convo_id = "convo-reset-clears-quarantine";
+        db.store_conversation(&fixture_convo(convo_id, "pre-reset-group"))
+            .await
+            .unwrap();
+
+        db.mark_quarantined(
+            convo_id,
+            QuarantineReason::PeerBadCommit,
+            1_000,
+            &["did:plc:suspect".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.get_recovery_flags(convo_id)
+                .await
+                .unwrap()
+                .quarantine
+                .is_some(),
+            "precondition: the conversation must start quarantined"
+        );
+
+        // The reset write alone — no `exit_quarantine` backstop — must leave
+        // the row unquarantined.
+        db.mark_reset_pending(convo_id, "post-reset-group-hex", 7, 2_000)
+            .await
+            .unwrap();
+
+        let flags = db.get_recovery_flags(convo_id).await.unwrap();
+        assert!(
+            flags.quarantine.is_none(),
+            "ruling 2a: the reset commit must clear persisted quarantine on its own"
+        );
+        let payload = flags
+            .reset
+            .as_ref()
+            .expect("reset authority must still be published");
+        assert_eq!(payload.new_group_id, "post-reset-group-hex");
+        assert_eq!(payload.reset_generation, 7);
     }
 
     /// Phase 2.5: a higher generation supersedes a lower one (mirrors the
