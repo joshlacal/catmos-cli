@@ -428,7 +428,7 @@ async fn get_subscription_ticket_standalone(
 /// `own_commits` is checked for commit messages to prevent duplicate processing
 /// of our own commits received back via WebSocket (spec section 5.4).
 async fn convert_event(
-    event: SubscribeEventsMessage<'_>,
+    event: SubscribeEventsMessage,
     mls: &Arc<crate::mls::MlsManager>,
     own_commits: &Arc<Mutex<HashMap<[u8; 32], Instant>>>,
 ) -> WsEvent {
