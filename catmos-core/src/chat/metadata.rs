@@ -40,7 +40,6 @@ use tracing::{debug, info, warn};
 
 use catbird_mls::metadata::{self as mls_metadata, GroupMetadataV1, MetadataReference};
 
-use super::canonical;
 use super::service::ChatService;
 use crate::auth::AuthMethod;
 use crate::error::{CatmosError, Result};
@@ -564,7 +563,7 @@ impl ChatService {
         }
     }
 
-    /// XRPC GET wrapper for the canonical chat blob endpoint.
+    /// XRPC GET wrapper for `blue.catbird.mlsChat.getGroupMetadataBlob`.
     /// Returns `Ok(None)` when the server returns 404 / `BlobNotFound`,
     /// preserving the bootstrap helper's "transient absence" semantics.
     #[allow(clippy::too_many_arguments)]
@@ -577,7 +576,7 @@ impl ChatService {
         reset_generation: Option<i64>,
         kind: Option<&str>,
     ) -> Result<Option<Vec<u8>>> {
-        const NSID: &str = canonical::GET_BLOB;
+        const NSID: &str = "blue.catbird.mlsChat.getGroupMetadataBlob";
 
         let bearer = self.current_bearer().await?;
         let (url, headers) = self.metadata_blob_request(NSID, &bearer)?;
@@ -647,7 +646,7 @@ impl ChatService {
         Ok(Some(bytes.to_vec()))
     }
 
-    /// XRPC POST wrapper for the canonical chat blob upload endpoint.
+    /// XRPC POST wrapper for `blue.catbird.mlsChat.putGroupMetadataBlob`.
     /// Sends the ciphertext body raw (no `$bytes` envelope) per lexicon.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn put_group_metadata_blob(
@@ -660,7 +659,7 @@ impl ChatService {
         reset_generation: Option<i64>,
         body: Vec<u8>,
     ) -> Result<()> {
-        const NSID: &str = canonical::UPLOAD_BLOB;
+        const NSID: &str = "blue.catbird.mlsChat.putGroupMetadataBlob";
 
         let bearer = self.current_bearer().await?;
         let (url, mut headers) = self.metadata_blob_request(NSID, &bearer)?;
@@ -744,7 +743,7 @@ impl ChatService {
         let url = match &self.auth {
             AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
             AuthMethod::AppPassword { .. } => {
-                let base = if nsid.starts_with("blue.catbird.chat.") {
+                let base = if nsid.starts_with("blue.catbird.mlsChat.") {
                     &self.config.server.mls_url
                 } else {
                     &self.config.server.nest_url

@@ -18,7 +18,6 @@ use catbird_atproto::catbird::mls_chat;
 use catbird_mls::orchestrator_bridge::FFICommitKind;
 use catbird_mls::{GroupConfig, KeyPackageData};
 
-use super::canonical;
 use crate::auth::{AuthMethod, TokenSession};
 use crate::error::{CatmosError, Result};
 use crate::mls::{MlsManager, MLS_CIPHER_SUITE};
@@ -412,7 +411,7 @@ impl ChatService {
 
     // ── XRPC transport ──────────────────────────────────────────────────
 
-    /// POST an XRPC procedure (e.g. `blue.catbird.chat.sendMessage`).
+    /// POST an XRPC procedure (e.g. `blue.catbird.mlsChat.sendMessage`).
     ///
     /// On 401/Unauthorized from AppPassword sessions, refreshes the jacquard
     /// session and retries exactly once.
@@ -462,7 +461,7 @@ impl ChatService {
             .map_err(|e| CatmosError::Xrpc(format!("Failed to parse {nsid} response: {e}")))
     }
 
-    /// GET an XRPC query (e.g. `blue.catbird.chat.getConversations`).
+    /// GET an XRPC query (e.g. `blue.catbird.mlsChat.getConvos`).
     ///
     /// On 401/Unauthorized from AppPassword sessions, refreshes the jacquard
     /// session and retries exactly once.
@@ -648,7 +647,7 @@ impl ChatService {
         );
 
         let resp: super::messages::CreateConvoResp = match self
-            .xrpc_procedure(canonical::CREATE_CONVERSATION, &req)
+            .xrpc_procedure(mls_chat::create_convo::NSID, &req)
             .await
         {
             Ok(resp) => resp,
@@ -709,7 +708,7 @@ impl ChatService {
         );
 
         let _: CommitGroupChangeResp = self
-            .xrpc_procedure(canonical::SUBMIT_TRANSITION, &req)
+            .xrpc_procedure(mls_chat::commit_group_change::NSID, &req)
             .await?;
         Ok(())
     }
@@ -763,6 +762,8 @@ impl ChatService {
             BootstrapResetGroup, BootstrapResetGroupCipherSuite,
         };
 
+        const NSID: &str = "blue.catbird.mlsChat.bootstrapResetGroup";
+
         // `metadata_blob_locator` / `metadata_version` declare the encrypted
         // metadata blob the reset winner re-publishes for the new group (see
         // `republish_metadata_after_reset`). They are diagnostic — joining
@@ -770,8 +771,8 @@ impl ChatService {
         // server-visible signal that the resetter owns the new generation's
         // metadata. The generated `BootstrapResetGroup` now carries both fields.
         let req = BootstrapResetGroup::<String> {
-            original_convo_id: original_convo_id.to_string(),
-            new_group_id: new_group_id_hex.to_string(),
+            original_convo_id: original_convo_id.to_string().into(),
+            new_group_id: new_group_id_hex.to_string().into(),
             cipher_suite: BootstrapResetGroupCipherSuite::from_value(cipher_suite.to_string()),
             group_info: bytes::Bytes::from(group_info),
             members: members
@@ -782,13 +783,13 @@ impl ChatService {
                 .collect(),
             current_epoch: None,
             key_package_hashes: None,
-            metadata_blob_locator: metadata_blob_locator.map(str::to_string),
+            metadata_blob_locator: metadata_blob_locator.map(|s| s.to_string().into()),
             metadata_version,
             welcome_message: None,
             extra_data: Default::default(),
         };
 
-        let _: serde_json::Value = self.xrpc_procedure(canonical::REQUEST_RESET, &req).await?;
+        let _: serde_json::Value = self.xrpc_procedure(NSID, &req).await?;
         Ok(())
     }
 
@@ -801,14 +802,16 @@ impl ChatService {
         }
         .into();
 
-        let _: serde_json::Value = self.xrpc_procedure(canonical::REQUEST_LEAVE, &req).await?;
+        let _: serde_json::Value = self
+            .xrpc_procedure(mls_chat::leave_convo::NSID, &req)
+            .await?;
 
         Ok(())
     }
 
     /// List devices registered for the authenticated user.
     pub async fn list_devices(&self) -> Result<Vec<Device>> {
-        let resp: ListDevicesResp = self.xrpc_query(canonical::GET_DEVICES, &[]).await?;
+        let resp: ListDevicesResp = self.xrpc_query(mls_chat::list_devices::NSID, &[]).await?;
 
         let devices = resp
             .devices
@@ -826,7 +829,10 @@ impl ChatService {
     /// Get the current key package availability status.
     pub async fn get_key_package_status(&self) -> Result<KeyPackageStatus> {
         let resp: KeyPackageStatusResp = self
-            .xrpc_query(canonical::REPLENISH_KEY_PACKAGES, &[("include", "stats")])
+            .xrpc_query(
+                mls_chat::get_key_package_status::NSID,
+                &[("include", "stats")],
+            )
             .await?;
 
         match resp.stats {
@@ -934,7 +940,7 @@ impl ChatService {
         );
 
         match self
-            .xrpc_procedure::<_, CommitGroupChangeResp>(canonical::SUBMIT_TRANSITION, &req)
+            .xrpc_procedure::<_, CommitGroupChangeResp>(mls_chat::commit_group_change::NSID, &req)
             .await
         {
             Ok(resp) if resp.success => {
@@ -1021,7 +1027,7 @@ impl ChatService {
 
         let handle = plan.handle.clone();
         match self
-            .xrpc_procedure::<_, CommitGroupChangeResp>(canonical::SUBMIT_TRANSITION, &req)
+            .xrpc_procedure::<_, CommitGroupChangeResp>(mls_chat::commit_group_change::NSID, &req)
             .await
         {
             Ok(resp) if resp.success => {
@@ -1099,7 +1105,7 @@ impl ChatService {
 
         let handle = plan.handle.clone();
         match self
-            .xrpc_procedure::<_, CommitGroupChangeResp>(canonical::SUBMIT_TRANSITION, &req)
+            .xrpc_procedure::<_, CommitGroupChangeResp>(mls_chat::commit_group_change::NSID, &req)
             .await
         {
             Ok(resp) if resp.success => {
@@ -1166,7 +1172,9 @@ impl ChatService {
         // xrpc_query takes `&[(&str, &str)]`; `dids` is a repeated query
         // parameter per AT Protocol convention.
         let params: Vec<(&str, &str)> = dids.iter().map(|d| ("dids", d.as_str())).collect();
-        let resp: GetKeyPackagesResp = self.xrpc_query(canonical::GET_DEVICES, &params).await?;
+        let resp: GetKeyPackagesResp = self
+            .xrpc_query(mls_chat::get_key_packages::NSID, &params)
+            .await?;
         Ok(resp.key_packages)
     }
 
@@ -1186,7 +1194,7 @@ impl ChatService {
             .into();
 
             let _: serde_json::Value = self
-                .xrpc_procedure(canonical::SUBMIT_TRANSITION, &req)
+                .xrpc_procedure(mls_chat::promote_admin::NSID, &req)
                 .await?;
         }
 
@@ -1239,7 +1247,9 @@ impl ChatService {
         }
         .into();
 
-        let _: serde_json::Value = self.xrpc_procedure(canonical::SEND_MESSAGE, &req).await?;
+        let _: serde_json::Value = self
+            .xrpc_procedure(mls_chat::send_message::NSID, &req)
+            .await?;
 
         Ok(())
     }
@@ -1262,7 +1272,9 @@ impl ChatService {
             device_name: device_name.to_string(),
         };
 
-        let device: Device = self.xrpc_procedure(canonical::ENROLL_DEVICE, &req).await?;
+        let device: Device = self
+            .xrpc_procedure(mls_chat::register_device::NSID, &req)
+            .await?;
 
         Ok(device)
     }
@@ -1301,7 +1313,7 @@ impl ChatService {
             .into();
 
         let resp: PublishKeyPackagesResp = self
-            .xrpc_procedure(canonical::REPLENISH_KEY_PACKAGES, &req)
+            .xrpc_procedure(mls_chat::publish_key_packages::NSID, &req)
             .await?;
 
         let accepted = resp.publish_result.map(|r| r.succeeded as u32).unwrap_or(0);
@@ -1316,7 +1328,9 @@ impl ChatService {
         }
         .into();
 
-        let resp: RemoveDeviceResp = self.xrpc_procedure(canonical::REVOKE_DEVICE, &req).await?;
+        let resp: RemoveDeviceResp = self
+            .xrpc_procedure(mls_chat::remove_device::NSID, &req)
+            .await?;
 
         Ok((
             resp.deleted,
@@ -1347,7 +1361,7 @@ impl ChatService {
     /// Fetch group state from the server.
     pub async fn get_group_state(&self, convo_id: &str) -> Result<serde_json::Value> {
         let resp: serde_json::Value = self
-            .xrpc_query(canonical::GET_CONVERSATION_STATE, &[("convoId", convo_id)])
+            .xrpc_query(mls_chat::get_group_state::NSID, &[("convoId", convo_id)])
             .await?;
         Ok(resp)
     }
@@ -1361,7 +1375,7 @@ impl ChatService {
             .await
             .map_err(|e| CatmosError::Other(format!("Failed to read file {file_path}: {e}")))?;
 
-        let nsid = canonical::UPLOAD_BLOB;
+        let nsid = mls_chat::upload_blob::NSID;
         let bearer = self.current_bearer().await?;
         let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC POST {nsid} -> {url}");
@@ -1412,7 +1426,7 @@ impl ChatService {
 
     /// Download a blob by ID and write it to the given output path.
     pub async fn download_blob(&self, blob_id: &str, output_path: &str) -> Result<()> {
-        let nsid = canonical::GET_BLOB;
+        let nsid = mls_chat::get_blob::NSID;
         let bearer = self.current_bearer().await?;
         let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC GET {nsid} -> {url}");
@@ -1462,7 +1476,7 @@ impl ChatService {
 
     /// Get the authenticated user's blob storage usage stats.
     pub async fn get_blob_usage(&self) -> Result<BlobUsage> {
-        let resp: GetBlobUsageResp = self.xrpc_query(canonical::GET_BLOB_USAGE, &[]).await?;
+        let resp: GetBlobUsageResp = self.xrpc_query(mls_chat::get_blob_usage::NSID, &[]).await?;
 
         Ok(BlobUsage {
             used_bytes: resp.used_bytes,
@@ -1475,7 +1489,7 @@ impl ChatService {
     /// pre-resolved bearer token.
     ///
     /// - OAuth: routes through nest (confidential client proxy)
-    /// - AppPassword: routes directly to mls-ds for `blue.catbird.chat.*` endpoints
+    /// - AppPassword: routes directly to mls-ds for `blue.catbird.mlsChat.*` endpoints
     pub(crate) fn build_request(&self, nsid: &str, bearer: &str) -> Result<(String, HeaderMap)> {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1488,7 +1502,7 @@ impl ChatService {
             AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
             AuthMethod::AppPassword { .. } => {
                 // Route mlsChat calls directly to the MLS delivery service
-                let base = if nsid.starts_with("blue.catbird.chat.") {
+                let base = if nsid.starts_with("blue.catbird.mlsChat.") {
                     &self.config.server.mls_url
                 } else {
                     &self.config.server.nest_url

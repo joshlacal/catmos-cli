@@ -11,7 +11,6 @@ use tracing::{debug, info, warn};
 use catbird_atproto::catbird::mls_chat;
 
 use super::{MlsManager, MLS_CIPHER_SUITE};
-use crate::chat::canonical;
 use crate::chat::ChatService;
 use crate::error::{CatmosError, Result};
 use crate::storage::db::Database;
@@ -130,7 +129,7 @@ impl MlsManager {
 
         // 4. Call registerDevice
         let resp: RegisterDeviceResp = service
-            .xrpc_procedure(canonical::ENROLL_DEVICE, &req)
+            .xrpc_procedure(mls_chat::register_device::NSID, &req)
             .await?;
 
         info!(
@@ -272,7 +271,7 @@ impl MlsManager {
         );
 
         match service
-            .xrpc_procedure::<_, serde_json::Value>(canonical::SUBMIT_TRANSITION, &req)
+            .xrpc_procedure::<_, serde_json::Value>(mls_chat::commit_group_change::NSID, &req)
             .await
         {
             Ok(_) => {
@@ -437,7 +436,7 @@ impl MlsManager {
             );
 
             match service
-                .xrpc_procedure::<_, serde_json::Value>(canonical::SUBMIT_TRANSITION, &req)
+                .xrpc_procedure::<_, serde_json::Value>(mls_chat::commit_group_change::NSID, &req)
                 .await
             {
                 Ok(_) => {
@@ -506,7 +505,7 @@ impl MlsManager {
     ) -> Result<String> {
         let group_state: serde_json::Value = service
             .xrpc_query(
-                canonical::GET_CONVERSATION_STATE,
+                mls_chat::get_group_state::NSID,
                 &[("convoId", convo_id), ("include", "groupInfo")],
             )
             .await?;
@@ -556,7 +555,7 @@ impl MlsManager {
     ) -> Result<Option<String>> {
         let group_state: serde_json::Value = match service
             .xrpc_query(
-                canonical::GET_CONVERSATION_STATE,
+                mls_chat::get_group_state::NSID,
                 &[("convoId", convo_id), ("include", "welcome")],
             )
             .await
@@ -590,7 +589,7 @@ impl MlsManager {
             "action": "refreshGroupInfo"
         });
         let _: serde_json::Value = service
-            .xrpc_procedure(canonical::SUBMIT_TRANSITION, &req)
+            .xrpc_procedure(mls_chat::commit_group_change::NSID, &req)
             .await?;
         info!(
             "request_group_info_refresh: sent refreshGroupInfo for {}",

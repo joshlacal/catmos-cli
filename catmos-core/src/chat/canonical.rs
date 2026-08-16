@@ -1,10 +1,16 @@
 //! Canonical clean-chat XRPC route contract.
 //!
 //! Endpoint names are sourced from the generated `blue.catbird.chat` Jacquard
-//! markers. Keep transport call sites dependent on these constants so a
-//! legacy namespace route cannot quietly return to the client.
+//! markers. This is an inventory/seam for the future typed migration; runtime
+//! transport remains on the legacy endpoints until canonical request signing,
+//! DPoP, and payload adapters are available.
+
+#![allow(dead_code)]
 
 use catbird_atproto::jacquard_common::xrpc::{SubscriptionResp, XrpcResp};
+
+/// Deliberately disabled until canonical typed adapters and DPoP are landed.
+pub(crate) const RUNTIME_MIGRATION_ENABLED: bool = false;
 
 pub(crate) const CREATE_CONVERSATION: &str =
     catbird_atproto::blue_catbird::chat::create_conversation::CreateConversationResponse::NSID;
@@ -47,11 +53,6 @@ pub(crate) const REPLENISH_KEY_PACKAGES: &str =
     catbird_atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesResponse::NSID;
 pub(crate) const UPLOAD_BLOB: &str =
     catbird_atproto::blue_catbird::chat::upload_blob::UploadBlobResponse::NSID;
-
-/// Canonical request-reset endpoint for CLI/TUI recovery commands.
-pub fn request_reset_nsid() -> &'static str {
-    REQUEST_RESET
-}
 
 #[cfg(test)]
 mod tests {
@@ -108,5 +109,10 @@ mod tests {
             SUBSCRIBE_EVENTS,
             catbird_atproto::blue_catbird::chat::subscribe_events::SubscribeEventsStream::NSID
         );
+    }
+
+    #[test]
+    fn inventory_is_not_enabled_for_runtime_transport() {
+        assert!(!RUNTIME_MIGRATION_ENABLED);
     }
 }
