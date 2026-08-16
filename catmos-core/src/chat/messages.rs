@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use catbird_atproto::catbird::mls_chat;
 
+use super::canonical;
 use super::service::ChatService;
 use crate::error::{CatmosError, Result};
 use crate::types::{Conversation, Member, Message, MessageContent};
@@ -306,7 +307,7 @@ impl ChatService {
         .into();
 
         match self
-            .xrpc_procedure::<_, SendMessageResp>(mls_chat::send_message::NSID, &req)
+            .xrpc_procedure::<_, SendMessageResp>(canonical::SEND_MESSAGE, &req)
             .await
         {
             Ok(resp) => {
@@ -354,7 +355,7 @@ impl ChatService {
                 .into();
 
                 match self
-                    .xrpc_procedure::<_, SendMessageResp>(mls_chat::send_message::NSID, &retry_req)
+                    .xrpc_procedure::<_, SendMessageResp>(canonical::SEND_MESSAGE, &retry_req)
                     .await
                 {
                     Ok(resp) => {
@@ -416,7 +417,7 @@ impl ChatService {
                 .into();
 
                 let resp: SendMessageResp = self
-                    .xrpc_procedure(mls_chat::send_message::NSID, &retry_req)
+                    .xrpc_procedure(canonical::SEND_MESSAGE, &retry_req)
                     .await?;
 
                 info!("send_message: retry succeeded for {convo_label} at epoch {new_epoch}");
@@ -513,9 +514,7 @@ impl ChatService {
             ),
         );
 
-        let _: serde_json::Value = self
-            .xrpc_procedure(mls_chat::send_message::NSID, &req)
-            .await?;
+        let _: serde_json::Value = self.xrpc_procedure(canonical::SEND_MESSAGE, &req).await?;
 
         Ok(())
     }
@@ -525,7 +524,7 @@ impl ChatService {
     /// Resolves all unique member DIDs to handles and populates
     /// `self.handle_cache` so the TUI can display friendly names.
     pub async fn fetch_conversations(&self) -> Result<Vec<Conversation>> {
-        let resp: GetConvosResp = self.xrpc_query(mls_chat::get_convos::NSID, &[]).await?;
+        let resp: GetConvosResp = self.xrpc_query(canonical::GET_CONVERSATIONS, &[]).await?;
 
         let mut convos: Vec<Conversation> = resp
             .conversations
@@ -737,7 +736,7 @@ impl ChatService {
             let from_epoch = current_epoch.saturating_add(1).to_string();
             let resp: GetMessagesResp = self
                 .xrpc_query(
-                    mls_chat::get_messages::NSID,
+                    canonical::GET_ENTRIES,
                     &[
                         ("convoId", convo_id),
                         ("type", "commit"),
@@ -973,9 +972,7 @@ impl ChatService {
             params.push(("sinceSeq", seq));
         }
 
-        let resp: GetMessagesResp = self
-            .xrpc_query(mls_chat::get_messages::NSID, &params)
-            .await?;
+        let resp: GetMessagesResp = self.xrpc_query(canonical::GET_ENTRIES, &params).await?;
 
         let convo_label = &convo_id[..12.min(convo_id.len())];
         let mut messages = Vec::with_capacity(resp.messages.len());

@@ -1,6 +1,7 @@
 use serde::Serialize;
 use tracing::debug;
 
+use super::canonical;
 use super::service::ChatService;
 use crate::error::Result;
 
@@ -34,9 +35,7 @@ impl ChatService {
             convo_id: convo_id.to_string(),
             cursor: cursor.to_string(),
         };
-        let _: serde_json::Value = self
-            .xrpc_procedure("blue.catbird.mlsChat.updateCursor", &req)
-            .await?;
+        let _: serde_json::Value = self.xrpc_procedure(canonical::GET_ENTRIES, &req).await?;
         Ok(())
     }
 }

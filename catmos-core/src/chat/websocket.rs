@@ -64,6 +64,7 @@ struct RawResetRequestedEvent {
     requested_at: Option<String>,
 }
 
+use super::canonical;
 use super::service::ChatService;
 use crate::error::{CatmosError, Result};
 
@@ -161,7 +162,10 @@ impl ChatService {
     ) -> String {
         let endpoint = endpoint.map(String::from).unwrap_or_else(|| {
             let base = config.server.mls_url.clone();
-            format!("{base}/xrpc/blue.catbird.mlsChat.subscribeEvents?ticket={ticket}")
+            format!(
+                "{base}/xrpc/{}?ticket={ticket}",
+                canonical::SUBSCRIBE_EVENTS
+            )
         });
 
         if endpoint.contains("ticket=") {
@@ -187,10 +191,7 @@ impl ChatService {
     pub async fn subscribe(&self) -> Result<mpsc::UnboundedReceiver<WsEvent>> {
         // 1. Get a subscription ticket for the initial connection
         let ticket_resp: SubscriptionTicketResponse = self
-            .xrpc_procedure(
-                "blue.catbird.mlsChat.getSubscriptionTicket",
-                &serde_json::json!({}),
-            )
+            .xrpc_procedure(canonical::GET_SUBSCRIPTION_TICKET, &serde_json::json!({}))
             .await?;
 
         let ws_url = Self::build_ws_url(
@@ -351,7 +352,7 @@ async fn get_subscription_ticket_standalone(
     use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
     use reqwest::StatusCode;
 
-    let nsid = "blue.catbird.mlsChat.getSubscriptionTicket";
+    let nsid = canonical::GET_SUBSCRIPTION_TICKET;
 
     let base_url = match auth {
         crate::auth::AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),

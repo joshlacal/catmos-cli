@@ -42,6 +42,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
+    parts.push(Span::styled(" · ", bg));
+    parts.push(Span::styled(app.status.clone(), bg.fg(Color::LightGreen)));
+
     // Pad the rest of the line with background color
     let content_len: usize = parts.iter().map(|s| s.content.len()).sum();
     let padding = if area.width as usize > content_len {

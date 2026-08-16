@@ -59,11 +59,10 @@ pub async fn run() -> anyhow::Result<()> {
     // layer. Same key file as the main binary (`{config_dir}/mls-content-
     // root/{sha256(did)}.key`), so opening the TUI and the CLI back-to-back
     // sees the same HMAC chain seed and decrypts each other's writes.
-    let content_root_key = catmos_core::storage::keys::load_or_create_content_root_key(
-        &Config::config_dir()?,
-        &did,
-    )?;
-    mls.context().set_content_root_key(content_root_key.clone())?;
+    let content_root_key =
+        catmos_core::storage::keys::load_or_create_content_root_key(&Config::config_dir()?, &did)?;
+    mls.context()
+        .set_content_root_key(content_root_key.clone())?;
     db.set_content_root_key(content_root_key);
 
     // ── 4. Create ChatService ──────────────────────────────────────────
@@ -112,6 +111,7 @@ pub async fn run() -> anyhow::Result<()> {
     match service.fetch_conversations().await {
         Ok(convos) => {
             app.conversations = convos;
+            app.set_status(format!("ready · {} conversations", app.conversations.len()));
             // Populate handle cache from service for sender display
             app.handle_cache = service.handle_cache().await;
 
@@ -143,6 +143,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
         Err(e) => {
             error!("Failed to fetch conversations: {e}");
+            app.set_status(format!("list unavailable: {e}"));
             // Continue with empty state — user can retry
         }
     }
@@ -425,6 +426,7 @@ async fn main_loop(
                     // Non-blocking: messages arrive via WebSocket ChatMessage events
                 }
                 AppEvent::ConvoListUpdated(convos) => {
+                    app.set_status(format!("list refreshed · {} conversations", convos.len()));
                     app.conversations = convos;
                 }
                 AppEvent::GroupReset {
@@ -451,6 +453,7 @@ async fn main_loop(
                         svc.handle_group_reset_event(&cid, &new_gid, reset_generation)
                             .await;
                     });
+                    app.set_status("recovery pending · waiting for canonical reset flow");
                 }
                 AppEvent::ResetRequested {
                     convo_id,
@@ -489,6 +492,7 @@ async fn main_loop(
                         )
                         .await;
                     });
+                    app.set_status("recovery requested · waiting for server transition");
                 }
                 AppEvent::TreeDiverged { convo_id } => {
                     // Spec: treeChanged should NOT trigger an immediate External
@@ -503,6 +507,7 @@ async fn main_loop(
                     });
                 }
                 AppEvent::MessageSent(msg) => {
+                    app.set_status(format!("sent · seq {}", msg.seq));
                     if let Some(convo) = app.active_conversation() {
                         if msg.convo_id == convo.conversation_id {
                             app.messages.push(msg);
@@ -512,12 +517,14 @@ async fn main_loop(
                 }
                 AppEvent::SendFailed(e) => {
                     error!("Send failed: {e}");
+                    app.set_status(format!("send paused: {e}"));
                 }
                 AppEvent::SyncCompleted => {
                     // No-op: background sync now sends ConvoListUpdated directly
                 }
                 AppEvent::Error(e) => {
                     error!("Event error: {e}");
+                    app.set_status(e);
                 }
             }
         }
@@ -558,6 +565,7 @@ async fn handle_chat_key(
             if !text.is_empty() {
                 if let Some(convo) = app.active_conversation() {
                     let convo_id = convo.conversation_id.clone();
+                    app.set_status("sending · encrypting message");
                     let svc = Arc::clone(&app.service);
                     let tx = event_tx.clone();
                     tokio::spawn(async move {
@@ -608,8 +616,14 @@ async fn reload_messages(app: &mut App) {
     if let Some(convo) = app.active_conversation() {
         let convo_id = convo.conversation_id.clone();
         match app.service.load_local_messages(&convo_id, 50).await {
-            Ok(msgs) => app.messages = msgs,
-            Err(e) => error!("Failed to load messages from local DB: {e}"),
+            Ok(msgs) => {
+                app.set_status(format!("read · {} messages", msgs.len()));
+                app.messages = msgs;
+            }
+            Err(e) => {
+                error!("Failed to load messages from local DB: {e}");
+                app.set_status(format!("read unavailable: {e}"));
+            }
         }
     }
 }

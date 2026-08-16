@@ -49,6 +49,9 @@ pub struct App {
 
     /// Cache of DID → handle for display.
     pub handle_cache: HashMap<String, String>,
+
+    /// Human-readable operation state shown in the status bar.
+    pub status: String,
 }
 
 impl App {
@@ -70,6 +73,7 @@ impl App {
             scroll_offset: 0,
             should_quit: false,
             handle_cache: HashMap::new(),
+            status: "ready".to_string(),
         }
     }
 
@@ -169,5 +173,10 @@ impl App {
     pub fn take_input(&mut self) -> String {
         self.cursor_pos = 0;
         std::mem::take(&mut self.input)
+    }
+
+    /// Replace the transient operation state shown to the user.
+    pub fn set_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
     }
 }
