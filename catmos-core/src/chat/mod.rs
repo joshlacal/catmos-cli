@@ -1,5 +1,6 @@
 pub mod blocks;
 pub mod canonical;
+pub mod canonical_adapter;
 pub mod messages;
 pub mod metadata;
 pub mod recovery_ops;
