@@ -120,7 +120,7 @@ impl CanonicalTransportAdapter {
         // operation enum. This conversion keeps the mapping explicit and
         // prevents accidentally routing unsupported media operations.
         let ffi_operation = operation_to_ffi(operation);
-        prepare_clean_chat_request(
+        let prepared = prepare_clean_chat_request(
             CleanChatAuthContextFfi {
                 authorization: self.auth.authorization.clone(),
                 dpop_proof: self.auth.dpop_proof.clone(),
@@ -131,16 +131,41 @@ impl CanonicalTransportAdapter {
             ffi_operation,
             request_json,
         )
-        .map(|prepared| PreparedRequest {
+        .map_err(|error| CatmosError::Other(format!("canonical transport: {error}")))?;
+
+        // Task 1's FFI intentionally makes transport credentials optional so
+        // Nest-proxy adapters can attach them outside the signer. Keep this
+        // native consumer fail-closed while remaining source-compatible with
+        // the pre-Task-1 String fields used by older sibling checkouts.
+        Ok(PreparedRequest {
             operation,
             method: prepared.method,
             path: prepared.path,
-            authorization: prepared.authorization,
-            dpop: prepared.dpop,
+            authorization: require_transport_credential(prepared.authorization, "authorization")?,
+            dpop: require_transport_credential(prepared.dpop, "dpop")?,
             body: prepared.body,
         })
-        .map_err(|error| CatmosError::Other(format!("canonical transport: {error}")))
     }
+}
+
+trait TransportCredential {
+    fn require(self, field: &str) -> Result<String>;
+}
+
+impl TransportCredential for String {
+    fn require(self, _field: &str) -> Result<String> {
+        Ok(self)
+    }
+}
+
+impl TransportCredential for Option<String> {
+    fn require(self, field: &str) -> Result<String> {
+        self.ok_or_else(|| CatmosError::Other(format!("canonical transport: missing {field}")))
+    }
+}
+
+fn require_transport_credential<T: TransportCredential>(value: T, field: &str) -> Result<String> {
+    value.require(field)
 }
 
 fn map_transport_error(error: TransportError) -> CatmosError {
@@ -209,10 +234,15 @@ mod tests {
     #[test]
     fn media_operations_are_typed_fail_closed() {
         let adapter = CanonicalTransportAdapter::new(auth("not-a-jkt"));
-        let err = adapter
-            .prepare_signed_json(CanonicalOperation::UploadBlob, b"{}".to_vec())
-            .expect_err("blob upload has no JSON-only adapter");
-        assert!(err.to_string().contains("dedicated media adapters"));
+        for operation in [
+            CanonicalOperation::UploadBlob,
+            CanonicalOperation::SubscribeEvents,
+        ] {
+            let err = adapter
+                .prepare_signed_json(operation, b"{}".to_vec())
+                .expect_err("media operations have no JSON-only adapter");
+            assert!(err.to_string().contains("dedicated media adapters"));
+        }
     }
 
     #[test]
@@ -230,5 +260,12 @@ mod tests {
         assert_eq!(request.authorization, "Bearer test-token");
         assert_eq!(request.dpop, "dpop-proof");
         assert!(request.body.is_none());
+    }
+
+    #[test]
+    fn missing_optional_transport_credential_fails_closed() {
+        let error = require_transport_credential(None, "dpop")
+            .expect_err("missing optional FFI credential must fail closed");
+        assert!(error.to_string().contains("missing dpop"));
     }
 }
