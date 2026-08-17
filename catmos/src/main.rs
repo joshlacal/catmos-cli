@@ -222,11 +222,10 @@ async fn init_service() -> anyhow::Result<ChatService> {
     // `{config_dir}/mls-content-root/{sha256(did)}.key` on first call;
     // shared between the orchestrator's `MLSContext` and the `Database`
     // write/read paths so encrypted rows round-trip.
-    let content_root_key = catmos_core::storage::keys::load_or_create_content_root_key(
-        &Config::config_dir()?,
-        &did,
-    )?;
-    mls.context().set_content_root_key(content_root_key.clone())?;
+    let content_root_key =
+        catmos_core::storage::keys::load_or_create_content_root_key(&Config::config_dir()?, &did)?;
+    mls.context()
+        .set_content_root_key(content_root_key.clone())?;
     db.set_content_root_key(content_root_key);
 
     let aliases = Arc::new(RwLock::new(AliasStore::load()?));

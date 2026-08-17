@@ -297,15 +297,14 @@ impl Database {
             ("deleted_at", "INTEGER"),
         ];
         for (col, decl) in message_columns {
-            let existing: Option<(String,)> = sqlx::query_as(
-                "SELECT name FROM pragma_table_info('messages') WHERE name = ?1",
-            )
-            .bind(col)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| {
-                CatmosError::Storage(format!("Probe messages column '{col}' failed: {e}"))
-            })?;
+            let existing: Option<(String,)> =
+                sqlx::query_as("SELECT name FROM pragma_table_info('messages') WHERE name = ?1")
+                    .bind(col)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        CatmosError::Storage(format!("Probe messages column '{col}' failed: {e}"))
+                    })?;
             if existing.is_some() {
                 continue;
             }
@@ -587,7 +586,9 @@ impl Database {
         // back with a warning rather than panic — the row still lands so
         // the orchestrator can keep going, and a later session with the
         // key bound will surface the plaintext columns.
-        let sealed = self.try_encrypt_message_body(msg, &content_type, &content_json).await;
+        let sealed = self
+            .try_encrypt_message_body(msg, &content_type, &content_json)
+            .await;
 
         match sealed {
             Some((encrypted, entry_hmac)) => {
@@ -756,8 +757,10 @@ impl Database {
         };
 
         let root = self.content_root_key_snapshot();
-        let mut messages: Vec<Message> =
-            rows.iter().map(|r| map_message_row(r, root.as_deref())).collect();
+        let mut messages: Vec<Message> = rows
+            .iter()
+            .map(|r| map_message_row(r, root.as_deref()))
+            .collect();
         messages.reverse(); // return in chronological order
         Ok(messages)
     }

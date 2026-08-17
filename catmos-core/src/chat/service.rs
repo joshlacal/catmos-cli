@@ -498,24 +498,39 @@ impl ChatService {
             resp
         };
 
+        let is_sensitive_device_endpoint = nsid.contains("getOwnDevices")
+            || nsid.contains("enrollDevice")
+            || nsid.contains("rebindDeviceAuthentication")
+            || nsid.contains("revokeDevice");
+
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(CatmosError::Xrpc(format!(
-                "{nsid} returned {status}: {body}"
-            )));
+            if is_sensitive_device_endpoint {
+                return Err(CatmosError::Xrpc(format!("{nsid} returned {status}")));
+            } else {
+                return Err(CatmosError::Xrpc(format!(
+                    "{nsid} returned {status}: {body}"
+                )));
+            }
         }
 
         let body = resp
             .text()
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
-        tracing::debug!("XRPC {nsid} raw: {}", &body[..body.len().min(500)]);
+        if !is_sensitive_device_endpoint {
+            tracing::debug!("XRPC {nsid} raw: {}", &body[..body.len().min(500)]);
+        }
         serde_json::from_str::<R>(&body).map_err(|e| {
-            CatmosError::Xrpc(format!(
-                "Failed to parse {nsid}: {e}\nBody: {}",
-                &body[..body.len().min(300)]
-            ))
+            if is_sensitive_device_endpoint {
+                CatmosError::Xrpc(format!("Failed to parse {nsid}: {e}"))
+            } else {
+                CatmosError::Xrpc(format!(
+                    "Failed to parse {nsid}: {e}\nBody: {}",
+                    &body[..body.len().min(300)]
+                ))
+            }
         })
     }
 

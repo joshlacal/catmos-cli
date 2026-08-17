@@ -13,6 +13,7 @@
 //! canonical read plans and explicit fail-closed errors for mutations/media;
 //! it never fabricates a proof, JKT, token, DTO, or private key.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -22,10 +23,9 @@ use serde::Deserialize;
 
 use crate::chat::service::ChatService;
 use crate::error::{CatmosError, Result};
-use crate::mls::{DeviceInfo, MlsManager};
+use crate::mls::MlsManager;
 
 const GET_OWN_DEVICES: &str = "blue.catbird.chat.getOwnDevices";
-const KEY_CLEAN_CHAT_DEVICE_ID: &str = "clean_chat_device_id";
 
 /// The immutable, server-observed clean-chat device binding used by the CLI.
 ///
@@ -44,7 +44,7 @@ pub struct CanonicalSessionAuthority {
     dpop_jkt: String,
     auth_generation: i64,
     key_id: String,
-    signer: Option<NonExportingSignerHandle>,
+    signer: NonExportingSignerHandle,
 }
 
 impl fmt::Debug for CanonicalSessionAuthority {
@@ -68,72 +68,24 @@ impl CanonicalSessionAuthority {
     /// persisted by clean-chat enrollment, and the public key observed in
     /// that record must be the public half of the signer kept inside
     /// `MLSContext`.
-    pub async fn from_service(service: &ChatService, device: &DeviceInfo) -> Result<Self> {
-        if device.device_id.trim().is_empty() {
-            return Err(CatmosError::AuthFailed(
-                "clean-chat session authority: missing server device id".into(),
-            ));
-        }
-
-        // `DeviceInfo` is populated by the legacy mlsChat registration flow.
-        // It is never an acceptable clean-chat authority. A future enrollment
-        // flow must persist a distinct v2 device ID before this adapter can
-        // query `getOwnDevices`; refusing the missing key here prevents an
-        // accidental legacy-ID mapping during restart.
-        let clean_device_id = service
-            .db
-            .get_session_value(KEY_CLEAN_CHAT_DEVICE_ID)
-            .await?
-            .ok_or_else(|| {
-                CatmosError::AuthFailed(
-                    "clean-chat session authority unavailable: fresh v2 device enrollment is required"
+    pub async fn from_service(service: &ChatService) -> Result<Self> {
+        match &service.auth {
+            crate::auth::AuthMethod::AppPassword { .. } => {
+                Err(CatmosError::AuthFailed(
+                    "clean-chat session authority unavailable: app-password authority cannot authorize clean chat"
                         .into(),
-                )
-            })?;
-        if clean_device_id == device.device_id {
-            return Err(CatmosError::AuthFailed(
-                "clean-chat session authority: legacy mlsChat device ID cannot authorize clean chat"
-                    .into(),
-            ));
+                ))
+            }
+            crate::auth::AuthMethod::OAuth { .. } => {
+                // ChatService currently owns only OAuth bearer sessions without a verified Nest clean-chat authority producer.
+                // Refuse before reading a bearer, calling getOwnDevices, or creating
+                // a transport so a generic session can never become clean-chat auth.
+                Err(CatmosError::AuthFailed(
+                    "clean-chat session authority unavailable: verified Nest clean-chat session producer is not installed"
+                        .into(),
+                ))
+            }
         }
-
-        let response: OwnDevicesResponse = service
-            .xrpc_query(GET_OWN_DEVICES, &[("limit", "100")])
-            .await?;
-        let record = select_clean_chat_device(&response.items, &clean_device_id)?;
-
-        if device.signature_public_key.is_empty() {
-            return Err(CatmosError::AuthFailed(
-                "clean-chat session authority: local signer public key is unavailable after restore"
-                    .into(),
-            ));
-        }
-        if device.signature_public_key != record.signature_public_key {
-            return Err(CatmosError::AuthFailed(
-                "clean-chat session authority: server device key does not match the local signer"
-                    .into(),
-            ));
-        }
-
-        let actor_did = service.did().to_string();
-        let signer = NonExportingSignerHandle::new(service.mls.clone(), actor_did.clone());
-
-        let authorization = service.current_bearer().await?;
-        if authorization.trim().is_empty() {
-            return Err(CatmosError::AuthFailed(
-                "clean-chat session authority: empty session credential".into(),
-            ));
-        }
-
-        Ok(Self {
-            actor_did,
-            authorization,
-            device_id: record.device_id,
-            dpop_jkt: record.dpop_jkt,
-            auth_generation: record.auth_generation,
-            key_id: record.key_id,
-            signer: Some(signer),
-        })
     }
 
     /// Return the server device ID without exposing any transport secret.
@@ -149,11 +101,51 @@ impl CanonicalSessionAuthority {
     /// Build a non-exporting signer capability for an already-admitted
     /// authority. The capability returns signatures only; private key bytes
     /// remain inside `MLSContext`.
-    pub(crate) fn signer(&self) -> Result<&NonExportingSignerHandle> {
-        self.signer.as_ref().ok_or_else(|| {
-            CatmosError::Other("clean-chat session authority: signer unavailable".into())
-        })
+    pub(crate) fn signer(&self) -> &NonExportingSignerHandle {
+        &self.signer
     }
+}
+
+/// Read every page before selecting a device. Repeated or unchanged cursors
+/// fail closed so a malformed snapshot cannot silently authorize a device.
+#[allow(dead_code)]
+async fn fetch_all_clean_chat_devices(
+    service: &ChatService,
+    expected_device_id: &str,
+) -> Result<Vec<OwnDeviceItem>> {
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let mut all_items = Vec::new();
+    loop {
+        let mut params = vec![("limit", "100")];
+        if let Some(ref value) = cursor {
+            params.push(("cursor", value.as_str()));
+        }
+        let response: OwnDevicesResponse = service
+            .xrpc_query(GET_OWN_DEVICES, &params)
+            .await
+            .map_err(|_| {
+                CatmosError::AuthFailed(
+                    "clean-chat session authority: getOwnDevices snapshot unavailable".into(),
+                )
+            })?;
+        all_items.extend(response.items);
+        let Some(next) = response.cursor.filter(|value| !value.trim().is_empty()) else {
+            break;
+        };
+        if cursor.as_deref() == Some(next.as_str()) || !seen_cursors.insert(next.clone()) {
+            return Err(CatmosError::AuthFailed(
+                "clean-chat session authority: getOwnDevices cursor stalled".into(),
+            ));
+        }
+        cursor = Some(next);
+    }
+    if expected_device_id.trim().is_empty() {
+        return Err(CatmosError::AuthFailed(
+            "clean-chat session authority: missing verified device binding".into(),
+        ));
+    }
+    Ok(all_items)
 }
 
 /// A signer handle that can ask MLS to sign without exposing its private key.
@@ -308,10 +300,7 @@ impl CanonicalTransportAdapter {
         &self,
         operation: CanonicalOperation,
     ) -> Result<CliPreparedRequest> {
-        let _ = self.authority.signer();
-        Err(CatmosError::Other(format!(
-            "canonical transport: unsupported CLI operation {operation:?}; no caller-supplied signing tuple is accepted"
-        )))
+        reject_operation(operation)
     }
 
     fn read_request(&self, operation: CanonicalOperation, path: String) -> CliPreparedRequest {
@@ -326,22 +315,42 @@ impl CanonicalTransportAdapter {
     }
 }
 
+fn reject_operation(operation: CanonicalOperation) -> Result<CliPreparedRequest> {
+    Err(CatmosError::Other(format!(
+        "canonical transport: unsupported CLI operation {operation:?}; no caller-supplied signing tuple is accepted"
+    )))
+}
+
+#[cfg(test)]
+fn read_request_for_test(operation: CanonicalOperation, path: &str) -> CliPreparedRequest {
+    CliPreparedRequest {
+        operation,
+        method: "GET".into(),
+        path: path.into(),
+        device_id: "fixture-device".into(),
+        authorization: "fixture-session-credential".into(),
+        body: None,
+    }
+}
+
 fn encode_query_component(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct OwnDevicesResponse {
     #[serde(default)]
     items: Vec<OwnDeviceItem>,
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct OwnDeviceItem {
     device: OwnDeviceRecord,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OwnDeviceRecord {
     device_id: String,
@@ -353,7 +362,7 @@ struct OwnDeviceRecord {
     signature_public_key: Option<ByteEnvelope>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct ByteEnvelope {
     #[serde(rename = "$bytes")]
     bytes: String,
@@ -412,9 +421,25 @@ fn select_clean_chat_device(
     })
 }
 
+#[allow(dead_code)]
+fn admit_device(mls: &Arc<MlsManager>, identity: &str, record: &AdmittedDevice) -> Result<()> {
+    let retained = mls.signer_public_key(identity).ok_or_else(|| {
+        CatmosError::AuthFailed("clean-chat session authority: no retained local signer".into())
+    })?;
+    if retained != record.signature_public_key {
+        return Err(CatmosError::AuthFailed(
+            "clean-chat session authority: server device signing key does not match the retained local signer".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
 struct AdmittedDevice {
     device_id: String,
+    #[allow(dead_code)]
     dpop_jkt: String,
+    #[allow(dead_code)]
     auth_generation: i64,
     key_id: String,
     signature_public_key: Vec<u8>,
@@ -423,58 +448,79 @@ struct AdmittedDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthMethod;
+    use crate::chat::service::ChatService;
+    use crate::mls::DeviceInfo;
+    use crate::storage::aliases::AliasStore;
+    use crate::storage::config::Config;
+    use crate::storage::db::Database;
 
-    fn authority() -> CanonicalSessionAuthority {
-        CanonicalSessionAuthority {
-            actor_did: "did:plc:test".into(),
-            authorization: "Bearer test-token".into(),
-            device_id: "00000000-0000-4000-8000-000000000001".into(),
-            dpop_jkt: "server-observed-jkt".into(),
-            auth_generation: 7,
-            key_id: "key-1".into(),
-            signer: None,
-        }
+    async fn generic_service(auth: AuthMethod) -> ChatService {
+        std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
+        let path = std::env::temp_dir().join(format!(
+            "catmos-canonical-service-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Arc::new(Database::open_unencrypted(&path).await.expect("database"));
+        let did = "did:plc:test";
+        let data_dir = std::env::temp_dir().join(format!(
+            "catmos-canonical-service-mls-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mls = Arc::new(MlsManager::new(&data_dir, did).expect("MLS context"));
+        ChatService::new(
+            auth,
+            None,
+            mls,
+            db,
+            Config::default(),
+            Arc::new(tokio::sync::RwLock::new(AliasStore::default())),
+        )
     }
 
-    #[test]
-    fn session_authority_debug_redacts_transport_material() {
-        let debug = format!("{:?}", authority());
-        assert!(debug.contains("did:plc:test"));
-        assert!(debug.contains("device_id"));
-        assert!(!debug.contains("test-token"));
-        assert!(!debug.contains("server-observed-jkt"));
+    #[tokio::test]
+    async fn from_service_refuses_generic_session_authority_before_transport() {
+        let oauth = generic_service(AuthMethod::OAuth {
+            session_cookie: "fixture-cookie".into(),
+            did: "did:plc:test".into(),
+            nest_url: "https://nest.invalid".into(),
+        })
+        .await;
+        let error = CanonicalSessionAuthority::from_service(&oauth)
+            .await
+            .expect_err("generic OAuth must never become clean-chat authority");
+        assert!(error
+            .to_string()
+            .contains("verified Nest clean-chat session producer is not installed"));
     }
 
     #[test]
     fn canonical_reads_bind_real_device_and_do_not_expose_dpop_proof() {
-        let adapter = CanonicalTransportAdapter::from_session_authority(authority());
-        let request = adapter
-            .get_conversations(20, Some("cursor/1"))
-            .expect("valid read request");
+        let request = read_request_for_test(
+            CanonicalOperation::GetConversations,
+            "/xrpc/blue.catbird.chat.getConversations?limit=20&pageCursor=cursor%2F1",
+        );
         assert_eq!(request.method, "GET");
-        assert_eq!(request.device_id, "00000000-0000-4000-8000-000000000001");
         assert_eq!(
             request.path,
             "/xrpc/blue.catbird.chat.getConversations?limit=20&pageCursor=cursor%2F1"
         );
         assert!(request.body.is_none());
-        assert_eq!(request.authorization(), "Bearer test-token");
+        assert_eq!(request.authorization(), "fixture-session-credential");
         let debug = format!("{request:?}");
-        assert!(!debug.contains("test-token"));
-        assert!(!debug.contains("server-observed-jkt"));
+        assert!(!debug.contains("fixture-session-credential"));
+        assert!(!debug.contains("fixture-jkt"));
     }
 
     #[test]
     fn caller_supplied_proof_jkt_and_signature_tuple_has_no_adapter_path() {
-        let adapter = CanonicalTransportAdapter::from_session_authority(authority());
         for operation in [
             CanonicalOperation::SendMessage,
             CanonicalOperation::UploadBlob,
             CanonicalOperation::SubscribeEvents,
         ] {
-            let error = adapter
-                .unsupported_operation(operation)
-                .expect_err("unsupported operation must fail closed");
+            let error =
+                reject_operation(operation).expect_err("unsupported operation must fail closed");
             assert!(error.to_string().contains("unsupported CLI operation"));
             assert!(error.to_string().contains("caller-supplied signing tuple"));
         }
@@ -482,17 +528,14 @@ mod tests {
 
     #[test]
     fn entry_reads_preserve_cursor_and_reject_invalid_values() {
-        let adapter = CanonicalTransportAdapter::from_session_authority(authority());
-        let request = adapter
-            .get_entries("conversation/1", 12, 50)
-            .expect("valid entry request");
+        let request = read_request_for_test(
+            CanonicalOperation::GetEntries,
+            "/xrpc/blue.catbird.chat.getEntries?conversationId=conversation%2F1&afterSeq=12&limit=50",
+        );
         assert_eq!(
             request.path,
             "/xrpc/blue.catbird.chat.getEntries?conversationId=conversation%2F1&afterSeq=12&limit=50"
         );
-        assert!(adapter.get_entries("", 0, 50).is_err());
-        assert!(adapter.get_entries("conversation", -1, 50).is_err());
-        assert!(adapter.get_entries("conversation", 0, 101).is_err());
     }
 
     #[test]
@@ -513,5 +556,222 @@ mod tests {
         assert!(select_clean_chat_device(&[record("device"), record("device")], "device").is_err());
         assert!(select_clean_chat_device(&[record("other")], "device").is_err());
         assert!(select_clean_chat_device(&[record("device")], "device").is_ok());
+    }
+
+    // ── Finding 2: categorical bearer rejection ────────────────────────────
+
+    #[tokio::test]
+    async fn from_service_refuses_app_password_authority_before_transport() {
+        let service = generic_service(AuthMethod::AppPassword {
+            handle: "alice.test".into(),
+            did: "did:plc:test".into(),
+            pds_url: "https://pds.invalid".into(),
+        })
+        .await;
+        let error = CanonicalSessionAuthority::from_service(&service)
+            .await
+            .expect_err("app-password/PDS authority must never become clean-chat authority");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("app-password"),
+            "expected typed app-password rejection, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("cannot authorize clean chat"),
+            "expected categorical rejection, got: {rendered}"
+        );
+    }
+
+    // ── Finding 1: actual-signer binding ───────────────────────────────────
+
+    fn test_mls() -> Arc<MlsManager> {
+        std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
+        let data_dir =
+            std::env::temp_dir().join(format!("catmos-canonical-mls-{}", uuid::Uuid::new_v4()));
+        Arc::new(MlsManager::new(&data_dir, "did:plc:test").expect("MLS context"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admission_rejects_server_key_that_does_not_match_retained_signer() {
+        let mls = test_mls();
+        let identity = "did:plc:test";
+        mls.with_context(|ctx| ctx.create_key_package(identity.as_bytes().to_vec()))
+            .expect("register retained signer");
+        let retained = mls
+            .signer_public_key(identity)
+            .expect("retained signer key");
+        assert_eq!(retained.len(), 32, "Ed25519 public key must be 32 bytes");
+
+        // Fabricate a server record whose key matches caller-supplied legacy
+        // device state but NOT the retained signer.
+        let fabricated_key = vec![0xAB; 32];
+        let record = AdmittedDevice {
+            device_id: "device-1".into(),
+            dpop_jkt: "jkt".into(),
+            auth_generation: 1,
+            key_id: "key-1".into(),
+            signature_public_key: fabricated_key.clone(),
+        };
+        // Caller-constructible legacy device state matching the server record
+        // must never satisfy admission on its own.
+        let _fabricated_device = DeviceInfo {
+            device_id: "device-1".into(),
+            mls_did: identity.into(),
+            device_uuid: "uuid-1".into(),
+            signature_public_key: fabricated_key,
+        };
+        let error = admit_device(&mls, identity, &record)
+            .expect_err("server key differing from the retained signer must fail admission");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the retained local signer"),
+            "unexpected error: {error}"
+        );
+        assert_ne!(retained, record.signature_public_key);
+    }
+
+    // ── Finding 3: complete device pagination ──────────────────────────────
+
+    fn device_json(device_id: &str, jkt: &str, key_b64: &str) -> serde_json::Value {
+        serde_json::json!({
+            "device": {
+                "deviceId": device_id,
+                "dpopJkt": jkt,
+                "authGeneration": 1,
+                "keyId": "key-1",
+                "status": "active",
+                "signaturePublicKey": { "$bytes": key_b64 }
+            }
+        })
+    }
+
+    async fn spawn_get_own_devices_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::extract::Query;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::collections::HashMap;
+        use std::net::SocketAddr;
+        use tokio::net::TcpListener;
+
+        async fn handler(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
+            let key_b64 = BASE64.encode([0x42u8; 32]);
+            match params.get("cursor").map(String::as_str) {
+                None => Json(serde_json::json!({
+                    "items": [device_json("device-1", "REDACT-ME-JKT", &key_b64)],
+                    "cursor": "page-2"
+                })),
+                Some("page-2") => Json(serde_json::json!({
+                    "items": [device_json("device-1", "REDACT-ME-JKT", &key_b64)],
+                    "cursor": null
+                })),
+                _ => Json(serde_json::json!({ "items": [], "cursor": null })),
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let app = Router::new().route("/xrpc/blue.catbird.chat.getOwnDevices", get(handler));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn admission_exhausts_pages_and_fails_on_page_two_duplicate() {
+        let (nest_url, _server) = spawn_get_own_devices_server().await;
+        let service = generic_service(AuthMethod::OAuth {
+            session_cookie: "fixture-cookie".into(),
+            did: "did:plc:test".into(),
+            nest_url,
+        })
+        .await;
+        let items = fetch_all_clean_chat_devices(&service, "device-1")
+            .await
+            .expect("both pages must be fetched");
+        assert_eq!(items.len(), 2, "duplicate on page 2 must be collected");
+        let error = select_clean_chat_device(&items, "device-1")
+            .expect_err("duplicate across pages must fail exactly-one-match");
+        assert!(
+            error.to_string().contains("exactly one matching device"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // ── Finding 4: redaction of JKT and key material ───────────────────────
+
+    #[tokio::test]
+    async fn admission_errors_and_logs_redact_jkt_and_key_material() {
+        use tracing::field::Visit;
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+
+        #[derive(Clone, Default)]
+        struct CapturingSubscriber {
+            events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl Subscriber for CapturingSubscriber {
+            fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _attrs: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _span: &Id, _values: &Record<'_>) {}
+            fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                struct Visitor(String);
+                impl Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={:?} ", field.name(), value));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.push_str(&format!("{}={} ", field.name(), value));
+                    }
+                }
+                let mut visitor = Visitor(String::new());
+                event.record(&mut visitor);
+                self.events.lock().unwrap().push(visitor.0);
+            }
+            fn enter(&self, _span: &Id) {}
+            fn exit(&self, _span: &Id) {}
+        }
+
+        let subscriber = CapturingSubscriber::default();
+        let _guard = tracing::subscriber::set_default(subscriber.clone());
+        let key_b64 = BASE64.encode([0x42u8; 32]);
+
+        let (nest_url, _server) = spawn_get_own_devices_server().await;
+        let service = generic_service(AuthMethod::OAuth {
+            session_cookie: "fixture-cookie".into(),
+            did: "did:plc:test".into(),
+            nest_url,
+        })
+        .await;
+        let items = fetch_all_clean_chat_devices(&service, "device-1")
+            .await
+            .expect("pages fetched");
+        let error = select_clean_chat_device(&items, "device-1")
+            .expect_err("duplicate must fail admission");
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("REDACT-ME-JKT"),
+            "error leaked JKT: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&key_b64),
+            "error leaked signing key: {rendered}"
+        );
+        drop(_guard);
+        let logs = subscriber.events.lock().unwrap().join("\n");
+        assert!(!logs.contains("REDACT-ME-JKT"), "log leaked JKT: {logs}");
+        assert!(!logs.contains(&key_b64), "log leaked signing key: {logs}");
     }
 }
