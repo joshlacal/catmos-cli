@@ -101,6 +101,8 @@ impl CanonicalTransportAdapter {
     /// Prepare a request whose generated DTO has already been signed by the
     /// platform/device adapter. This is intentionally not a signer: unsigned
     /// or incorrectly bound JSON is rejected by the canonical transport.
+    /// Task 9 live-command wiring remains blocked until a trusted device-bound
+    /// DPoP and application-signer provider supplies those caller-owned values.
     pub fn prepare_signed_json(
         &self,
         operation: CanonicalOperation,
@@ -135,8 +137,8 @@ impl CanonicalTransportAdapter {
 
         // Task 1's FFI intentionally makes transport credentials optional so
         // Nest-proxy adapters can attach them outside the signer. Keep this
-        // native consumer fail-closed while remaining source-compatible with
-        // the pre-Task-1 String fields used by older sibling checkouts.
+        // native consumer fail-closed. The release provenance guard rejects
+        // older sibling checkouts instead of masking an API mismatch here.
         Ok(PreparedRequest {
             operation,
             method: prepared.method,
@@ -148,24 +150,8 @@ impl CanonicalTransportAdapter {
     }
 }
 
-trait TransportCredential {
-    fn require(self, field: &str) -> Result<String>;
-}
-
-impl TransportCredential for String {
-    fn require(self, _field: &str) -> Result<String> {
-        Ok(self)
-    }
-}
-
-impl TransportCredential for Option<String> {
-    fn require(self, field: &str) -> Result<String> {
-        self.ok_or_else(|| CatmosError::Other(format!("canonical transport: missing {field}")))
-    }
-}
-
-fn require_transport_credential<T: TransportCredential>(value: T, field: &str) -> Result<String> {
-    value.require(field)
+fn require_transport_credential(value: Option<String>, field: &str) -> Result<String> {
+    value.ok_or_else(|| CatmosError::Other(format!("canonical transport: missing {field}")))
 }
 
 fn map_transport_error(error: TransportError) -> CatmosError {
