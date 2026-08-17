@@ -1,44 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# No path overrides are accepted: production provenance comes only from this
+# tracked checkout and the sibling Cargo resolves from its own manifest.
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sibling_root="$repo_root/../catbird-mls"
 manifest="$repo_root/scripts/canonical-sibling-provenance.env"
-manifest_explicit=0
 
-usage() {
-  printf 'usage: %s [--repo-root PATH] [--sibling PATH] [--manifest PATH]\n' "$0" >&2
-}
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --repo-root)
-      [[ $# -ge 2 ]] || { usage; exit 2; }
-      repo_root=$(cd "$2" && pwd)
-      shift 2
-      ;;
-    --sibling)
-      [[ $# -ge 2 ]] || { usage; exit 2; }
-      sibling_root=$(cd "$2" && pwd)
-      shift 2
-      ;;
-    --manifest)
-      [[ $# -ge 2 ]] || { usage; exit 2; }
-      manifest=$2
-      manifest_explicit=1
-      shift 2
-      ;;
-    *)
-      usage
-      exit 2
-      ;;
-  esac
-done
-
-if [[ "$manifest_explicit" -eq 0 ]]; then
-  manifest="$repo_root/scripts/canonical-sibling-provenance.env"
+if [[ $# -ne 0 ]]; then
+  printf 'usage: %s\n' "$0" >&2
+  exit 2
 fi
 
+[[ -f "$repo_root/Cargo.toml" ]] || { printf 'Cargo.toml not found: %s\n' "$repo_root/Cargo.toml" >&2; exit 1; }
 [[ -f "$manifest" ]] || { printf 'provenance manifest not found: %s\n' "$manifest" >&2; exit 1; }
 [[ -f "$repo_root/Cargo.lock" ]] || { printf 'tracked Cargo.lock not found: %s\n' "$repo_root/Cargo.lock" >&2; exit 1; }
 [[ -d "$sibling_root" ]] || { printf 'catbird-mls sibling not found: %s\n' "$sibling_root" >&2; exit 1; }
@@ -61,6 +35,23 @@ if [[ "$actual_lock" != "$expected_lock" ]]; then
   exit 1
 fi
 
+metadata=$(mktemp)
+metadata_error=$(mktemp)
+trap 'rm -f "$metadata" "$metadata_error"' EXIT
+if ! CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo metadata \
+  --manifest-path "$repo_root/Cargo.toml" --format-version 1 --locked > "$metadata" 2>"$metadata_error"; then
+  printf 'locked Cargo metadata failed; refusing unverified sibling provenance\n' >&2
+  cat "$metadata_error" >&2
+  exit 1
+fi
+resolved_mls_manifest=$(jq -er '[.packages[] | select(.name == "catbird_mls") | .manifest_path] | if length == 1 then .[0] else error("expected one catbird_mls package") end' "$metadata")
+expected_mls_manifest=$(cd "$sibling_root" && pwd)/Cargo.toml
+if [[ "$resolved_mls_manifest" != "$expected_mls_manifest" ]]; then
+  printf 'Cargo resolved catbird_mls outside checked sibling\nexpected: %s\nactual:   %s\n' \
+    "$expected_mls_manifest" "$resolved_mls_manifest" >&2
+  exit 1
+fi
+
 status_output=$(cd "$sibling_root" && jj st)
 if ! grep -Fq 'The working copy has no changes.' <<<"$status_output"; then
   printf 'catbird-mls sibling is dirty or conflicted: %s\n%s\n' "$sibling_root" "$status_output" >&2
@@ -77,5 +68,5 @@ if [[ "$actual_child" != "$expected_child" || "$actual_parent" != "$expected_com
   exit 1
 fi
 
-printf 'exact catbird-mls and Cargo.lock provenance verified: child=%s parent=%s tree=%s lock=%s\n' \
-  "$actual_child" "$actual_parent" "$actual_tree" "$actual_lock"
+printf 'exact Cargo-resolved catbird-mls and lock provenance verified: manifest=%s child=%s parent=%s tree=%s lock=%s\n' \
+  "$resolved_mls_manifest" "$actual_child" "$actual_parent" "$actual_tree" "$actual_lock"

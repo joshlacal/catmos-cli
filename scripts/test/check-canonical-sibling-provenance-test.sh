@@ -6,30 +6,34 @@ exact_sibling=$(cd "$repo_root/../.codex-workspaces/task1-clean-chat-signed-requ
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 
-mkdir -p "$fixture/scripts"
-cp "$repo_root/Cargo.lock" "$fixture/Cargo.lock"
-cp "$repo_root/scripts/canonical-sibling-provenance.env" "$fixture/scripts/"
-cp "$repo_root/scripts/check-canonical-sibling-provenance.sh" "$fixture/scripts/"
+mkdir -p "$fixture/catmos-cli"
+rsync -a --exclude target --exclude .jj --exclude .git "$repo_root/" "$fixture/catmos-cli/"
 ln -s "$exact_sibling" "$fixture/catbird-mls"
+ln -s "$repo_root/../catbird-atproto" "$fixture/catbird-atproto"
 
-bash "$fixture/scripts/check-canonical-sibling-provenance.sh" \
-  --repo-root "$fixture" --sibling "$fixture/catbird-mls"
+checked_sibling=$(cd "$fixture/catbird-mls" && pwd)
+(cd "$fixture/catmos-cli" && scripts/check-canonical-sibling-provenance.sh)
+metadata=$(cd "$fixture/catmos-cli" && CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo metadata --format-version 1 --locked)
+resolved_manifest=$(jq -er '[.packages[] | select(.name == "catbird_mls") | .manifest_path] | if length == 1 then .[0] else error("expected one catbird_mls package") end' <<<"$metadata")
+[[ "$resolved_manifest" == "$checked_sibling/Cargo.toml" ]]
 
-sed 's/^CATBIRD_MLS_CHILD=.*/CATBIRD_MLS_CHILD=0000000000000000000000000000000000000000000000000000000000000000/' \
-  "$fixture/scripts/canonical-sibling-provenance.env" > "$fixture/scripts/wrong.env"
-if bash "$fixture/scripts/check-canonical-sibling-provenance.sh" \
-  --repo-root "$fixture" --sibling "$fixture/catbird-mls" \
-  --manifest "$fixture/scripts/wrong.env"; then
-  printf 'expected wrong sibling provenance to fail\n' >&2
+if (cd "$fixture/catmos-cli" && scripts/check-canonical-sibling-provenance.sh --sibling "$checked_sibling"); then
+  printf 'expected sibling override to fail\n' >&2
+  exit 1
+fi
+if (cd "$fixture/catmos-cli" && scripts/check-canonical-sibling-provenance.sh --manifest /tmp/external-provenance.env); then
+  printf 'expected external manifest override to fail\n' >&2
   exit 1
 fi
 
-sed 's/^CATMOS_CLI_LOCK_SHA256=.*/CATMOS_CLI_LOCK_SHA256=0000000000000000000000000000000000000000000000000000000000000000/' \
-  "$fixture/scripts/canonical-sibling-provenance.env" > "$fixture/scripts/wrong-lock.env"
-if bash "$fixture/scripts/check-canonical-sibling-provenance.sh" \
-  --repo-root "$fixture" --sibling "$fixture/catbird-mls" \
-  --manifest "$fixture/scripts/wrong-lock.env"; then
-  printf 'expected wrong lock provenance to fail\n' >&2
+mkdir -p "$fixture/wrong"
+rsync -a "$fixture/catmos-cli/" "$fixture/wrong/"
+ln -s "$exact_sibling" "$fixture/catbird-mls-alt"
+sed 's#path = "../catbird-mls"#path = "../catbird-mls-alt"#' \
+  "$fixture/wrong/Cargo.toml" > "$fixture/wrong/Cargo.toml.tmp"
+mv "$fixture/wrong/Cargo.toml.tmp" "$fixture/wrong/Cargo.toml"
+if (cd "$fixture/wrong" && scripts/check-canonical-sibling-provenance.sh); then
+  printf 'expected mismatched Cargo-resolved sibling to fail\n' >&2
   exit 1
 fi
 
