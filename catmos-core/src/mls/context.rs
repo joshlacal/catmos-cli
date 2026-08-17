@@ -242,4 +242,13 @@ impl MlsManager {
     pub fn context(&self) -> &Arc<MLSContext> {
         &self.context
     }
+
+    /// Sign a transcript with the persistent MLS identity signer without
+    /// exporting its private key. The returned signature is intended for a
+    /// reviewed protocol adapter; the key remains inside `MLSContext`.
+    pub fn sign_non_exporting(&self, identity: &str, transcript: &[u8]) -> Result<Vec<u8>> {
+        self.with_context(|ctx| {
+            ctx.sign_with_identity_key(identity.to_string(), transcript.to_vec())
+        })
+    }
 }
