@@ -90,10 +90,8 @@ mod tests {
 
     #[test]
     fn create_then_load_returns_same_bytes() {
-        let tmp = std::env::temp_dir().join(format!(
-            "catmos-cli-keys-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("catmos-cli-keys-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let did = "did:plc:catmos-cli-test-user";
         let first = load_or_create_content_root_key(&tmp, did).unwrap();
@@ -105,10 +103,8 @@ mod tests {
 
     #[test]
     fn different_dids_get_different_keys() {
-        let tmp = std::env::temp_dir().join(format!(
-            "catmos-cli-keys-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("catmos-cli-keys-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let a = load_or_create_content_root_key(&tmp, "did:plc:a").unwrap();
         let b = load_or_create_content_root_key(&tmp, "did:plc:b").unwrap();
@@ -118,10 +114,8 @@ mod tests {
 
     #[test]
     fn rejects_wrong_length_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "catmos-cli-keys-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("catmos-cli-keys-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let did = "did:plc:bad";
         let dir = tmp.join("mls-content-root");
@@ -134,10 +128,8 @@ mod tests {
 
     #[test]
     fn delete_removes_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "catmos-cli-keys-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("catmos-cli-keys-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let did = "did:plc:delete-me";
         let _ = load_or_create_content_root_key(&tmp, did).unwrap();

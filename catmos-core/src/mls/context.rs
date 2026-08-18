@@ -21,7 +21,7 @@ impl SystemKeychain {
     pub fn new(service: impl Into<String>) -> Self {
         let service = service.into();
         // Probe the system keychain to decide whether to use fallback
-        let needs_fallback = {
+        let needs_fallback = std::env::var_os("CATMOS_TEST_KEYCHAIN_FALLBACK").is_some() || {
             let entry = keyring::Entry::new(&service, "__probe__");
             match entry {
                 Ok(e) => {
@@ -119,6 +119,9 @@ impl KeychainAccess for SystemKeychain {
 /// 2. If not found, generate a random 32-byte key, store it, return hex
 /// 3. If the keychain is unavailable, derive deterministically from SHA256(did)
 pub fn get_or_create_db_key(did: &str) -> Result<String> {
+    if std::env::var_os("CATMOS_TEST_KEYCHAIN_FALLBACK").is_some() {
+        return Ok(derive_key_from_did(did));
+    }
     let service = "catmos-mls-db";
     let entry = keyring::Entry::new(service, did);
 
@@ -241,5 +244,30 @@ impl MlsManager {
     /// Get a reference to the inner Arc<MLSContext>.
     pub fn context(&self) -> &Arc<MLSContext> {
         &self.context
+    }
+
+    /// Sign a transcript with the persistent MLS identity signer without
+    /// exporting its private key. The returned signature is intended for a
+    /// reviewed protocol adapter; the key remains inside `MLSContext`.
+    pub fn sign_non_exporting(&self, identity: &str, transcript: &[u8]) -> Result<Vec<u8>> {
+        self.with_context(|ctx| {
+            ctx.sign_with_identity_key(identity.to_string(), transcript.to_vec())
+        })
+    }
+
+    /// Return the 32-byte Ed25519 public key for an identity if registered.
+    pub fn signer_public_key(&self, identity: &str) -> Option<Vec<u8>> {
+        let exported = self
+            .with_context(|ctx| ctx.export_identity_key(identity.to_string()))
+            .ok()?;
+        let value: serde_json::Value = serde_json::from_slice(&exported).ok()?;
+        if let Some(arr) = value.get("public").and_then(|v| v.as_array()) {
+            let bytes: Option<Vec<u8>> = arr.iter().map(|b| b.as_u64().map(|n| n as u8)).collect();
+            return bytes;
+        }
+        if let Some(s) = value.get("public").and_then(|v| v.as_str()) {
+            return hex::decode(s).ok();
+        }
+        None
     }
 }

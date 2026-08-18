@@ -507,7 +507,11 @@ impl ChatService {
             confirmation_tag: None, // not needed for ephemeral messages
         }
         .into();
-        req.action = Some(action.into());
+        req.action = Some(
+            catbird_atproto::blue_catbird::mlsChat::send_message::SendMessageAction::from_value(
+                action.to_string().into(),
+            ),
+        );
 
         let _: serde_json::Value = self
             .xrpc_procedure(mls_chat::send_message::NSID, &req)

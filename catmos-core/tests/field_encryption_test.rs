@@ -59,7 +59,9 @@ fn tmp_db_path() -> std::path::PathBuf {
 }
 
 async fn seed_convo(db: &Database, convo_id: &str) {
-    db.store_conversation(&fixture_convo(convo_id)).await.unwrap();
+    db.store_conversation(&fixture_convo(convo_id))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

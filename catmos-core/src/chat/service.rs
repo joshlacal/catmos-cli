@@ -10,7 +10,10 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use catbird_atproto::blue_catbird;
-use catbird_atproto::blue_catbird::mlsChat::commit_group_change::CommitGroupChange;
+use catbird_atproto::blue_catbird::mlsChat::commit_group_change::{
+    CommitGroupChange, CommitGroupChangeAction,
+};
+use catbird_atproto::blue_catbird::mlsChat::create_convo::CreateConvoCipherSuite;
 use catbird_atproto::catbird::mls_chat;
 use catbird_mls::orchestrator_bridge::FFICommitKind;
 use catbird_mls::{GroupConfig, KeyPackageData};
@@ -210,10 +213,10 @@ pub(crate) fn build_commit_group_change(
     confirmation_tag: Option<Vec<u8>>,
     member_dids: Option<Vec<String>>,
     idempotency_key: Option<String>,
-) -> CommitGroupChange<'static> {
+) -> CommitGroupChange {
     CommitGroupChange {
         convo_id: convo_id.to_string().into(),
-        action: action.to_string().into(),
+        action: CommitGroupChangeAction::from_value(action.to_string().into()),
         commit: commit.map(bytes::Bytes::from),
         welcome: welcome.map(bytes::Bytes::from),
         group_info: group_info.map(bytes::Bytes::from),
@@ -237,12 +240,12 @@ pub(crate) fn build_create_convo_request(
     initial_members: &[String],
     welcome_message: Option<Vec<u8>>,
     key_package_hashes: Vec<(String, String)>,
-) -> blue_catbird::mlsChat::create_convo::CreateConvo<'static> {
+) -> blue_catbird::mlsChat::create_convo::CreateConvo {
     let current_epoch = if welcome_message.is_some() { 1 } else { 0 };
 
     blue_catbird::mlsChat::create_convo::CreateConvo {
         group_id: group_id.to_string().into(),
-        cipher_suite: MLS_CIPHER_SUITE.into(),
+        cipher_suite: CreateConvoCipherSuite::from_value(MLS_CIPHER_SUITE.to_string().into()),
         initial_members: if initial_members.is_empty() {
             None
         } else {
@@ -495,24 +498,39 @@ impl ChatService {
             resp
         };
 
+        let is_sensitive_device_endpoint = nsid.contains("getOwnDevices")
+            || nsid.contains("enrollDevice")
+            || nsid.contains("rebindDeviceAuthentication")
+            || nsid.contains("revokeDevice");
+
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(CatmosError::Xrpc(format!(
-                "{nsid} returned {status}: {body}"
-            )));
+            if is_sensitive_device_endpoint {
+                return Err(CatmosError::Xrpc(format!("{nsid} returned {status}")));
+            } else {
+                return Err(CatmosError::Xrpc(format!(
+                    "{nsid} returned {status}: {body}"
+                )));
+            }
         }
 
         let body = resp
             .text()
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
-        tracing::debug!("XRPC {nsid} raw: {}", &body[..body.len().min(500)]);
+        if !is_sensitive_device_endpoint {
+            tracing::debug!("XRPC {nsid} raw: {}", &body[..body.len().min(500)]);
+        }
         serde_json::from_str::<R>(&body).map_err(|e| {
-            CatmosError::Xrpc(format!(
-                "Failed to parse {nsid}: {e}\nBody: {}",
-                &body[..body.len().min(300)]
-            ))
+            if is_sensitive_device_endpoint {
+                CatmosError::Xrpc(format!("Failed to parse {nsid}: {e}"))
+            } else {
+                CatmosError::Xrpc(format!(
+                    "Failed to parse {nsid}: {e}\nBody: {}",
+                    &body[..body.len().min(300)]
+                ))
+            }
         })
     }
 
@@ -755,7 +773,9 @@ impl ChatService {
         // — joining members fetch via `getGroupMetadataBlob` regardless — but
         // surface a strong server-visible signal that the resetter has ownership
         // of the new generation's metadata.
-        use catbird_atproto::blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroup;
+        use catbird_atproto::blue_catbird::mlsChat::bootstrap_reset_group::{
+            BootstrapResetGroup, BootstrapResetGroupCipherSuite,
+        };
 
         const NSID: &str = "blue.catbird.mlsChat.bootstrapResetGroup";
 
@@ -765,14 +785,16 @@ impl ChatService {
         // members fetch via `getGroupMetadataBlob` regardless — but surface a
         // server-visible signal that the resetter owns the new generation's
         // metadata. The generated `BootstrapResetGroup` now carries both fields.
-        let req = BootstrapResetGroup {
+        let req = BootstrapResetGroup::<String> {
             original_convo_id: original_convo_id.to_string().into(),
             new_group_id: new_group_id_hex.to_string().into(),
-            cipher_suite: cipher_suite.to_string().into(),
+            cipher_suite: BootstrapResetGroupCipherSuite::from_value(cipher_suite.to_string()),
             group_info: bytes::Bytes::from(group_info),
             members: members
                 .iter()
-                .map(|d| catbird_atproto::types::string::Did::from(d.clone()))
+                .map(|d| {
+                    catbird_atproto::types::did::Did::<String>::new_owned(d).expect("valid DID")
+                })
                 .collect(),
             current_epoch: None,
             key_package_hashes: None,
