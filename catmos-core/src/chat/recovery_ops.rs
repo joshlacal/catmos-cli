@@ -382,9 +382,9 @@ impl ChatService {
         self.reset_recovery_counters(convo_id).await;
     }
 
-    // ── §8.6 reportRecoveryFailure ─────────────────────────────────────
+    // ── §8.6 reportRecoveryFailure (requestLeafRecovery) ───────────────
 
-    /// POST `blue.catbird.mlsChat.reportRecoveryFailure` (§8.6). Best-effort:
+    /// POST `blue.catbird.chat.requestLeafRecovery` (§8.6). Best-effort:
     /// if the call fails we log and swallow — the local state has already
     /// transitioned to `UNRECOVERABLE_LOCAL`, so failing the report serves no
     /// recovery purpose (server can re-derive via other clients' reports).
@@ -415,16 +415,16 @@ impl ChatService {
         };
         match self
             .xrpc_procedure::<_, serde_json::Value>(
-                "blue.catbird.mlsChat.reportRecoveryFailure",
+                "blue.catbird.chat.requestLeafRecovery",
                 &req,
             )
             .await
         {
-            Ok(_) => info!(convo = %convo_label, "reportRecoveryFailure accepted"),
+            Ok(_) => info!(convo = %convo_label, "requestLeafRecovery accepted"),
             Err(e) => warn!(
                 convo = %convo_label,
                 error = %e,
-                "reportRecoveryFailure failed (best-effort, swallowed)"
+                "requestLeafRecovery failed (best-effort, swallowed)"
             ),
         }
     }
@@ -1488,7 +1488,7 @@ impl ChatService {
     /// `groupResetEvent` carries no roster, so bootstrap MUST refetch fresh.
     async fn fetch_member_roster_for_bootstrap(&self, convo_id: &str) -> Result<Vec<String>> {
         let resp: super::messages::GetConvosResp = self
-            .xrpc_query(catbird_atproto::catbird::mls_chat::get_convos::NSID, &[])
+            .xrpc_query("blue.catbird.chat.getConversations", &[])
             .await?;
 
         let mut roster: Vec<String> = Vec::new();
@@ -1511,7 +1511,7 @@ impl ChatService {
     /// Ambiguous duplicate rows fail closed.
     async fn fetch_authoritative_group_id(&self, convo_id: &str) -> Result<Option<String>> {
         let resp: super::messages::GetConvosResp = self
-            .xrpc_query(catbird_atproto::catbird::mls_chat::get_convos::NSID, &[])
+            .xrpc_query("blue.catbird.chat.getConversations", &[])
             .await?;
         let mut matches = resp.conversations.into_iter().filter(|conversation| {
             conversation
@@ -1540,13 +1540,13 @@ mod bootstrap_classifier_tests {
     /// another caller already populated `group_info` on the post-reset row
     /// for `(originalConvoId, newGroupId)` (mls-ds task #17 endpoint).
     /// catmos-cli flattens that into
-    /// `CatmosError::Xrpc("blue.catbird.mlsChat.bootstrapResetGroup returned
+    /// `CatmosError::Xrpc("blue.catbird.chat.requestReset returned
     /// 409 Conflict: {...}")`. The classifier must detect this exact shape
     /// and must NOT mis-classify other 409s or non-409 statuses.
     #[test]
     fn is_bootstrap_already_bootstrapped_matches_real_xrpc_shape() {
         let err = CatmosError::Xrpc(
-            "blue.catbird.mlsChat.bootstrapResetGroup returned 409 Conflict: \
+            "blue.catbird.chat.requestReset returned 409 Conflict: \
              {\"error\":\"AlreadyBootstrapped\",\"message\":\"caller lost first-responder race\"}"
                 .to_string(),
         );
@@ -1561,7 +1561,7 @@ mod bootstrap_classifier_tests {
         // Sibling lexicon errors on the same endpoint (BootstrapTargetNotFound,
         // NotMember, InvalidCipherSuite) MUST NOT trigger the race-loss path.
         let err = CatmosError::Xrpc(
-            "blue.catbird.mlsChat.bootstrapResetGroup returned 409 Conflict: \
+            "blue.catbird.chat.requestReset returned 409 Conflict: \
              {\"error\":\"BootstrapTargetNotFound\",\"message\":\"...\"}"
                 .to_string(),
         );
@@ -1571,7 +1571,7 @@ mod bootstrap_classifier_tests {
         );
 
         let err = CatmosError::Xrpc(
-            "blue.catbird.mlsChat.commitGroupChange returned 409 Conflict: \
+            "blue.catbird.chat.submitTransition returned 409 Conflict: \
              {\"error\":\"EpochMismatch\",\"message\":\"...\"}"
                 .to_string(),
         );
@@ -1585,7 +1585,7 @@ mod bootstrap_classifier_tests {
     fn is_bootstrap_already_bootstrapped_rejects_non_409_statuses() {
         // Same body string, wrong status: must not classify.
         let err = CatmosError::Xrpc(
-            "blue.catbird.mlsChat.bootstrapResetGroup returned 500 Internal Server Error: \
+            "blue.catbird.chat.requestReset returned 500 Internal Server Error: \
              {\"error\":\"AlreadyBootstrapped\"}"
                 .to_string(),
         );

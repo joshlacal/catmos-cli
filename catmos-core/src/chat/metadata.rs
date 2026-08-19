@@ -563,7 +563,7 @@ impl ChatService {
         }
     }
 
-    /// XRPC GET wrapper for `blue.catbird.mlsChat.getGroupMetadataBlob`.
+    /// XRPC GET wrapper for `blue.catbird.chat.getBlob`.
     /// Returns `Ok(None)` when the server returns 404 / `BlobNotFound`,
     /// preserving the bootstrap helper's "transient absence" semantics.
     #[allow(clippy::too_many_arguments)]
@@ -576,7 +576,7 @@ impl ChatService {
         reset_generation: Option<i64>,
         kind: Option<&str>,
     ) -> Result<Option<Vec<u8>>> {
-        const NSID: &str = "blue.catbird.mlsChat.getGroupMetadataBlob";
+        const NSID: &str = "blue.catbird.chat.getBlob";
 
         let bearer = self.current_bearer().await?;
         let (url, headers) = self.metadata_blob_request(NSID, &bearer)?;
@@ -646,7 +646,7 @@ impl ChatService {
         Ok(Some(bytes.to_vec()))
     }
 
-    /// XRPC POST wrapper for `blue.catbird.mlsChat.putGroupMetadataBlob`.
+    /// XRPC POST wrapper for `blue.catbird.chat.uploadBlob`.
     /// Sends the ciphertext body raw (no `$bytes` envelope) per lexicon.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn put_group_metadata_blob(
@@ -659,7 +659,7 @@ impl ChatService {
         reset_generation: Option<i64>,
         body: Vec<u8>,
     ) -> Result<()> {
-        const NSID: &str = "blue.catbird.mlsChat.putGroupMetadataBlob";
+        const NSID: &str = "blue.catbird.chat.uploadBlob";
 
         let bearer = self.current_bearer().await?;
         let (url, mut headers) = self.metadata_blob_request(NSID, &bearer)?;
@@ -743,7 +743,7 @@ impl ChatService {
         let url = match &self.auth {
             AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
             AuthMethod::AppPassword { .. } => {
-                let base = if nsid.starts_with("blue.catbird.mlsChat.") {
+                let base = if nsid.starts_with("blue.catbird.chat.") {
                     &self.config.server.mls_url
                 } else {
                     &self.config.server.nest_url

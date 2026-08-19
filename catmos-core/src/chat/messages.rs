@@ -1,13 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
-
-use catbird_atproto::catbird::mls_chat;
 
 use super::service::ChatService;
 use crate::error::{CatmosError, Result};
@@ -293,20 +292,18 @@ impl ChatService {
         // Get local confirmation tag for divergence detection
         let confirmation_tag = self.get_confirmation_tag_b64(&group_id_bytes);
 
-        // Build the generated SendMessage input using the convenience wrapper
-        let req: mls_chat::send_message::Input = mls_chat::send_message::InputData {
-            convo_id: convo_id.to_string(),
-            ciphertext: encrypt_result.ciphertext.clone(),
-            epoch: epoch as usize,
-            msg_id: msg_id.clone(),
-            padded_size,
-            delivery: None,
-            confirmation_tag: confirmation_tag.clone(),
-        }
-        .into();
+        // Build the SendMessage input
+        let req = serde_json::json!({
+            "convoId": convo_id,
+            "ciphertext": BASE64.encode(&encrypt_result.ciphertext),
+            "epoch": epoch,
+            "msgId": msg_id,
+            "paddedSize": padded_size,
+            "confirmationTag": confirmation_tag,
+        });
 
         match self
-            .xrpc_procedure::<_, SendMessageResp>(mls_chat::send_message::NSID, &req)
+            .xrpc_procedure::<_, SendMessageResp>("blue.catbird.chat.sendMessage", &req)
             .await
         {
             Ok(resp) => {
@@ -342,19 +339,17 @@ impl ChatService {
                 let new_tag = self.get_confirmation_tag_b64(&group_id_bytes);
                 let new_padded = new_encrypt.ciphertext.len() as i64;
 
-                let retry_req: mls_chat::send_message::Input = mls_chat::send_message::InputData {
-                    convo_id: convo_id.to_string(),
-                    ciphertext: new_encrypt.ciphertext,
-                    epoch: new_epoch as usize,
-                    msg_id: ulid::Ulid::new().to_string(),
-                    padded_size: new_padded,
-                    delivery: None,
-                    confirmation_tag: new_tag,
-                }
-                .into();
+                let retry_req = serde_json::json!({
+                    "convoId": convo_id,
+                    "ciphertext": BASE64.encode(&new_encrypt.ciphertext),
+                    "epoch": new_epoch,
+                    "msgId": ulid::Ulid::new().to_string(),
+                    "paddedSize": new_padded,
+                    "confirmationTag": new_tag,
+                });
 
                 match self
-                    .xrpc_procedure::<_, SendMessageResp>(mls_chat::send_message::NSID, &retry_req)
+                    .xrpc_procedure::<_, SendMessageResp>("blue.catbird.chat.sendMessage", &retry_req)
                     .await
                 {
                     Ok(resp) => {
@@ -404,19 +399,17 @@ impl ChatService {
                 let retry_padded = retry_encrypt.ciphertext.len() as i64;
                 let retry_tag = self.get_confirmation_tag_b64(&group_id_bytes);
 
-                let retry_req: mls_chat::send_message::Input = mls_chat::send_message::InputData {
-                    convo_id: convo_id.to_string(),
-                    ciphertext: retry_encrypt.ciphertext,
-                    epoch: new_epoch as usize,
-                    msg_id: retry_msg_id,
-                    padded_size: retry_padded,
-                    delivery: None,
-                    confirmation_tag: retry_tag,
-                }
-                .into();
+                let retry_req = serde_json::json!({
+                    "convoId": convo_id,
+                    "ciphertext": BASE64.encode(&retry_encrypt.ciphertext),
+                    "epoch": new_epoch,
+                    "msgId": retry_msg_id,
+                    "paddedSize": retry_padded,
+                    "confirmationTag": retry_tag,
+                });
 
                 let resp: SendMessageResp = self
-                    .xrpc_procedure(mls_chat::send_message::NSID, &retry_req)
+                    .xrpc_procedure("blue.catbird.chat.sendMessage", &retry_req)
                     .await?;
 
                 info!("send_message: retry succeeded for {convo_label} at epoch {new_epoch}");
@@ -497,24 +490,18 @@ impl ChatService {
         let noop = vec![0u8; 512];
         let msg_id = ulid::Ulid::new().to_string();
 
-        let mut req: mls_chat::send_message::Input = mls_chat::send_message::InputData {
-            convo_id: convo_id.to_string(),
-            ciphertext: noop,
-            epoch: 0,
-            msg_id,
-            padded_size: 512,
-            delivery: Some("ephemeral".to_string()),
-            confirmation_tag: None, // not needed for ephemeral messages
-        }
-        .into();
-        req.action = Some(
-            catbird_atproto::blue_catbird::mlsChat::send_message::SendMessageAction::from_value(
-                action.to_string().into(),
-            ),
-        );
+        let req = serde_json::json!({
+            "convoId": convo_id,
+            "ciphertext": BASE64.encode(&noop),
+            "epoch": 0,
+            "msgId": msg_id,
+            "paddedSize": 512,
+            "delivery": "ephemeral",
+            "action": action,
+        });
 
         let _: serde_json::Value = self
-            .xrpc_procedure(mls_chat::send_message::NSID, &req)
+            .xrpc_procedure("blue.catbird.chat.sendMessage", &req)
             .await?;
 
         Ok(())
@@ -525,7 +512,7 @@ impl ChatService {
     /// Resolves all unique member DIDs to handles and populates
     /// `self.handle_cache` so the TUI can display friendly names.
     pub async fn fetch_conversations(&self) -> Result<Vec<Conversation>> {
-        let resp: GetConvosResp = self.xrpc_query(mls_chat::get_convos::NSID, &[]).await?;
+        let resp: GetConvosResp = self.xrpc_query("blue.catbird.chat.getConversations", &[]).await?;
 
         let mut convos: Vec<Conversation> = resp
             .conversations
@@ -737,7 +724,7 @@ impl ChatService {
             let from_epoch = current_epoch.saturating_add(1).to_string();
             let resp: GetMessagesResp = self
                 .xrpc_query(
-                    mls_chat::get_messages::NSID,
+                    "blue.catbird.chat.getEntries",
                     &[
                         ("convoId", convo_id),
                         ("type", "commit"),
@@ -974,7 +961,7 @@ impl ChatService {
         }
 
         let resp: GetMessagesResp = self
-            .xrpc_query(mls_chat::get_messages::NSID, &params)
+            .xrpc_query("blue.catbird.chat.getEntries", &params)
             .await?;
 
         let convo_label = &convo_id[..12.min(convo_id.len())];

@@ -9,12 +9,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use catbird_atproto::blue_catbird;
-use catbird_atproto::blue_catbird::mlsChat::commit_group_change::{
-    CommitGroupChange, CommitGroupChangeAction,
-};
-use catbird_atproto::blue_catbird::mlsChat::create_convo::CreateConvoCipherSuite;
-use catbird_atproto::catbird::mls_chat;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use catbird_mls::orchestrator_bridge::FFICommitKind;
 use catbird_mls::{GroupConfig, KeyPackageData};
 
@@ -213,26 +209,30 @@ pub(crate) fn build_commit_group_change(
     confirmation_tag: Option<Vec<u8>>,
     member_dids: Option<Vec<String>>,
     idempotency_key: Option<String>,
-) -> CommitGroupChange {
-    CommitGroupChange {
-        convo_id: convo_id.to_string().into(),
-        action: CommitGroupChangeAction::from_value(action.to_string().into()),
-        commit: commit.map(bytes::Bytes::from),
-        welcome: welcome.map(bytes::Bytes::from),
-        group_info: group_info.map(bytes::Bytes::from),
-        confirmation_tag: confirmation_tag.map(bytes::Bytes::from),
-        member_dids: member_dids.map(|dids| {
-            dids.into_iter()
-                .map(catbird_atproto::types::string::Did::from)
-                .collect()
-        }),
-        idempotency_key: idempotency_key.map(Into::into),
-        device_id: None,
-        epoch_authenticator: None,
-        key_package_hashes: None,
-        pending_addition_id: None,
-        ..Default::default()
+) -> serde_json::Value {
+    let mut val = serde_json::json!({
+        "convoId": convo_id,
+        "action": action,
+    });
+    if let Some(c) = commit {
+        val["commit"] = serde_json::json!(BASE64.encode(c));
     }
+    if let Some(w) = welcome {
+        val["welcome"] = serde_json::json!(BASE64.encode(w));
+    }
+    if let Some(gi) = group_info {
+        val["groupInfo"] = serde_json::json!(BASE64.encode(gi));
+    }
+    if let Some(ct) = confirmation_tag {
+        val["confirmationTag"] = serde_json::json!(BASE64.encode(ct));
+    }
+    if let Some(dids) = member_dids {
+        val["memberDids"] = serde_json::json!(dids);
+    }
+    if let Some(ik) = idempotency_key {
+        val["idempotencyKey"] = serde_json::json!(ik);
+    }
+    val
 }
 
 pub(crate) fn build_create_convo_request(
@@ -240,43 +240,28 @@ pub(crate) fn build_create_convo_request(
     initial_members: &[String],
     welcome_message: Option<Vec<u8>>,
     key_package_hashes: Vec<(String, String)>,
-) -> blue_catbird::mlsChat::create_convo::CreateConvo {
+) -> serde_json::Value {
     let current_epoch = if welcome_message.is_some() { 1 } else { 0 };
 
-    blue_catbird::mlsChat::create_convo::CreateConvo {
-        group_id: group_id.to_string().into(),
-        cipher_suite: CreateConvoCipherSuite::from_value(MLS_CIPHER_SUITE.to_string().into()),
-        initial_members: if initial_members.is_empty() {
-            None
-        } else {
-            Some(
-                initial_members
-                    .iter()
-                    .cloned()
-                    .map(catbird_atproto::types::string::Did::from)
-                    .collect(),
-            )
-        },
-        welcome_message: welcome_message.map(bytes::Bytes::from),
-        current_epoch: Some(current_epoch),
-        key_package_hashes: if key_package_hashes.is_empty() {
-            None
-        } else {
-            Some(
-                key_package_hashes
-                    .into_iter()
-                    .map(
-                        |(did, hash)| blue_catbird::mlsChat::create_convo::KeyPackageHashEntry {
-                            did: catbird_atproto::types::string::Did::from(did),
-                            hash: hash.into(),
-                            extra_data: Default::default(),
-                        },
-                    )
-                    .collect(),
-            )
-        },
-        ..Default::default()
+    let mut val = serde_json::json!({
+        "groupId": group_id,
+        "cipherSuite": MLS_CIPHER_SUITE,
+        "currentEpoch": current_epoch,
+    });
+    if !initial_members.is_empty() {
+        val["initialMembers"] = serde_json::json!(initial_members);
     }
+    if let Some(w) = welcome_message {
+        val["welcomeMessage"] = serde_json::json!(BASE64.encode(w));
+    }
+    if !key_package_hashes.is_empty() {
+        let kps: Vec<serde_json::Value> = key_package_hashes
+            .into_iter()
+            .map(|(did, hash)| serde_json::json!({ "did": did, "hash": hash }))
+            .collect();
+        val["keyPackageHashes"] = serde_json::json!(kps);
+    }
+    val
 }
 
 /// Central coordinator for chat operations: XRPC calls, message encryption,
@@ -411,15 +396,15 @@ impl ChatService {
 
     // ── XRPC transport ──────────────────────────────────────────────────
 
-    /// POST an XRPC procedure (e.g. `blue.catbird.mlsChat.sendMessage`).
+    /// POST an XRPC procedure (e.g. `blue.catbird.chat.sendMessage`).
     ///
     /// On 401/Unauthorized from AppPassword sessions, refreshes the jacquard
     /// session and retries exactly once.
-    pub async fn xrpc_procedure<T: Serialize, R: DeserializeOwned>(
+    pub async fn xrpc_procedure<Req: Serialize + ?Sized, Resp: DeserializeOwned>(
         &self,
         nsid: &str,
-        input: &T,
-    ) -> Result<R> {
+        input: &Req,
+    ) -> Result<Resp> {
         let bearer = self.current_bearer().await?;
         let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC POST {nsid} -> {url}");
@@ -456,12 +441,12 @@ impl ChatService {
             )));
         }
 
-        resp.json::<R>()
+        resp.json::<Resp>()
             .await
             .map_err(|e| CatmosError::Xrpc(format!("Failed to parse {nsid} response: {e}")))
     }
 
-    /// GET an XRPC query (e.g. `blue.catbird.mlsChat.getConvos`).
+    /// GET an XRPC query (e.g. `blue.catbird.chat.getConversations`).
     ///
     /// On 401/Unauthorized from AppPassword sessions, refreshes the jacquard
     /// session and retries exactly once.
@@ -662,7 +647,7 @@ impl ChatService {
         );
 
         let resp: super::messages::CreateConvoResp = match self
-            .xrpc_procedure(mls_chat::create_convo::NSID, &req)
+            .xrpc_procedure("blue.catbird.chat.createConversation", &req)
             .await
         {
             Ok(resp) => resp,
@@ -723,7 +708,7 @@ impl ChatService {
         );
 
         let _: CommitGroupChangeResp = self
-            .xrpc_procedure(mls_chat::commit_group_change::NSID, &req)
+            .xrpc_procedure("blue.catbird.chat.submitTransition", &req)
             .await?;
         Ok(())
     }
@@ -761,64 +746,34 @@ impl ChatService {
         metadata_blob_locator: Option<&str>,
         metadata_version: Option<i64>,
     ) -> Result<()> {
-        // Build the lexicon struct directly to dodge the InputData/Bytes
-        // double-encoding bug documented above `build_commit_group_change`.
-        // bootstrap_reset_group has no hand-written shim in
-        // catbird-atproto/src/lib.rs as of commit `f6d7efc` so we construct
-        // the generated `BootstrapResetGroup<'static>` ourselves.
-        //
-        // `metadata_blob_locator` / `metadata_version` are optional declarations
-        // for the encrypted metadata blob the reset winner re-publishes for the
-        // new group (see `republish_metadata_after_reset`). They are diagnostic
-        // — joining members fetch via `getGroupMetadataBlob` regardless — but
-        // surface a strong server-visible signal that the resetter has ownership
-        // of the new generation's metadata.
-        use catbird_atproto::blue_catbird::mlsChat::bootstrap_reset_group::{
-            BootstrapResetGroup, BootstrapResetGroupCipherSuite,
-        };
+        let mut req = serde_json::json!({
+            "originalConvoId": original_convo_id,
+            "newGroupId": new_group_id_hex,
+            "cipherSuite": cipher_suite,
+            "groupInfo": BASE64.encode(group_info),
+            "members": members,
+        });
+        if let Some(locator) = metadata_blob_locator {
+            req["metadataBlobLocator"] = serde_json::json!(locator);
+        }
+        if let Some(version) = metadata_version {
+            req["metadataVersion"] = serde_json::json!(version);
+        }
 
-        const NSID: &str = "blue.catbird.mlsChat.bootstrapResetGroup";
-
-        // `metadata_blob_locator` / `metadata_version` declare the encrypted
-        // metadata blob the reset winner re-publishes for the new group (see
-        // `republish_metadata_after_reset`). They are diagnostic — joining
-        // members fetch via `getGroupMetadataBlob` regardless — but surface a
-        // server-visible signal that the resetter owns the new generation's
-        // metadata. The generated `BootstrapResetGroup` now carries both fields.
-        let req = BootstrapResetGroup::<String> {
-            original_convo_id: original_convo_id.to_string().into(),
-            new_group_id: new_group_id_hex.to_string().into(),
-            cipher_suite: BootstrapResetGroupCipherSuite::from_value(cipher_suite.to_string()),
-            group_info: bytes::Bytes::from(group_info),
-            members: members
-                .iter()
-                .map(|d| {
-                    catbird_atproto::types::did::Did::<String>::new_owned(d).expect("valid DID")
-                })
-                .collect(),
-            current_epoch: None,
-            key_package_hashes: None,
-            metadata_blob_locator: metadata_blob_locator.map(|s| s.to_string().into()),
-            metadata_version,
-            welcome_message: None,
-            extra_data: Default::default(),
-        };
-
-        let _: serde_json::Value = self.xrpc_procedure(NSID, &req).await?;
+        let _: serde_json::Value = self
+            .xrpc_procedure("blue.catbird.chat.requestReset", &req)
+            .await?;
         Ok(())
     }
 
     /// Leave (remove self from) a conversation.
     pub async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
-        let req: mls_chat::leave_convo::Input = mls_chat::leave_convo::InputData {
-            convo_id: convo_id.to_string(),
-            commit: None,
-            target_did: None,
-        }
-        .into();
+        let req = serde_json::json!({
+            "convoId": convo_id,
+        });
 
         let _: serde_json::Value = self
-            .xrpc_procedure(mls_chat::leave_convo::NSID, &req)
+            .xrpc_procedure("blue.catbird.chat.requestLeave", &req)
             .await?;
 
         Ok(())
@@ -826,7 +781,7 @@ impl ChatService {
 
     /// List devices registered for the authenticated user.
     pub async fn list_devices(&self) -> Result<Vec<Device>> {
-        let resp: ListDevicesResp = self.xrpc_query(mls_chat::list_devices::NSID, &[]).await?;
+        let resp: ListDevicesResp = self.xrpc_query("blue.catbird.chat.getDevices", &[]).await?;
 
         let devices = resp
             .devices
@@ -845,7 +800,7 @@ impl ChatService {
     pub async fn get_key_package_status(&self) -> Result<KeyPackageStatus> {
         let resp: KeyPackageStatusResp = self
             .xrpc_query(
-                mls_chat::get_key_package_status::NSID,
+                "blue.catbird.chat.getDevices",
                 &[("include", "stats")],
             )
             .await?;
@@ -955,7 +910,7 @@ impl ChatService {
         );
 
         match self
-            .xrpc_procedure::<_, CommitGroupChangeResp>(mls_chat::commit_group_change::NSID, &req)
+            .xrpc_procedure::<_, CommitGroupChangeResp>("blue.catbird.chat.submitTransition", &req)
             .await
         {
             Ok(resp) if resp.success => {
@@ -1042,7 +997,7 @@ impl ChatService {
 
         let handle = plan.handle.clone();
         match self
-            .xrpc_procedure::<_, CommitGroupChangeResp>(mls_chat::commit_group_change::NSID, &req)
+            .xrpc_procedure::<_, CommitGroupChangeResp>("blue.catbird.chat.submitTransition", &req)
             .await
         {
             Ok(resp) if resp.success => {
@@ -1120,7 +1075,7 @@ impl ChatService {
 
         let handle = plan.handle.clone();
         match self
-            .xrpc_procedure::<_, CommitGroupChangeResp>(mls_chat::commit_group_change::NSID, &req)
+            .xrpc_procedure::<_, CommitGroupChangeResp>("blue.catbird.chat.submitTransition", &req)
             .await
         {
             Ok(resp) if resp.success => {
@@ -1188,7 +1143,7 @@ impl ChatService {
         // parameter per AT Protocol convention.
         let params: Vec<(&str, &str)> = dids.iter().map(|d| ("dids", d.as_str())).collect();
         let resp: GetKeyPackagesResp = self
-            .xrpc_query(mls_chat::get_key_packages::NSID, &params)
+            .xrpc_query("blue.catbird.chat.getKeyPackages", &params)
             .await?;
         Ok(resp.key_packages)
     }
@@ -1202,14 +1157,14 @@ impl ChatService {
         _moderator: bool,
     ) -> Result<()> {
         if admin {
-            let req: mls_chat::promote_admin::Input = mls_chat::promote_admin::InputData {
-                convo_id: convo_id.to_string(),
-                target_did: catbird_atproto::types::string::Did::from(member_did.to_string()),
-            }
-            .into();
+            let req = serde_json::json!({
+                "convoId": convo_id,
+                "action": "promoteAdmin",
+                "targetDid": member_did,
+            });
 
             let _: serde_json::Value = self
-                .xrpc_procedure(mls_chat::promote_admin::NSID, &req)
+                .xrpc_procedure("blue.catbird.chat.submitTransition", &req)
                 .await?;
         }
 
@@ -1251,19 +1206,17 @@ impl ChatService {
 
         let confirmation_tag = self.get_confirmation_tag_b64(&group_id_bytes);
 
-        let req: mls_chat::send_message::Input = mls_chat::send_message::InputData {
-            convo_id: convo_id.to_string(),
-            ciphertext: encrypt_result.ciphertext,
-            epoch: epoch as usize,
-            msg_id,
-            padded_size,
-            delivery: None,
-            confirmation_tag,
-        }
-        .into();
+        let req = serde_json::json!({
+            "convoId": convo_id,
+            "ciphertext": BASE64.encode(&encrypt_result.ciphertext),
+            "epoch": epoch,
+            "msgId": msg_id,
+            "paddedSize": padded_size,
+            "confirmationTag": confirmation_tag,
+        });
 
         let _: serde_json::Value = self
-            .xrpc_procedure(mls_chat::send_message::NSID, &req)
+            .xrpc_procedure("blue.catbird.chat.sendMessage", &req)
             .await?;
 
         Ok(())
@@ -1277,18 +1230,12 @@ impl ChatService {
     pub async fn register_device(&self, name: Option<&str>) -> Result<Device> {
         let device_name = name.unwrap_or("catmos-cli");
 
-        #[derive(serde::Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct MinimalRegister {
-            device_name: String,
-        }
-
-        let req = MinimalRegister {
-            device_name: device_name.to_string(),
-        };
+        let req = serde_json::json!({
+            "deviceName": device_name,
+        });
 
         let device: Device = self
-            .xrpc_procedure(mls_chat::register_device::NSID, &req)
+            .xrpc_procedure("blue.catbird.chat.enrollDevice", &req)
             .await?;
 
         Ok(device)
@@ -1303,32 +1250,23 @@ impl ChatService {
         let expires_str =
             (now + chrono::Duration::days(30)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-        let key_packages: Vec<mls_chat::publish_key_packages::KeyPackageItem> = packages
+        let key_packages: Vec<serde_json::Value> = packages
             .iter()
             .map(|kp| {
-                mls_chat::publish_key_packages::KeyPackageItemData {
-                    cipher_suite: MLS_CIPHER_SUITE.to_string(),
-                    expires: expires_str.parse().expect("valid datetime"),
-                    key_package: kp.key_package_data.clone(),
-                }
-                .into()
+                serde_json::json!({
+                    "cipherSuite": MLS_CIPHER_SUITE,
+                    "expiresAt": expires_str,
+                    "data": BASE64.encode(&kp.key_package_data),
+                })
             })
             .collect();
 
-        let req: mls_chat::publish_key_packages::Input =
-            mls_chat::publish_key_packages::InputData {
-                action: "publish".to_string(),
-                convo_id: None,
-                device_id: None,
-                key_packages: Some(key_packages),
-                local_hashes: None,
-                reason: None,
-                target_dids: None,
-            }
-            .into();
+        let req = serde_json::json!({
+            "keyPackages": key_packages,
+        });
 
         let resp: PublishKeyPackagesResp = self
-            .xrpc_procedure(mls_chat::publish_key_packages::NSID, &req)
+            .xrpc_procedure("blue.catbird.chat.replenishKeyPackages", &req)
             .await?;
 
         let accepted = resp.publish_result.map(|r| r.succeeded as u32).unwrap_or(0);
@@ -1338,13 +1276,12 @@ impl ChatService {
 
     /// Remove a device by its ID. Returns (deleted, key_packages_deleted, conversations_left).
     pub async fn remove_device(&self, device_id: &str) -> Result<(bool, i64, i64)> {
-        let req: mls_chat::remove_device::Input = mls_chat::remove_device::InputData {
-            device_id: device_id.to_string(),
-        }
-        .into();
+        let req = serde_json::json!({
+            "deviceId": device_id,
+        });
 
         let resp: RemoveDeviceResp = self
-            .xrpc_procedure(mls_chat::remove_device::NSID, &req)
+            .xrpc_procedure("blue.catbird.chat.revokeDevice", &req)
             .await?;
 
         Ok((
@@ -1376,7 +1313,7 @@ impl ChatService {
     /// Fetch group state from the server.
     pub async fn get_group_state(&self, convo_id: &str) -> Result<serde_json::Value> {
         let resp: serde_json::Value = self
-            .xrpc_query(mls_chat::get_group_state::NSID, &[("convoId", convo_id)])
+            .xrpc_query("blue.catbird.chat.getConversationState", &[("convoId", convo_id)])
             .await?;
         Ok(resp)
     }
@@ -1390,7 +1327,7 @@ impl ChatService {
             .await
             .map_err(|e| CatmosError::Other(format!("Failed to read file {file_path}: {e}")))?;
 
-        let nsid = mls_chat::upload_blob::NSID;
+        let nsid = "blue.catbird.chat.uploadBlob";
         let bearer = self.current_bearer().await?;
         let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC POST {nsid} -> {url}");
@@ -1441,7 +1378,7 @@ impl ChatService {
 
     /// Download a blob by ID and write it to the given output path.
     pub async fn download_blob(&self, blob_id: &str, output_path: &str) -> Result<()> {
-        let nsid = mls_chat::get_blob::NSID;
+        let nsid = "blue.catbird.chat.getBlob";
         let bearer = self.current_bearer().await?;
         let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC GET {nsid} -> {url}");
@@ -1491,7 +1428,7 @@ impl ChatService {
 
     /// Get the authenticated user's blob storage usage stats.
     pub async fn get_blob_usage(&self) -> Result<BlobUsage> {
-        let resp: GetBlobUsageResp = self.xrpc_query(mls_chat::get_blob_usage::NSID, &[]).await?;
+        let resp: GetBlobUsageResp = self.xrpc_query("blue.catbird.chat.getBlobUsage", &[]).await?;
 
         Ok(BlobUsage {
             used_bytes: resp.used_bytes,
@@ -1504,7 +1441,7 @@ impl ChatService {
     /// pre-resolved bearer token.
     ///
     /// - OAuth: routes through nest (confidential client proxy)
-    /// - AppPassword: routes directly to mls-ds for `blue.catbird.mlsChat.*` endpoints
+    /// - AppPassword: routes directly to mls-ds for `blue.catbird.chat.*` endpoints
     pub(crate) fn build_request(&self, nsid: &str, bearer: &str) -> Result<(String, HeaderMap)> {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1516,8 +1453,8 @@ impl ChatService {
         let url = match &self.auth {
             AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
             AuthMethod::AppPassword { .. } => {
-                // Route mlsChat calls directly to the MLS delivery service
-                let base = if nsid.starts_with("blue.catbird.mlsChat.") {
+                // Route chat calls directly to the MLS delivery service
+                let base = if nsid.starts_with("blue.catbird.chat.") {
                     &self.config.server.mls_url
                 } else {
                     &self.config.server.nest_url
@@ -1559,9 +1496,9 @@ mod tests {
         assert_eq!(json["keyPackageHashes"][0]["did"], "did:plc:alice");
         assert_eq!(json["keyPackageHashes"][0]["hash"], "hash-a");
 
-        let encoded = json["welcomeMessage"]["$bytes"]
+        let encoded = json["welcomeMessage"]
             .as_str()
-            .expect("welcomeMessage $bytes envelope");
+            .expect("welcomeMessage base64 string");
         assert_eq!(encoded, SINGLE_ENCODED);
         assert_ne!(encoded, DOUBLE_ENCODED);
     }

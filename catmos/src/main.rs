@@ -767,7 +767,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             });
 
             let resp: serde_json::Value = svc
-                .xrpc_procedure("blue.catbird.mlsChat.resetGroup", &req)
+                .xrpc_procedure("blue.catbird.chat.requestReset", &req)
                 .await?;
 
             println!(

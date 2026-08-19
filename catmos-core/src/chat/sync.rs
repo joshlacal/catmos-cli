@@ -35,7 +35,7 @@ impl ChatService {
             cursor: cursor.to_string(),
         };
         let _: serde_json::Value = self
-            .xrpc_procedure("blue.catbird.mlsChat.updateCursor", &req)
+            .xrpc_procedure("blue.catbird.chat.submitTransition", &req)
             .await?;
         Ok(())
     }

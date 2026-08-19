@@ -8,8 +8,6 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use catbird_atproto::catbird::mls_chat;
-
 use super::{MlsManager, MLS_CIPHER_SUITE};
 use crate::chat::ChatService;
 use crate::error::{CatmosError, Result};
@@ -107,29 +105,27 @@ impl MlsManager {
         let expires_str =
             (now + chrono::Duration::days(30)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-        let key_packages: Vec<mls_chat::register_device::KeyPackageItem> = packages
+        let key_packages: Vec<serde_json::Value> = packages
             .iter()
             .map(|kp| {
-                mls_chat::register_device::KeyPackageItemData {
-                    cipher_suite: MLS_CIPHER_SUITE.to_string(),
-                    expires: expires_str.parse().expect("valid datetime"),
-                    key_package: kp.key_package_data.clone(),
-                }
-                .into()
+                serde_json::json!({
+                    "cipherSuite": MLS_CIPHER_SUITE,
+                    "expiresAt": expires_str,
+                    "data": BASE64.encode(&kp.key_package_data),
+                })
             })
             .collect();
 
-        let req: mls_chat::register_device::Input = mls_chat::register_device::InputData {
-            device_name: device_name.to_string(),
-            device_uuid: Some(device_uuid.clone()),
-            signature_public_key: signature_public_key.clone(),
-            key_packages,
-        }
-        .into();
+        let req = serde_json::json!({
+            "deviceUuid": device_uuid,
+            "deviceName": device_name,
+            "signaturePublicKey": { "$bytes": BASE64.encode(&signature_public_key) },
+            "keyPackages": key_packages,
+        });
 
-        // 4. Call registerDevice
+        // 4. Call enrollDevice
         let resp: RegisterDeviceResp = service
-            .xrpc_procedure(mls_chat::register_device::NSID, &req)
+            .xrpc_procedure("blue.catbird.chat.enrollDevice", &req)
             .await?;
 
         info!(
@@ -271,7 +267,7 @@ impl MlsManager {
         );
 
         match service
-            .xrpc_procedure::<_, serde_json::Value>(mls_chat::commit_group_change::NSID, &req)
+            .xrpc_procedure::<_, serde_json::Value>("blue.catbird.chat.submitTransition", &req)
             .await
         {
             Ok(_) => {
@@ -436,7 +432,7 @@ impl MlsManager {
             );
 
             match service
-                .xrpc_procedure::<_, serde_json::Value>(mls_chat::commit_group_change::NSID, &req)
+                .xrpc_procedure::<_, serde_json::Value>("blue.catbird.chat.submitTransition", &req)
                 .await
             {
                 Ok(_) => {
@@ -505,7 +501,7 @@ impl MlsManager {
     ) -> Result<String> {
         let group_state: serde_json::Value = service
             .xrpc_query(
-                mls_chat::get_group_state::NSID,
+                "blue.catbird.chat.getConversationState",
                 &[("convoId", convo_id), ("include", "groupInfo")],
             )
             .await?;
@@ -555,7 +551,7 @@ impl MlsManager {
     ) -> Result<Option<String>> {
         let group_state: serde_json::Value = match service
             .xrpc_query(
-                mls_chat::get_group_state::NSID,
+                "blue.catbird.chat.getConversationState",
                 &[("convoId", convo_id), ("include", "welcome")],
             )
             .await
@@ -589,7 +585,7 @@ impl MlsManager {
             "action": "refreshGroupInfo"
         });
         let _: serde_json::Value = service
-            .xrpc_procedure(mls_chat::commit_group_change::NSID, &req)
+            .xrpc_procedure("blue.catbird.chat.submitTransition", &req)
             .await?;
         info!(
             "request_group_info_refresh: sent refreshGroupInfo for {}",

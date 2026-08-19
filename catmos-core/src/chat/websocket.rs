@@ -2,10 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use catbird_atproto::blue_catbird::mlsChat::subscribe_events::SubscribeEventsMessage;
+use catbird_atproto::blue_catbird::chat::subscribe_events::SubscribeEventsMessage;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite;
 use tracing::{debug, error, info, warn};
@@ -161,7 +160,7 @@ impl ChatService {
     ) -> String {
         let endpoint = endpoint.map(String::from).unwrap_or_else(|| {
             let base = config.server.mls_url.clone();
-            format!("{base}/xrpc/blue.catbird.mlsChat.subscribeEvents?ticket={ticket}")
+            format!("{base}/xrpc/blue.catbird.chat.subscribeEvents?ticket={ticket}")
         });
 
         if endpoint.contains("ticket=") {
@@ -188,7 +187,7 @@ impl ChatService {
         // 1. Get a subscription ticket for the initial connection
         let ticket_resp: SubscriptionTicketResponse = self
             .xrpc_procedure(
-                "blue.catbird.mlsChat.getSubscriptionTicket",
+                "blue.catbird.chat.getSubscriptionTicket",
                 &serde_json::json!({}),
             )
             .await?;
@@ -235,24 +234,34 @@ impl ChatService {
                     while let Some(msg_result) = read.next().await {
                         match msg_result {
                             Ok(tungstenite::Message::Binary(data)) => {
-                                match SubscribeEventsMessage::decode_framed(&data) {
-                                    Ok(event) => {
+                                if let Some(ws_event) = try_decode_unknown_event(&data) {
+                                    if tx.send(ws_event).is_err() {
+                                        debug!("WsEvent receiver dropped, stopping reader");
+                                        return;
+                                    }
+                                } else if let Ok((_header, body)) =
+                                    jacquard_common::xrpc::subscription::parse_event_header(&data)
+                                {
+                                    if let Ok(event) =
+                                        serde_ipld_dagcbor::from_slice::<SubscribeEventsMessage>(&body)
+                                    {
                                         let ws_event =
                                             convert_event(event, &mls, &own_commits).await;
                                         if tx.send(ws_event).is_err() {
                                             debug!("WsEvent receiver dropped, stopping reader");
                                             return;
                                         }
-                                    }
-                                    Err(e) => {
-                                        if let Some(ws_event) = try_decode_unknown_event(&data) {
-                                            if tx.send(ws_event).is_err() {
-                                                debug!("WsEvent receiver dropped, stopping reader");
-                                                return;
-                                            }
-                                        } else {
-                                            warn!("Failed to decode WebSocket frame: {e}");
+                                    } else if let Ok(event) =
+                                        serde_json::from_slice::<SubscribeEventsMessage>(&body)
+                                    {
+                                        let ws_event =
+                                            convert_event(event, &mls, &own_commits).await;
+                                        if tx.send(ws_event).is_err() {
+                                            debug!("WsEvent receiver dropped, stopping reader");
+                                            return;
                                         }
+                                    } else {
+                                        warn!("Failed to decode WebSocket event body");
                                     }
                                 }
                             }
@@ -351,7 +360,7 @@ async fn get_subscription_ticket_standalone(
     use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
     use reqwest::StatusCode;
 
-    let nsid = "blue.catbird.mlsChat.getSubscriptionTicket";
+    let nsid = "blue.catbird.chat.getSubscriptionTicket";
 
     let base_url = match auth {
         crate::auth::AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
@@ -429,202 +438,46 @@ async fn get_subscription_ticket_standalone(
 /// of our own commits received back via WebSocket (spec section 5.4).
 async fn convert_event(
     event: SubscribeEventsMessage,
-    mls: &Arc<crate::mls::MlsManager>,
-    own_commits: &Arc<Mutex<HashMap<[u8; 32], Instant>>>,
+    _mls: &Arc<crate::mls::MlsManager>,
+    _own_commits: &Arc<Mutex<HashMap<[u8; 32], Instant>>>,
 ) -> WsEvent {
     match event {
-        SubscribeEventsMessage::MessageEvent(msg_event) => {
-            let mv = &msg_event.message;
-            let convo_id = mv.convo_id.to_string();
-            let message_id = mv.id.to_string();
-            let epoch = mv.epoch as u64;
-            let seq = mv.seq as u64;
-
-            // ciphertext is already bytes::Bytes — no base64 decode needed
-            let ct_bytes = mv.ciphertext.to_vec();
-            let msg_type = mv
-                .message_type
-                .as_ref()
-                .map(|s| s.as_ref())
-                .unwrap_or("app");
-            info!("WS MessageEvent: id={message_id} convo={convo_id} type={msg_type} epoch={epoch} seq={seq} ct_len={}", ct_bytes.len());
-
-            let gid_bytes = match hex::decode(&convo_id) {
-                Ok(b) => b,
-                Err(e) => {
-                    return WsEvent::Error(format!("Invalid group ID hex: {e}"));
-                }
-            };
-
-            // Commit messages advance the MLS epoch — process them to update local state
-            if msg_type == "commit" {
-                // Own-commit dedup (spec section 5.4): check SHA256 of the ciphertext
-                // against our own_commits set to avoid duplicate processing.
-                let hash: [u8; 32] = Sha256::digest(&ct_bytes).into();
-                if own_commits.lock().await.remove(&hash).is_some() {
-                    debug!("WS: skipping own commit {message_id} epoch={epoch}");
-                    return WsEvent::EpochAdvanced {
-                        convo_id,
-                        new_epoch: epoch,
-                    };
-                }
-
-                // Task #47: explicit stage + merge. process_message stages the
-                // commit; we must call merge_incoming_commit to actually advance
-                // the epoch. Auto-merge was removed in catbird-mls task #33.
-                let gid_for_merge = gid_bytes.clone();
-                match mls.with_context(|ctx| ctx.process_message(gid_bytes, ct_bytes)) {
-                    Ok(catbird_mls::ProcessedContent::StagedCommit { new_epoch, .. }) => {
-                        match mls.with_context(|ctx| {
-                            ctx.merge_incoming_commit(gid_for_merge.clone(), new_epoch)
-                        }) {
-                            Ok(merged) => debug!(
-                                "WS commit {message_id} staged+merged for {convo_id} (epoch {merged})"
-                            ),
-                            Err(e) => {
-                                warn!(
-                                    "WS commit {message_id} merge_incoming_commit failed: {e}"
-                                );
-                                let _ = mls.with_context(|ctx| {
-                                    ctx.discard_incoming_commit(gid_for_merge.clone(), new_epoch)
-                                });
-                            }
-                        }
-                    }
-                    Ok(_) => {
-                        debug!(
-                            "WS commit {message_id}: non-commit content returned, nothing to merge"
-                        );
-                    }
-                    Err(e) => {
-                        debug!("Failed to process WS commit {message_id}: {e}");
-                    }
-                }
-                // Commits aren't user-visible messages — skip
-                return WsEvent::EpochAdvanced {
+        SubscribeEventsMessage::EventEnvelope(env) => match env.payload {
+            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::MessageAvailableEvent(msg_evt) => {
+                let convo_id = msg_evt.conversation_id.to_string();
+                let seq = msg_evt.seq as u64;
+                WsEvent::EpochAdvanced {
                     convo_id,
-                    new_epoch: epoch,
-                };
-            }
-
-            // Application messages — decrypt to get plaintext
-            match mls.with_context(|ctx| ctx.decrypt_message(gid_bytes, ct_bytes)) {
-                Ok(result) => {
-                    let unpadded = {
-                        let end = result
-                            .plaintext
-                            .iter()
-                            .rposition(|&b| b != 0)
-                            .map_or(0, |i| i + 1);
-                        &result.plaintext[..end]
-                    };
-                    let plaintext = String::from_utf8_lossy(unpadded).to_string();
-                    let sender_did = if !result.sender_credential.identity.is_empty() {
-                        Some(
-                            String::from_utf8_lossy(&result.sender_credential.identity).to_string(),
-                        )
-                    } else {
-                        None
-                    };
-
-                    WsEvent::Message {
-                        convo_id,
-                        plaintext,
-                        sender_did,
-                        message_id,
-                        epoch,
-                        seq,
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to decrypt WS message {message_id}: {e}");
-                    WsEvent::Error(format!("Decrypt failed for {message_id}: {e}"))
+                    new_epoch: seq,
                 }
             }
-        }
-        SubscribeEventsMessage::TypingEvent(evt) => WsEvent::Typing {
-            convo_id: evt.convo_id.to_string(),
-            sender_did: evt.did.to_string(),
-            is_typing: evt.is_typing,
-        },
-        // Lexicon drift (April 2026): the separate `memberJoined` / `memberLeft`
-        // / `epochAdvanced` events were collapsed. Membership deltas now ride on
-        // `membershipChangeEvent` (distinguished by `action`), and epoch
-        // advancement is reported via `treeChanged`.
-        //
-        // Lexicon `knownValues` for action: ["joined", "left", "removed", "kicked"].
-        // "left" = self-initiated leave; "removed" / "kicked" = admin-initiated.
-        // From the UI's perspective all three are "this DID is no longer a member."
-        SubscribeEventsMessage::MembershipChangeEvent(evt) => {
-            let action = evt.action.as_ref();
-            match action {
-                "joined" => WsEvent::MemberJoined {
-                    convo_id: evt.convo_id.to_string(),
-                    member_did: evt.did.to_string(),
-                },
-                "left" | "removed" | "kicked" => WsEvent::MemberLeft {
-                    convo_id: evt.convo_id.to_string(),
-                    member_did: evt.did.to_string(),
-                },
-                other => {
-                    info!(
-                        "WS MembershipChangeEvent: unknown action {other:?} for {}",
-                        evt.convo_id
-                    );
-                    WsEvent::Error(format!("Unknown membership action: {other}"))
+            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::ConversationChangedEvent(evt) => {
+                let convo_id = evt.conversation_id.to_string();
+                WsEvent::EpochAdvanced {
+                    convo_id,
+                    new_epoch: 0,
                 }
             }
-        }
-        SubscribeEventsMessage::ReactionEvent(evt) => WsEvent::Reaction {
-            convo_id: evt.convo_id.to_string(),
-            message_id: evt.message_id.to_string(),
-            emoji: evt.reaction.to_string(),
-            sender_did: evt.did.to_string(),
-        },
-        SubscribeEventsMessage::TreeChanged(evt) => {
-            let convo_id = evt.convo_id.to_string();
-            let server_tag = String::from_utf8_lossy(&evt.confirmation_tag).to_string();
-            let epoch = evt.epoch as u64;
-
-            // Compare server's canonical tag against our local tag
-            let gid_bytes = match hex::decode(&convo_id) {
-                Ok(b) => b,
-                Err(e) => {
-                    return WsEvent::Error(format!("Invalid group ID hex in treeChanged: {e}"));
+            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::ResetRequestedEvent(evt) => {
+                WsEvent::ResetRequested {
+                    convo_id: evt.conversation_id.to_string(),
+                    crypto_session_id: String::new(),
+                    generation: 0,
+                    trigger: "reset_requested".to_string(),
+                    request_event_id: evt.reset_request_id.to_string(),
+                    expected_new_mls_group_id: None,
                 }
-            };
-
-            let local_tag = mls
-                .with_context(|ctx| ctx.get_confirmation_tag(gid_bytes))
-                .ok()
-                .map(|tag| {
-                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tag)
-                });
-
-            if local_tag.as_deref() == Some(server_tag.as_str()) {
-                debug!("treeChanged for {convo_id}: local tag matches canonical, no action needed");
-            } else {
-                warn!(
-                    "treeChanged for {convo_id}: local tag MISMATCH (epoch {epoch}), repair needed"
-                );
             }
-
-            WsEvent::TreeChanged {
-                convo_id,
-                confirmation_tag: server_tag,
-                epoch,
-            }
-        }
-        other => {
-            info!(
-                "Ignoring subscription event: {:?}",
-                std::mem::discriminant(&other)
-            );
-            WsEvent::EpochAdvanced {
+            _ => WsEvent::EpochAdvanced {
                 convo_id: String::new(),
                 new_epoch: 0,
-            }
-        }
+            },
+        },
+        SubscribeEventsMessage::TypingEvent(evt) => WsEvent::Typing {
+            convo_id: evt.conversation_id.to_string(),
+            sender_did: evt.actor_did.to_string(),
+            is_typing: evt.is_typing,
+        },
     }
 }
 
