@@ -5,3 +5,6 @@ pub mod mls;
 pub mod recovery;
 pub mod storage;
 pub mod types;
+pub mod orchestrator_api;
+pub mod orchestrator_credentials;
+pub mod orchestrator_storage;
