@@ -1487,15 +1487,12 @@ impl ChatService {
     /// Returns the unique set of `user_did`s. Spec §8.5 Phase 1 / Phase 0 Q3:
     /// `groupResetEvent` carries no roster, so bootstrap MUST refetch fresh.
     async fn fetch_member_roster_for_bootstrap(&self, convo_id: &str) -> Result<Vec<String>> {
-        let resp: super::messages::GetConvosResp = self
-            .xrpc_query("blue.catbird.chat.getConversations", &[])
-            .await?;
+        let convos = self.fetch_conversations().await?;
 
         let mut roster: Vec<String> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for c in &resp.conversations {
-            let id = c.conversation_id.as_deref().unwrap_or(&c.group_id);
-            if id != convo_id {
+        for c in &convos {
+            if c.conversation_id != convo_id && c.group_id != convo_id {
                 continue;
             }
             for m in &c.members {
@@ -1510,15 +1507,9 @@ impl ChatService {
     /// Fetch the unique current group bound to a stable conversation ID.
     /// Ambiguous duplicate rows fail closed.
     async fn fetch_authoritative_group_id(&self, convo_id: &str) -> Result<Option<String>> {
-        let resp: super::messages::GetConvosResp = self
-            .xrpc_query("blue.catbird.chat.getConversations", &[])
-            .await?;
-        let mut matches = resp.conversations.into_iter().filter(|conversation| {
-            conversation
-                .conversation_id
-                .as_deref()
-                .unwrap_or(&conversation.group_id)
-                == convo_id
+        let convos = self.fetch_conversations().await?;
+        let mut matches = convos.into_iter().filter(|c| {
+            c.conversation_id == convo_id || c.group_id == convo_id
         });
         let Some(first) = matches.next() else {
             return Ok(None);

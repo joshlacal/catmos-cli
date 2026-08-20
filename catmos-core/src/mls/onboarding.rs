@@ -56,6 +56,12 @@ const KEY_DEVICE_ID: &str = "mls_device_id";
 const KEY_MLS_DID: &str = "mls_did";
 const KEY_DEVICE_UUID: &str = "device_uuid";
 
+fn derive_key_id(public_key: &[u8]) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use sha2::{Digest, Sha256};
+    URL_SAFE_NO_PAD.encode(Sha256::digest(public_key))
+}
+
 // ── MlsManager onboarding methods ─────────────────────────────────────
 
 impl MlsManager {
@@ -77,11 +83,11 @@ impl MlsManager {
 
         // 1. Device UUID — reuse if present, else generate
         let device_uuid = match db.get_session_value(KEY_DEVICE_UUID).await? {
-            Some(uuid) => {
+            Some(uuid) if !uuid.trim().is_empty() => {
                 info!("Reusing existing device UUID: {uuid}");
                 uuid
             }
-            None => {
+            _ => {
                 let uuid = uuid::Uuid::new_v4().to_string();
                 db.store_session_value(KEY_DEVICE_UUID, &uuid).await?;
                 info!("Generated new device UUID: {uuid}");
@@ -89,96 +95,122 @@ impl MlsManager {
             }
         };
 
-        // 2. Create key packages (identity = bare user DID as UTF-8 bytes)
-        let identity = did.as_bytes().to_vec();
-        let packages = self.create_key_packages(&identity, 25)?;
+        // 2. Create key packages (identity = bare user DID#device_uuid as UTF-8 bytes)
+        let mls_did = format!("{did}#{device_uuid}");
+        let identity_bytes = mls_did.as_bytes().to_vec();
+        let packages = self.create_key_packages(&identity_bytes, 25)?;
         info!("Created {} key packages", packages.len());
+
+        // Sort packages strictly by hash_ref (keyPackageRef)
+        let mut packages = packages;
+        packages.sort_by(|a, b| a.hash_ref.cmp(&b.hash_ref));
 
         // The signature public key comes from the first key package (all share the same signer)
         let signature_public_key = packages
             .first()
             .map(|kp| kp.signature_public_key.clone())
             .unwrap_or_default();
+        let key_id = derive_key_id(&signature_public_key);
 
-        // 3. Build XRPC request
-        let now = chrono::Utc::now();
-        let expires_str =
-            (now + chrono::Duration::days(30)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-
-        let key_packages: Vec<serde_json::Value> = packages
+        // 3. Build canonical v2 deviceEnrollmentBody
+        let key_packages_json: Vec<serde_json::Value> = packages
             .iter()
             .map(|kp| {
                 serde_json::json!({
-                    "cipherSuite": MLS_CIPHER_SUITE,
-                    "expiresAt": expires_str,
-                    "data": BASE64.encode(&kp.key_package_data),
+                    "framing": "mlsMessage",
+                    "contentType": "keyPackage",
+                    "bytes": BASE64.encode(&kp.key_package_data),
+                    "sha256": BASE64.encode(Sha256::digest(&kp.key_package_data)),
+                    "keyPackageRef": BASE64.encode(&kp.hash_ref),
                 })
             })
             .collect();
 
-        let req = serde_json::json!({
-            "deviceUuid": device_uuid,
-            "deviceName": device_name,
-            "signaturePublicKey": { "$bytes": BASE64.encode(&signature_public_key) },
-            "keyPackages": key_packages,
+        let signed_at = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#deviceEnrollmentBody",
+            "signatureDomain": "CATBIRD-CHAT-DEVICE-ENROLL\0",
+            "actorDid": did,
+            "deviceId": device_uuid,
+            "deviceName": if device_name.is_empty() { "catmos-cli" } else { device_name },
+            "keyId": key_id,
+            "signaturePublicKey": BASE64.encode(&signature_public_key),
+            "expectedAuthGeneration": 0,
+            "capability": {
+                "protocolVersion": "1",
+                "mlsVersion": "1.0",
+                "cipherSuite": MLS_CIPHER_SUITE,
+                "credentialType": "basic",
+                "addByValue": "supported",
+                "updatePath": "supported",
+                "removeByValue": "supported",
+                "ratchetTreeGroupInfo": "supported",
+                "externalPubGroupInfo": "presentButExternalCommitsForbidden",
+                "applicationFrameProfile": "dagCborApplication1",
+                "controlProfile": "publicGroup1",
+                "attachmentProfile": "aes256GcmBlob1",
+                "metadataProfile": "exporterAes256Gcm1",
+                "typingProfile": "signedClearEphemeral1"
+            },
+            "keyPackages": key_packages_json,
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "signedAt": signed_at,
         });
 
-        // 4. Call enrollDevice
-        let resp: RegisterDeviceResp = service
-            .xrpc_procedure("blue.catbird.chat.enrollDevice", &req)
+        // 4. Prepare signed request envelope using canonical transport
+        let binding = catbird_mls::orchestrator::CleanChatSigningContext {
+            actor_did: did.to_string(),
+            device_id: device_uuid.clone(),
+            auth_generation: None,
+        };
+        let prepared = catbird_mls::orchestrator::canonical_transport::prepare_signed_request_with(
+            &binding,
+            catbird_mls::orchestrator::CanonicalOperation::EnrollDevice,
+            serde_json::to_vec(&body).map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?,
+            |transcript| {
+                self.with_context(|ctx| {
+                    ctx.sign_with_identity_key(identity_bytes.clone(), transcript.to_vec())
+                })
+                .map_err(|_| catbird_mls::orchestrator::TransportError::Signing)
+            },
+        )
+        .map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?;
+
+        let prepared_body_bytes = prepared.body.ok_or_else(|| {
+            CatmosError::Mls(catbird_mls::MLSError::Internal("Prepared enrollment body is missing".into()))
+        })?;
+
+        // 5. Submit to enrollDevice
+        let resp: serde_json::Value = service
+            .xrpc_post_raw("blue.catbird.chat.enrollDevice", &prepared_body_bytes)
             .await?;
 
-        info!(
-            "Device registered: id={}, mls_did={}, welcomes={}, auto_joined={}",
-            resp.device_id,
-            resp.mls_did,
-            resp.welcome_messages.len(),
-            resp.auto_joined_convos.len()
-        );
-
-        // 5. Process welcome messages
-        for wm in &resp.welcome_messages {
-            match self.process_welcome_b64(&wm.welcome, did) {
-                Ok(group_id) => {
-                    let group_id_hex = hex::encode(&group_id);
-                    info!(
-                        "Joined convo {} via welcome (group={})",
-                        wm.convo_id, group_id_hex
-                    );
-                    // Encrypted-bootstrap (post-MLS-metadata cutover): fetch
-                    // and decrypt the metadata blob now that the group
-                    // exporter is live. Failure is non-fatal — the next
-                    // fetch_conversations cycle will retry.
-                    if let Err(e) = service
-                        .bootstrap_group_metadata(&wm.convo_id, &group_id_hex)
-                        .await
-                    {
-                        warn!(
-                            "Welcome bootstrap_group_metadata failed for {}: {e}",
-                            wm.convo_id
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to process welcome for convo {}: {e}", wm.convo_id);
-                }
-            }
-        }
+        let device_obj = resp.get("device").unwrap_or(&resp);
+        let server_device_id = device_obj
+            .get("deviceId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CatmosError::Xrpc("enrollDevice response missing deviceId".into()))?
+            .to_string();
+        let mls_did = format!("{did}#{server_device_id}");
 
         // 6. Persist device info
-        db.store_session_value(KEY_DEVICE_ID, &resp.device_id)
-            .await?;
-        db.store_session_value(KEY_MLS_DID, &resp.mls_did).await?;
+        db.store_session_value(KEY_DEVICE_ID, &server_device_id).await?;
+        db.store_session_value(KEY_MLS_DID, &mls_did).await?;
+
+        info!("Device registered successfully: id={}, mls_did={}", server_device_id, mls_did);
 
         let info = DeviceInfo {
-            device_id: resp.device_id,
-            mls_did: resp.mls_did,
+            device_id: server_device_id,
+            mls_did,
             device_uuid,
             signature_public_key,
         };
 
         Ok(info)
     }
+
 
     /// Process a base64-encoded welcome message to join a group.
     /// Returns the group ID bytes on success.
@@ -499,10 +531,16 @@ impl MlsManager {
         service: &ChatService,
         convo_id: &str,
     ) -> Result<String> {
+        let actor_device_id = service.actor_device_id().await.unwrap_or_default();
         let group_state: serde_json::Value = service
             .xrpc_query(
                 "blue.catbird.chat.getConversationState",
-                &[("convoId", convo_id), ("include", "groupInfo")],
+                &[
+                    ("actorDeviceId", &actor_device_id),
+                    ("convoId", convo_id),
+                    ("conversationId", convo_id),
+                    ("include", "groupInfo"),
+                ],
             )
             .await?;
 
@@ -549,10 +587,16 @@ impl MlsManager {
         service: &ChatService,
         convo_id: &str,
     ) -> Result<Option<String>> {
+        let actor_device_id = service.actor_device_id().await.unwrap_or_default();
         let group_state: serde_json::Value = match service
             .xrpc_query(
                 "blue.catbird.chat.getConversationState",
-                &[("convoId", convo_id), ("include", "welcome")],
+                &[
+                    ("actorDeviceId", &actor_device_id),
+                    ("convoId", convo_id),
+                    ("conversationId", convo_id),
+                    ("include", "welcome"),
+                ],
             )
             .await
         {

@@ -94,31 +94,46 @@ impl ChatService {
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
-        let resp = if self.should_retry_after_refresh(resp.status()) {
+        let status = resp.status();
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
             let new_bearer = self.refresh_bearer().await?;
             let headers = self.bearer_headers(&new_bearer)?;
-            self.http
+            let retry_resp = self
+                .http
                 .post(&url)
                 .headers(headers)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| CatmosError::Network(e.to_string()))?
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            let retry_status = retry_resp.status();
+            let retry_bytes = retry_resp
+                .bytes()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            if !retry_status.is_success() {
+                let err_body = String::from_utf8_lossy(&retry_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "createRecord({BLOCK_COLLECTION}) returned {retry_status}: {err_body}"
+                )));
+            }
+            retry_bytes
         } else {
-            resp
+            if !status.is_success() {
+                let err_body = String::from_utf8_lossy(&body_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "createRecord({BLOCK_COLLECTION}) returned {status}: {err_body}"
+                )));
+            }
+            body_bytes
         };
 
-        let status = resp.status();
-        if !status.is_success() {
-            let err_body = resp.text().await.unwrap_or_default();
-            return Err(CatmosError::Xrpc(format!(
-                "createRecord({BLOCK_COLLECTION}) returned {status}: {err_body}"
-            )));
-        }
-
-        let parsed: CreateRecordResp = resp
-            .json()
-            .await
+        let parsed: CreateRecordResp = serde_json::from_slice(&body_bytes)
             .map_err(|e| CatmosError::Xrpc(format!("createRecord parse: {e}")))?;
         Ok(parsed.uri)
     }
@@ -215,31 +230,48 @@ impl ChatService {
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
-        let resp = if self.should_retry_after_refresh(resp.status()) {
+        let status = resp.status();
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
             let new_bearer = self.refresh_bearer().await?;
             let headers = self.bearer_headers(&new_bearer)?;
-            self.http
+            let retry_resp = self
+                .http
                 .get(&url)
                 .headers(headers)
                 .query(&params)
                 .send()
                 .await
-                .map_err(|e| CatmosError::Network(e.to_string()))?
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            let retry_status = retry_resp.status();
+            let retry_bytes = retry_resp
+                .bytes()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            if !retry_status.is_success() {
+                let err_body = String::from_utf8_lossy(&retry_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "listRecords({BLOCK_COLLECTION}) returned {retry_status}: {err_body}"
+                )));
+            }
+            retry_bytes
         } else {
-            resp
+            if !status.is_success() {
+                let err_body = String::from_utf8_lossy(&body_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "listRecords({BLOCK_COLLECTION}) returned {status}: {err_body}"
+                )));
+            }
+            body_bytes
         };
 
-        let status = resp.status();
-        if !status.is_success() {
-            let err_body = resp.text().await.unwrap_or_default();
-            return Err(CatmosError::Xrpc(format!(
-                "listRecords({BLOCK_COLLECTION}) returned {status}: {err_body}"
-            )));
-        }
-
-        resp.json::<ListRecordsResp>()
-            .await
-            .map_err(|e| CatmosError::Xrpc(format!("listRecords parse: {e}")))
+        let parsed = serde_json::from_slice::<ListRecordsResp>(&body_bytes)
+            .map_err(|e| CatmosError::Xrpc(format!("listRecords parse: {e}")))?;
+        Ok(parsed)
     }
 
     async fn delete_block_record(&self, rkey: &str) -> Result<()> {
@@ -262,23 +294,32 @@ impl ChatService {
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
-        let resp = if self.should_retry_after_refresh(resp.status()) {
+        let status = resp.status();
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        if self.should_retry_after_refresh(status, &body_bytes) {
             let new_bearer = self.refresh_bearer().await?;
             let headers = self.bearer_headers(&new_bearer)?;
-            self.http
+            let retry_resp = self
+                .http
                 .post(&url)
                 .headers(headers)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| CatmosError::Network(e.to_string()))?
-        } else {
-            resp
-        };
-
-        let status = resp.status();
-        if !status.is_success() {
-            let err_body = resp.text().await.unwrap_or_default();
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            let retry_status = retry_resp.status();
+            if !retry_status.is_success() {
+                let err_body = retry_resp.text().await.unwrap_or_default();
+                return Err(CatmosError::Xrpc(format!(
+                    "deleteRecord({BLOCK_COLLECTION}) returned {retry_status}: {err_body}"
+                )));
+            }
+        } else if !status.is_success() {
+            let err_body = String::from_utf8_lossy(&body_bytes);
             return Err(CatmosError::Xrpc(format!(
                 "deleteRecord({BLOCK_COLLECTION}) returned {status}: {err_body}"
             )));

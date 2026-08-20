@@ -577,11 +577,10 @@ impl ChatService {
         kind: Option<&str>,
     ) -> Result<Option<Vec<u8>>> {
         const NSID: &str = "blue.catbird.chat.getBlob";
-
-        let bearer = self.current_bearer().await?;
-        let (url, headers) = self.metadata_blob_request(NSID, &bearer)?;
-
         let mut params: Vec<(&str, String)> = Vec::new();
+        if let Ok(actor_device_id) = self.actor_device_id().await {
+            params.push(("actorDeviceId", actor_device_id));
+        }
         if let Some(v) = blob_locator {
             params.push(("blobLocator", v.to_string()));
         }
@@ -610,40 +609,58 @@ impl ChatService {
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
-        let resp = if self.should_retry_after_refresh(resp.status()) {
+        let status = resp.status();
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
             let new_bearer = self.refresh_bearer().await?;
             let (url, headers) = self.metadata_blob_request(NSID, &new_bearer)?;
-            self.http
+            let retry_resp = self
+                .http
                 .get(&url)
                 .headers(headers)
                 .query(&params)
                 .send()
                 .await
-                .map_err(|e| CatmosError::Network(e.to_string()))?
-        } else {
-            resp
-        };
-
-        let status = resp.status();
-        if status == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            // Body shape `{"error":"BlobNotFound", ...}` is also a soft miss.
-            if body.contains("BlobNotFound") {
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            let retry_status = retry_resp.status();
+            let retry_bytes = retry_resp
+                .bytes()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            if retry_status == StatusCode::NOT_FOUND {
                 return Ok(None);
             }
-            return Err(CatmosError::Xrpc(format!(
-                "{NSID} returned {status}: {body}"
-            )));
-        }
+            if !retry_status.is_success() {
+                let body_str = String::from_utf8_lossy(&retry_bytes);
+                if body_str.contains("BlobNotFound") {
+                    return Ok(None);
+                }
+                return Err(CatmosError::Xrpc(format!(
+                    "{NSID} returned {retry_status}: {body_str}"
+                )));
+            }
+            retry_bytes
+        } else {
+            if status == StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            if !status.is_success() {
+                let body_str = String::from_utf8_lossy(&body_bytes);
+                if body_str.contains("BlobNotFound") {
+                    return Ok(None);
+                }
+                return Err(CatmosError::Xrpc(format!(
+                    "{NSID} returned {status}: {body_str}"
+                )));
+            }
+            body_bytes
+        };
 
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| CatmosError::Network(e.to_string()))?;
-        Ok(Some(bytes.to_vec()))
+        Ok(Some(body_bytes.to_vec()))
     }
 
     /// XRPC POST wrapper for `blue.catbird.chat.uploadBlob`.
@@ -668,10 +685,12 @@ impl ChatService {
             HeaderValue::from_static("application/octet-stream"),
         );
 
-        let mut params: Vec<(&str, String)> = vec![
-            ("blobLocator", blob_locator.to_string()),
-            ("groupId", group_id.to_string()),
-        ];
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if let Ok(actor_device_id) = self.actor_device_id().await {
+            params.push(("actorDeviceId", actor_device_id));
+        }
+        params.push(("blobLocator", blob_locator.to_string()));
+        params.push(("groupId", group_id.to_string()));
         if let Some(v) = convo_id {
             params.push(("convoId", v.to_string()));
         }
@@ -695,43 +714,46 @@ impl ChatService {
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
-        let resp = if self.should_retry_after_refresh(resp.status()) {
+        let status = resp.status();
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        if self.should_retry_after_refresh(status, &body_bytes) {
             let new_bearer = self.refresh_bearer().await?;
             let (url, mut headers) = self.metadata_blob_request(NSID, &new_bearer)?;
             headers.insert(
                 reqwest::header::CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
             );
-            self.http
+            let retry_resp = self
+                .http
                 .post(&url)
                 .headers(headers)
                 .query(&params)
                 .body(body)
                 .send()
                 .await
-                .map_err(|e| CatmosError::Network(e.to_string()))?
-        } else {
-            resp
-        };
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            let retry_status = retry_resp.status();
+            if !retry_status.is_success() {
+                let body_str = retry_resp.text().await.unwrap_or_default();
+                return Err(CatmosError::Xrpc(format!(
+                    "{NSID} returned {retry_status}: {body_str}"
+                )));
+            }
+        } else if !status.is_success() {
+            let body_str = String::from_utf8_lossy(&body_bytes);
             return Err(CatmosError::Xrpc(format!(
-                "{NSID} returned {status}: {body}"
+                "{NSID} returned {status}: {body_str}"
             )));
         }
 
-        // Drain so the connection returns to the pool. The output schema
-        // includes blob_locator + size; we don't need either.
-        let _ = resp.bytes().await;
         Ok(())
     }
 
-    /// Build URL + auth headers for the metadata-blob endpoints. Mirrors
-    /// `ChatService::build_request` but is colocated here to keep this
-    /// module self-contained — encoding/decoding the binary body is unique
-    /// to these two endpoints.
+    /// Build URL + auth headers for the metadata-blob endpoints.
     fn metadata_blob_request(&self, nsid: &str, bearer: &str) -> Result<(String, HeaderMap)> {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -742,13 +764,17 @@ impl ChatService {
 
         let url = match &self.auth {
             AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
-            AuthMethod::AppPassword { .. } => {
-                let base = if nsid.starts_with("blue.catbird.chat.") {
-                    &self.config.server.mls_url
-                } else {
-                    &self.config.server.nest_url
-                };
-                format!("{base}/xrpc/{nsid}")
+            AuthMethod::AppPassword { pds_url, .. } => {
+                if nsid.starts_with("blue.catbird.chat.") || nsid.starts_with("blue.catbird.mlsChat.") {
+                    let proxy_val = crate::mls::atproto_proxy_header_value();
+                    if let Ok(hv) = HeaderValue::from_str(&proxy_val) {
+                        headers.insert(
+                            reqwest::header::HeaderName::from_static("atproto-proxy"),
+                            hv,
+                        );
+                    }
+                }
+                format!("{}/xrpc/{nsid}", pds_url.trim_end_matches('/'))
             }
         };
 

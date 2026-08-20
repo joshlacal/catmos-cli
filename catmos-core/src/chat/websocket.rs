@@ -362,10 +362,10 @@ async fn get_subscription_ticket_standalone(
 
     let nsid = "blue.catbird.chat.getSubscriptionTicket";
 
-    let base_url = match auth {
-        crate::auth::AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
-        crate::auth::AuthMethod::AppPassword { .. } => {
-            format!("{}/xrpc/{nsid}", config.server.mls_url)
+    let (base_url, is_proxy) = match auth {
+        crate::auth::AuthMethod::OAuth { nest_url, .. } => (format!("{nest_url}/xrpc/{nsid}"), false),
+        crate::auth::AuthMethod::AppPassword { pds_url, .. } => {
+            (format!("{}/xrpc/{nsid}", pds_url.trim_end_matches('/')), true)
         }
     };
 
@@ -388,6 +388,15 @@ async fn get_subscription_ticket_standalone(
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {bearer}")).map_err(|e| e.to_string())?,
         );
+        if is_proxy {
+            let proxy_val = crate::mls::atproto_proxy_header_value();
+            if let Ok(hv) = HeaderValue::from_str(&proxy_val) {
+                headers.insert(
+                    reqwest::header::HeaderName::from_static("atproto-proxy"),
+                    hv,
+                );
+            }
+        }
         Ok(headers)
     };
 
@@ -399,38 +408,47 @@ async fn get_subscription_ticket_standalone(
         .await
         .map_err(|e| format!("Network error: {e}"))?;
 
-    // Retry once after token refresh if AppPassword + unauthorized
-    let should_refresh = token_session.is_some()
-        && matches!(
-            resp.status(),
-            StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
-        );
-    let resp = if should_refresh {
+    let status = resp.status();
+    let body_bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    // Retry once after token refresh only if AppPassword + ExpiredToken
+    let body_bytes = if token_session.is_some() && crate::chat::service::is_expired_token_response(status, &body_bytes) {
         let sess = token_session.expect("checked above");
         let new_bearer = sess
             .refresh(db)
             .await
             .map_err(|e| format!("refresh failed: {e}"))?;
-        http.post(&base_url)
+        let retry_resp = http
+            .post(&base_url)
             .headers(build_headers(&new_bearer)?)
             .json(&serde_json::json!({}))
             .send()
             .await
-            .map_err(|e| format!("Network error (retry): {e}"))?
+            .map_err(|e| format!("Network error (retry): {e}"))?;
+        let retry_status = retry_resp.status();
+        let retry_bytes = retry_resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Network error (retry): {e}"))?;
+        if !retry_status.is_success() {
+            let body = String::from_utf8_lossy(&retry_bytes);
+            return Err(format!("Ticket request failed: {body}"));
+        }
+        retry_bytes
     } else {
-        resp
+        if !status.is_success() {
+            let body = String::from_utf8_lossy(&body_bytes);
+            return Err(format!("Ticket request failed: {body}"));
+        }
+        body_bytes
     };
 
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Ticket request failed: {body}"));
-    }
-
-    resp.json::<SubscriptionTicketResponse>()
-        .await
+    serde_json::from_slice::<SubscriptionTicketResponse>(&body_bytes)
         .map_err(|e| format!("Parse error: {e}"))
 }
-
 /// Convert a decoded `SubscribeEventsMessage` into a `WsEvent`, decrypting
 /// message ciphertext where applicable.
 ///

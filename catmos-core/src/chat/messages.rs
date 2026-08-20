@@ -512,14 +512,98 @@ impl ChatService {
     /// Resolves all unique member DIDs to handles and populates
     /// `self.handle_cache` so the TUI can display friendly names.
     pub async fn fetch_conversations(&self) -> Result<Vec<Conversation>> {
-        let resp: GetConvosResp = self.xrpc_query("blue.catbird.chat.getConversations", &[]).await?;
+        let actor_device_id = self.actor_device_id().await?;
+        let resp: serde_json::Value = self
+            .xrpc_query(
+                "blue.catbird.chat.getConversations",
+                &[("actorDeviceId", &actor_device_id), ("limit", "50")],
+            )
+            .await?;
 
-        let mut convos: Vec<Conversation> = resp
-            .conversations
-            .iter()
-            .map(convo_resp_to_conversation)
-            .collect();
-
+        let mut convos: Vec<Conversation> = if let Some(items) = resp.get("items").and_then(|v| v.as_array()) {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let state_obj = item.get("state")?;
+                    let coords = state_obj.get("coordinates")?;
+                    let convo_id = coords.get("conversationId").and_then(|v| v.as_str())?.to_string();
+                    let epoch = coords.get("epoch").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
+                    let group_id = if let Some(gid_val) = coords.get("groupId") {
+                        if let Some(s) = gid_val.as_str() {
+                            if let Ok(b) = BASE64.decode(s) {
+                                hex::encode(b)
+                            } else {
+                                s.to_string()
+                            }
+                        } else if let Some(arr) = gid_val.as_array() {
+                            let bytes: Vec<u8> = arr.iter().filter_map(|b| b.as_u64().map(|n| n as u8)).collect();
+                            hex::encode(bytes)
+                        } else {
+                            convo_id.clone()
+                        }
+                    } else {
+                        convo_id.clone()
+                    };
+                    let cipher_suite = state_obj
+                        .get("cipherSuite")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(crate::mls::MLS_CIPHER_SUITE)
+                        .to_string();
+                    let mut members = Vec::new();
+                    let mut creator = String::new();
+                    if let Some(participants) = state_obj.get("participants").and_then(|v| v.as_array()) {
+                        for (idx, p) in participants.iter().enumerate() {
+                            let user_did = p.get("userDid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let role = p.get("role").and_then(|v| v.as_str()).unwrap_or("member");
+                            let is_admin = role == "admin";
+                            if is_admin && creator.is_empty() {
+                                creator = user_did.clone();
+                            } else if idx == 0 && creator.is_empty() {
+                                creator = user_did.clone();
+                            }
+                            members.push(Member {
+                                did: user_did.clone(),
+                                user_did: user_did.clone(),
+                                device_id: None,
+                                device_name: None,
+                                is_admin,
+                                is_moderator: role == "moderator",
+                                joined_at: Utc::now(),
+                            });
+                        }
+                    }
+                    Some(Conversation {
+                        conversation_id: convo_id,
+                        group_id,
+                        name: None,
+                        description: None,
+                        creator,
+                        epoch,
+                        cipher_suite,
+                        members,
+                        created_at: Utc::now(),
+                        last_message_at: None,
+                        unread_count: 0,
+                        alias: None,
+                        metadata_version: None,
+                        metadata_blob_locator: None,
+                        avatar_blob_locator: None,
+                        avatar_bytes: None,
+                        avatar_content_type: None,
+                    })
+                })
+                .collect()
+        } else if let Some(convo_arr) = resp.get("conversations").and_then(|v| v.as_array()) {
+            let legacy_resp: GetConvosResp = serde_json::from_value(resp)
+                .map_err(|e| CatmosError::Xrpc(format!("parse conversations: {e}")))?;
+            legacy_resp
+                .conversations
+                .iter()
+                .map(convo_resp_to_conversation)
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Hydrate locally-decrypted metadata into the freshly-built
         // Conversation values BEFORE the COALESCE-aware DB upsert below.
         // Without this step the in-memory cache published to the TUI
@@ -722,11 +806,14 @@ impl ChatService {
             // applied to reach current_epoch, which then fails with a
             // forward-secrecy error (sender_epoch = current-1). Skip past it.
             let from_epoch = current_epoch.saturating_add(1).to_string();
+            let actor_device_id = self.actor_device_id().await.unwrap_or_default();
             let resp: GetMessagesResp = self
                 .xrpc_query(
                     "blue.catbird.chat.getEntries",
                     &[
+                        ("actorDeviceId", &actor_device_id),
                         ("convoId", convo_id),
+                        ("conversationId", convo_id),
                         ("type", "commit"),
                         ("fromEpoch", &from_epoch),
                         ("limit", "50"),
@@ -951,8 +1038,11 @@ impl ChatService {
         let limit_str = limit.to_string();
         let since_seq_str = since_seq.map(|s| s.to_string());
 
+        let actor_device_id = self.actor_device_id().await.unwrap_or_default();
         let mut params: Vec<(&str, &str)> = vec![
+            ("actorDeviceId", &actor_device_id),
             ("convoId", convo_id),
+            ("conversationId", convo_id),
             ("type", "app"),
             ("limit", &limit_str),
         ];

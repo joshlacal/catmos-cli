@@ -45,6 +45,26 @@ pub enum QuarantineEvent {
         via: QuarantineExitReason,
     },
 }
+/// Return true if the response status and body indicate an ExpiredToken error.
+pub(crate) fn is_expired_token_response(status: StatusCode, body: &[u8]) -> bool {
+    if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST) {
+        return false;
+    }
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
+            if err == "ExpiredToken" {
+                return true;
+            }
+        }
+    }
+    if let Ok(text) = std::str::from_utf8(body) {
+        if text.contains("ExpiredToken") {
+            return true;
+        }
+    }
+    false
+}
+
 
 // ── Thin response wrappers for endpoints not covered in messages.rs ─────
 //
@@ -418,31 +438,131 @@ impl ChatService {
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
-        let resp = if self.should_retry_after_refresh(resp.status()) {
+        let status = resp.status();
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
             let new_bearer = self.refresh_bearer().await?;
             let (url, headers) = self.build_request(nsid, &new_bearer)?;
             debug!("XRPC POST {nsid} retry after refresh -> {url}");
-            self.http
+            let retry_resp = self
+                .http
                 .post(&url)
                 .headers(headers)
                 .json(input)
                 .send()
                 .await
-                .map_err(|e| CatmosError::Network(e.to_string()))?
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            let retry_status = retry_resp.status();
+            let retry_bytes = retry_resp
+                .bytes()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            if !retry_status.is_success() {
+                let body_str = String::from_utf8_lossy(&retry_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "{nsid} returned {retry_status}: {body_str}"
+                )));
+            }
+            retry_bytes
         } else {
-            resp
+            if !status.is_success() {
+                let body_str = String::from_utf8_lossy(&body_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "{nsid} returned {status}: {body_str}"
+                )));
+            }
+            body_bytes
         };
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(CatmosError::Xrpc(format!(
-                "{nsid} returned {status}: {body}"
-            )));
-        }
+        serde_json::from_slice::<Resp>(&body_bytes)
+            .map_err(|e| CatmosError::Xrpc(format!("Failed to parse {nsid} response: {e}")))
+    }
 
-        resp.json::<Resp>()
+    /// POST raw JSON bytes to an XRPC procedure.
+    pub async fn xrpc_post_raw<Resp: DeserializeOwned>(
+        &self,
+        nsid: &str,
+        body_json: &[u8],
+    ) -> Result<Resp> {
+        let bearer = self.current_bearer().await?;
+        let (url, mut headers) = self.build_request(nsid, &bearer)?;
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        debug!("XRPC POST (raw) {nsid} -> {url}");
+
+        let resp = self
+            .http
+            .post(&url)
+            .headers(headers)
+            .body(body_json.to_vec())
+            .send()
             .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let status = resp.status();
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let is_sensitive_device_endpoint = nsid.contains("enrollDevice")
+            || nsid.contains("getOwnDevices")
+            || nsid.contains("rebindDeviceAuthentication")
+            || nsid.contains("revokeDevice");
+
+        let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
+            let new_bearer = self.refresh_bearer().await?;
+            let (url, mut headers) = self.build_request(nsid, &new_bearer)?;
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            debug!("XRPC POST (raw) {nsid} retry after refresh -> {url}");
+            let retry_resp = self
+                .http
+                .post(&url)
+                .headers(headers)
+                .body(body_json.to_vec())
+                .send()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            let retry_status = retry_resp.status();
+            let retry_bytes = retry_resp
+                .bytes()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            if !retry_status.is_success() {
+                if is_sensitive_device_endpoint {
+                    return Err(CatmosError::Xrpc(format!("{nsid} returned {retry_status}")));
+                } else {
+                    let body_str = String::from_utf8_lossy(&retry_bytes);
+                    return Err(CatmosError::Xrpc(format!(
+                        "{nsid} returned {retry_status}: {body_str}"
+                    )));
+                }
+            }
+            retry_bytes
+        } else {
+            if !status.is_success() {
+                if is_sensitive_device_endpoint {
+                    return Err(CatmosError::Xrpc(format!("{nsid} returned {status}")));
+                } else {
+                    let body_str = String::from_utf8_lossy(&body_bytes);
+                    return Err(CatmosError::Xrpc(format!(
+                        "{nsid} returned {status}: {body_str}"
+                    )));
+                }
+            }
+            body_bytes
+        };
+
+        serde_json::from_slice::<Resp>(&body_bytes)
             .map_err(|e| CatmosError::Xrpc(format!("Failed to parse {nsid} response: {e}")))
     }
 
@@ -468,64 +588,99 @@ impl ChatService {
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
-        let resp = if self.should_retry_after_refresh(resp.status()) {
-            let new_bearer = self.refresh_bearer().await?;
-            let (url, headers) = self.build_request(nsid, &new_bearer)?;
-            debug!("XRPC GET {nsid} retry after refresh -> {url}");
-            self.http
-                .get(&url)
-                .headers(headers)
-                .query(params)
-                .send()
-                .await
-                .map_err(|e| CatmosError::Network(e.to_string()))?
-        } else {
-            resp
-        };
+        let status = resp.status();
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
 
         let is_sensitive_device_endpoint = nsid.contains("getOwnDevices")
             || nsid.contains("enrollDevice")
             || nsid.contains("rebindDeviceAuthentication")
             || nsid.contains("revokeDevice");
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            if is_sensitive_device_endpoint {
-                return Err(CatmosError::Xrpc(format!("{nsid} returned {status}")));
-            } else {
-                return Err(CatmosError::Xrpc(format!(
-                    "{nsid} returned {status}: {body}"
-                )));
+        let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
+            let new_bearer = self.refresh_bearer().await?;
+            let (url, headers) = self.build_request(nsid, &new_bearer)?;
+            debug!("XRPC GET {nsid} retry after refresh -> {url}");
+            let retry_resp = self
+                .http
+                .get(&url)
+                .headers(headers)
+                .query(params)
+                .send()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            let retry_status = retry_resp.status();
+            let retry_bytes = retry_resp
+                .bytes()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            if !retry_status.is_success() {
+                if is_sensitive_device_endpoint {
+                    return Err(CatmosError::Xrpc(format!("{nsid} returned {retry_status}")));
+                } else {
+                    let body_str = String::from_utf8_lossy(&retry_bytes);
+                    return Err(CatmosError::Xrpc(format!(
+                        "{nsid} returned {retry_status}: {body_str}"
+                    )));
+                }
             }
-        }
+            retry_bytes
+        } else {
+            if !status.is_success() {
+                if is_sensitive_device_endpoint {
+                    return Err(CatmosError::Xrpc(format!("{nsid} returned {status}")));
+                } else {
+                    let body_str = String::from_utf8_lossy(&body_bytes);
+                    return Err(CatmosError::Xrpc(format!(
+                        "{nsid} returned {status}: {body_str}"
+                    )));
+                }
+            }
+            body_bytes
+        };
 
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| CatmosError::Network(e.to_string()))?;
         if !is_sensitive_device_endpoint {
-            tracing::debug!("XRPC {nsid} raw: {}", &body[..body.len().min(500)]);
+            let sample_len = body_bytes.len().min(500);
+            tracing::debug!("XRPC {nsid} raw: {}", String::from_utf8_lossy(&body_bytes[..sample_len]));
         }
-        serde_json::from_str::<R>(&body).map_err(|e| {
+        serde_json::from_slice::<R>(&body_bytes).map_err(|e| {
             if is_sensitive_device_endpoint {
                 CatmosError::Xrpc(format!("Failed to parse {nsid}: {e}"))
             } else {
+                let sample_len = body_bytes.len().min(300);
                 CatmosError::Xrpc(format!(
                     "Failed to parse {nsid}: {e}\nBody: {}",
-                    &body[..body.len().min(300)]
+                    String::from_utf8_lossy(&body_bytes[..sample_len])
                 ))
             }
         })
     }
 
     /// True if we should refresh & retry after the server returned this status
-    /// code (AppPassword only — OAuth is refreshed server-side by nest).
-    pub(crate) fn should_retry_after_refresh(&self, status: StatusCode) -> bool {
-        self.token_session.is_some()
-            && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST)
+    /// code and body (AppPassword only — OAuth is refreshed server-side by nest).
+    /// Only retries when the response is explicitly an ExpiredToken error.
+    pub(crate) fn should_retry_after_refresh(&self, status: StatusCode, body: &[u8]) -> bool {
+        self.token_session.is_some() && is_expired_token_response(status, body)
     }
 
+    /// Return the active registered device ID for this account.
+    pub async fn actor_device_id(&self) -> Result<String> {
+        if let Some(id) = self.db.get_session_value("mls_device_id").await? {
+            if !id.trim().is_empty() {
+                return Ok(id);
+            }
+        }
+        if let Some(id) = self.db.get_session_value("device_uuid").await? {
+            if !id.trim().is_empty() {
+                return Ok(id);
+            }
+        }
+        Err(CatmosError::AuthFailed(
+            "No registered MLS device ID found. Please register a device first.".into(),
+        ))
+    }
     /// Fetch the current bearer token for the active auth method.
     pub(crate) async fn current_bearer(&self) -> Result<String> {
         match (&self.auth, &self.token_session) {
@@ -781,42 +936,113 @@ impl ChatService {
 
     /// List devices registered for the authenticated user.
     pub async fn list_devices(&self) -> Result<Vec<Device>> {
-        let resp: ListDevicesResp = self.xrpc_query("blue.catbird.chat.getDevices", &[]).await?;
+        let actor_device_id = self.actor_device_id().await?;
+        let resp: serde_json::Value = self
+            .xrpc_query(
+                "blue.catbird.chat.getOwnDevices",
+                &[("actorDeviceId", &actor_device_id)],
+            )
+            .await?;
 
-        let devices = resp
-            .devices
-            .into_iter()
-            .map(|d| Device {
-                device_id: d.device_id,
-                mls_did: d.credential_did,
-                device_name: d.device_name,
-            })
-            .collect();
+        if let Some(items) = resp.get("items").and_then(|v| v.as_array()) {
+            let mut devices = Vec::new();
+            for item in items {
+                let dev = item.get("device").unwrap_or(item);
+                let device_id = dev
+                    .get("deviceId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let device_name = dev
+                    .get("deviceName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&device_id)
+                    .to_string();
+                let mls_did = format!("{}#{}", self.did(), device_id);
+                devices.push(Device {
+                    device_id,
+                    mls_did,
+                    device_name,
+                });
+            }
+            return Ok(devices);
+        }
 
-        Ok(devices)
+        if let Some(devices_arr) = resp.get("devices").and_then(|v| v.as_array()) {
+            let mut devices = Vec::new();
+            for dev in devices_arr {
+                let device_id = dev
+                    .get("deviceId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let credential_did = dev
+                    .get("credentialDid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let device_name = dev
+                    .get("deviceName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&device_id)
+                    .to_string();
+                devices.push(Device {
+                    device_id,
+                    mls_did: credential_did,
+                    device_name,
+                });
+            }
+            return Ok(devices);
+        }
+
+        Ok(Vec::new())
     }
 
     /// Get the current key package availability status.
     pub async fn get_key_package_status(&self) -> Result<KeyPackageStatus> {
-        let resp: KeyPackageStatusResp = self
+        let actor_device_id = self.actor_device_id().await?;
+        let resp: serde_json::Value = self
             .xrpc_query(
-                "blue.catbird.chat.getDevices",
-                &[("include", "stats")],
+                "blue.catbird.chat.getOwnDevices",
+                &[("actorDeviceId", &actor_device_id)],
             )
             .await?;
 
-        match resp.stats {
-            Some(s) => Ok(KeyPackageStatus {
-                available: s.total_available as u64,
-                target: 50,                              // spec: KEY_PACKAGE_TARGET = 50
-                needs_replenish: s.total_available < 10, // spec: KEY_PACKAGE_LOW_THRESHOLD = 10
-            }),
-            None => Ok(KeyPackageStatus {
-                available: 0,
-                target: 50,
-                needs_replenish: true,
-            }),
+        if let Some(items) = resp.get("items").and_then(|v| v.as_array()) {
+            for item in items {
+                let dev = item.get("device").unwrap_or(item);
+                let dev_id = dev.get("deviceId").and_then(|v| v.as_str()).unwrap_or("");
+                if dev_id == actor_device_id || items.len() == 1 {
+                    let avail = dev
+                        .get("availablePackageCount")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    return Ok(KeyPackageStatus {
+                        available: avail as u64,
+                        target: 25,
+                        needs_replenish: avail < 10,
+                    });
+                }
+            }
         }
+
+        if let Some(stats) = resp.get("stats") {
+            let avail = stats
+                .get("totalAvailable")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            return Ok(KeyPackageStatus {
+                available: avail as u64,
+                target: 50,
+                needs_replenish: avail < 10,
+            });
+        }
+
+        Ok(KeyPackageStatus {
+            available: 0,
+            target: 25,
+            needs_replenish: true,
+        })
     }
 
     // ── Join / Update / Member management ─────────────────────────────────
@@ -1197,123 +1423,18 @@ impl ChatService {
             .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
 
         let encrypt_result = self
-            .mls
-            .with_context(|ctx| ctx.encrypt_message(group_id_bytes.clone(), plaintext))?;
-
-        let epoch = self.get_epoch(convo_id).unwrap_or(0);
-        let msg_id = ulid::Ulid::new().to_string();
-        let padded_size = encrypt_result.ciphertext.len() as i64;
-
-        let confirmation_tag = self.get_confirmation_tag_b64(&group_id_bytes);
-
-        let req = serde_json::json!({
-            "convoId": convo_id,
-            "ciphertext": BASE64.encode(&encrypt_result.ciphertext),
-            "epoch": epoch,
-            "msgId": msg_id,
-            "paddedSize": padded_size,
-            "confirmationTag": confirmation_tag,
-        });
-
-        let _: serde_json::Value = self
-            .xrpc_procedure("blue.catbird.chat.sendMessage", &req)
-            .await?;
-
-        Ok(())
-    }
-
-    /// Register a new device for the authenticated user.
-    ///
-    /// Note: Full MLS device registration (with signature key + key packages)
-    /// is handled by the MLS orchestration layer. This method provides a
-    /// simplified registration path using the generated NSID.
-    pub async fn register_device(&self, name: Option<&str>) -> Result<Device> {
-        let device_name = name.unwrap_or("catmos-cli");
-
-        let req = serde_json::json!({
-            "deviceName": device_name,
-        });
-
-        let device: Device = self
-            .xrpc_procedure("blue.catbird.chat.enrollDevice", &req)
-            .await?;
-
-        Ok(device)
-    }
-
-    /// Replenish key packages on the server.
-    pub async fn replenish_key_packages(&self) -> Result<u32> {
-        let identity = self.did().as_bytes().to_vec();
-        let packages = self.mls.create_key_packages(&identity, 50)?;
-
-        let now = chrono::Utc::now();
-        let expires_str =
-            (now + chrono::Duration::days(30)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-
-        let key_packages: Vec<serde_json::Value> = packages
-            .iter()
-            .map(|kp| {
-                serde_json::json!({
-                    "cipherSuite": MLS_CIPHER_SUITE,
-                    "expiresAt": expires_str,
-                    "data": BASE64.encode(&kp.key_package_data),
-                })
-            })
-            .collect();
-
-        let req = serde_json::json!({
-            "keyPackages": key_packages,
-        });
-
-        let resp: PublishKeyPackagesResp = self
-            .xrpc_procedure("blue.catbird.chat.replenishKeyPackages", &req)
-            .await?;
-
-        let accepted = resp.publish_result.map(|r| r.succeeded as u32).unwrap_or(0);
-
-        Ok(accepted)
-    }
-
-    /// Remove a device by its ID. Returns (deleted, key_packages_deleted, conversations_left).
-    pub async fn remove_device(&self, device_id: &str) -> Result<(bool, i64, i64)> {
-        let req = serde_json::json!({
-            "deviceId": device_id,
-        });
-
-        let resp: RemoveDeviceResp = self
-            .xrpc_procedure("blue.catbird.chat.revokeDevice", &req)
-            .await?;
-
-        Ok((
-            resp.deleted,
-            resp.key_packages_deleted.unwrap_or(0),
-            resp.conversations_left.unwrap_or(0),
-        ))
-    }
-
-    // ── Debug / introspection ───────────────────────────────────────────
-
-    /// Get the current MLS epoch for a conversation from local state.
-    pub fn get_epoch(&self, convo_id: &str) -> Result<u64> {
-        let group_id_bytes = hex::decode(convo_id)
-            .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
-        self.mls.with_context(|ctx| ctx.get_epoch(group_id_bytes))
-    }
-
-    /// Get the tree hash for a conversation from local MLS state.
-    pub fn get_tree_hash(&self, convo_id: &str) -> Result<Vec<u8>> {
-        let group_id_bytes = hex::decode(convo_id)
-            .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
-        let data = self
-            .mls
-            .with_context(|ctx| ctx.get_tree_hash(group_id_bytes))?;
-        Ok(data.tree_hash)
-    }
-
     /// Fetch group state from the server.
     pub async fn get_group_state(&self, convo_id: &str) -> Result<serde_json::Value> {
+        let actor_device_id = self.actor_device_id().await?;
         let resp: serde_json::Value = self
-            .xrpc_query("blue.catbird.chat.getConversationState", &[("convoId", convo_id)])
+            .xrpc_query(
+                "blue.catbird.chat.getConversationState",
+                &[
+                    ("actorDeviceId", &actor_device_id),
+                    ("convoId", convo_id),
+                    ("conversationId", convo_id),
+                ],
+            )
             .await?;
         Ok(resp)
     }
@@ -1327,49 +1448,71 @@ impl ChatService {
             .await
             .map_err(|e| CatmosError::Other(format!("Failed to read file {file_path}: {e}")))?;
 
+        let actor_device_id = self.actor_device_id().await?;
         let nsid = "blue.catbird.chat.uploadBlob";
         let bearer = self.current_bearer().await?;
         let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC POST {nsid} -> {url}");
 
+        let params = [
+            ("actorDeviceId", actor_device_id.as_str()),
+            ("convoId", convo_id),
+            ("conversationId", convo_id),
+        ];
+
         let resp = self
             .http
             .post(&url)
             .headers(headers)
-            .query(&[("convoId", convo_id)])
+            .query(&params)
             .header("content-type", "application/octet-stream")
             .body(data.clone())
             .send()
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
-        let resp = if self.should_retry_after_refresh(resp.status()) {
+        let status = resp.status();
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| CatmosError::Network(e.to_string()))?;
+
+        let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
             let new_bearer = self.refresh_bearer().await?;
             let (url, headers) = self.build_request(nsid, &new_bearer)?;
-            self.http
+            let retry_resp = self
+                .http
                 .post(&url)
                 .headers(headers)
-                .query(&[("convoId", convo_id)])
+                .query(&params)
                 .header("content-type", "application/octet-stream")
                 .body(data)
                 .send()
                 .await
-                .map_err(|e| CatmosError::Network(e.to_string()))?
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            let retry_status = retry_resp.status();
+            let retry_bytes = retry_resp
+                .bytes()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            if !retry_status.is_success() {
+                let body_str = String::from_utf8_lossy(&retry_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "{nsid} returned {retry_status}: {body_str}"
+                )));
+            }
+            retry_bytes
         } else {
-            resp
+            if !status.is_success() {
+                let body_str = String::from_utf8_lossy(&body_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "{nsid} returned {status}: {body_str}"
+                )));
+            }
+            body_bytes
         };
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(CatmosError::Xrpc(format!(
-                "{nsid} returned {status}: {body}"
-            )));
-        }
-
-        let resp: UploadBlobResp = resp
-            .json()
-            .await
+        let resp: UploadBlobResp = serde_json::from_slice(&body_bytes)
             .map_err(|e| CatmosError::Xrpc(format!("Failed to parse {nsid} response: {e}")))?;
 
         debug!("Uploaded blob {} ({} bytes)", resp.blob_id, resp.size);
@@ -1378,48 +1521,66 @@ impl ChatService {
 
     /// Download a blob by ID and write it to the given output path.
     pub async fn download_blob(&self, blob_id: &str, output_path: &str) -> Result<()> {
+        let actor_device_id = self.actor_device_id().await?;
         let nsid = "blue.catbird.chat.getBlob";
         let bearer = self.current_bearer().await?;
         let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC GET {nsid} -> {url}");
 
+        let params = [
+            ("actorDeviceId", actor_device_id.as_str()),
+            ("blobId", blob_id),
+        ];
+
         let resp = self
             .http
             .get(&url)
             .headers(headers)
-            .query(&[("blobId", blob_id)])
+            .query(&params)
             .send()
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
-        let resp = if self.should_retry_after_refresh(resp.status()) {
-            let new_bearer = self.refresh_bearer().await?;
-            let (url, headers) = self.build_request(nsid, &new_bearer)?;
-            self.http
-                .get(&url)
-                .headers(headers)
-                .query(&[("blobId", blob_id)])
-                .send()
-                .await
-                .map_err(|e| CatmosError::Network(e.to_string()))?
-        } else {
-            resp
-        };
-
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(CatmosError::Xrpc(format!(
-                "{nsid} returned {status}: {body}"
-            )));
-        }
-
-        let bytes = resp
+        let body_bytes = resp
             .bytes()
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
-        tokio::fs::write(output_path, &bytes)
+        let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
+            let new_bearer = self.refresh_bearer().await?;
+            let (url, headers) = self.build_request(nsid, &new_bearer)?;
+            let retry_resp = self
+                .http
+                .get(&url)
+                .headers(headers)
+                .query(&params)
+                .send()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            let retry_status = retry_resp.status();
+            let retry_bytes = retry_resp
+                .bytes()
+                .await
+                .map_err(|e| CatmosError::Network(e.to_string()))?;
+            if !retry_status.is_success() {
+                let body_str = String::from_utf8_lossy(&retry_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "{nsid} returned {retry_status}: {body_str}"
+                )));
+            }
+            retry_bytes
+        } else {
+            if !status.is_success() {
+                let body_str = String::from_utf8_lossy(&body_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "{nsid} returned {status}: {body_str}"
+                )));
+            }
+            body_bytes
+        };
+
+        tokio::fs::write(output_path, &body_bytes)
             .await
             .map_err(|e| CatmosError::Other(format!("Failed to write {output_path}: {e}")))?;
 
@@ -1428,12 +1589,22 @@ impl ChatService {
 
     /// Get the authenticated user's blob storage usage stats.
     pub async fn get_blob_usage(&self) -> Result<BlobUsage> {
-        let resp: GetBlobUsageResp = self.xrpc_query("blue.catbird.chat.getBlobUsage", &[]).await?;
+        let actor_device_id = self.actor_device_id().await?;
+        let resp: serde_json::Value = self
+            .xrpc_query(
+                "blue.catbird.chat.getBlobUsage",
+                &[("actorDeviceId", &actor_device_id)],
+            )
+            .await?;
+
+        let used_bytes = resp.get("usedBytes").and_then(|v| v.as_i64()).unwrap_or(0);
+        let quota_bytes = resp.get("quotaBytes").and_then(|v| v.as_i64()).unwrap_or(0);
+        let blob_count = resp.get("blobCount").and_then(|v| v.as_i64()).unwrap_or(0);
 
         Ok(BlobUsage {
-            used_bytes: resp.used_bytes,
-            quota_bytes: resp.quota_bytes,
-            blob_count: resp.blob_count,
+            used_bytes,
+            quota_bytes,
+            blob_count,
         })
     }
 
@@ -1441,7 +1612,7 @@ impl ChatService {
     /// pre-resolved bearer token.
     ///
     /// - OAuth: routes through nest (confidential client proxy)
-    /// - AppPassword: routes directly to mls-ds for `blue.catbird.chat.*` endpoints
+    /// - AppPassword: routes to user's PDS (`pds_url`) with `atproto-proxy` header
     pub(crate) fn build_request(&self, nsid: &str, bearer: &str) -> Result<(String, HeaderMap)> {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1452,14 +1623,17 @@ impl ChatService {
 
         let url = match &self.auth {
             AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
-            AuthMethod::AppPassword { .. } => {
-                // Route chat calls directly to the MLS delivery service
-                let base = if nsid.starts_with("blue.catbird.chat.") {
-                    &self.config.server.mls_url
-                } else {
-                    &self.config.server.nest_url
-                };
-                format!("{base}/xrpc/{nsid}")
+            AuthMethod::AppPassword { pds_url, .. } => {
+                if nsid.starts_with("blue.catbird.chat.") || nsid.starts_with("blue.catbird.mlsChat.") {
+                    let proxy_val = crate::mls::atproto_proxy_header_value();
+                    if let Ok(hv) = HeaderValue::from_str(&proxy_val) {
+                        headers.insert(
+                            reqwest::header::HeaderName::from_static("atproto-proxy"),
+                            hv,
+                        );
+                    }
+                }
+                format!("{}/xrpc/{nsid}", pds_url.trim_end_matches('/'))
             }
         };
 
@@ -1513,5 +1687,29 @@ mod tests {
         assert!(json.get("initialMembers").is_none());
         assert!(json.get("welcomeMessage").is_none());
         assert!(json.get("keyPackageHashes").is_none());
+    }
+
+    #[test]
+    fn expired_token_response_detection() {
+        assert!(is_expired_token_response(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":"ExpiredToken","message":"Token has expired"}"#
+        ));
+        assert!(is_expired_token_response(
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":"ExpiredToken"}"#
+        ));
+        assert!(!is_expired_token_response(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":"InvalidRequest","message":"Bad payload"}"#
+        ));
+        assert!(!is_expired_token_response(
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":"AuthRequired"}"#
+        ));
+        assert!(!is_expired_token_response(
+            StatusCode::NOT_FOUND,
+            br#"{"error":"ExpiredToken"}"#
+        ));
     }
 }
