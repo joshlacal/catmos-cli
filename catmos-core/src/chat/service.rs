@@ -472,16 +472,18 @@ Body: {}",
             (AuthMethod::OAuth { session_cookie, .. }, _) => Ok(session_cookie.clone()),
             (AuthMethod::AppPassword { pds_url, .. }, Some(sess)) => {
                 let access_jwt = sess.current_bearer().await?;
-                // Mint service auth token from user's PDS for did:web:chat.catbird.blue#atproto_mls
                 let aud = crate::mls::atproto_proxy_header_value();
-                let url = format!("{}/xrpc/com.atproto.server.getServiceAuth", pds_url.trim_end_matches('/'));
+                let aud_encoded = aud.replace('#', "%23");
+                let pds_base = pds_url.trim_end_matches('/');
+
+                let url = format!("{pds_base}/xrpc/com.atproto.server.getServiceAuth?aud={aud_encoded}&lxm={nsid}");
                 let resp = self
                     .http
                     .get(&url)
-                    .query(&[("aud", aud.as_str()), ("lxm", nsid)])
                     .header(AUTHORIZATION, format!("Bearer {access_jwt}"))
                     .send()
                     .await;
+
                 if let Ok(r) = resp {
                     if r.status().is_success() {
                         #[derive(Deserialize)]
@@ -493,6 +495,41 @@ Body: {}",
                         }
                     }
                 }
+
+                // If pds_base was bsky.social, resolve actual PDS from plc.directory
+                if pds_base.contains("bsky.social") {
+                    let did = self.did();
+                    if let Ok(plc_resp) = self.http.get(&format!("https://plc.directory/{did}")).send().await {
+                        if let Ok(doc) = plc_resp.json::<serde_json::Value>().await {
+                            if let Some(services) = doc.get("service").and_then(|v| v.as_array()) {
+                                for svc in services {
+                                    if let Some(endpoint) = svc.get("serviceEndpoint").and_then(|v| v.as_str()) {
+                                        let ep_clean = endpoint.trim_end_matches('/');
+                                        let ep_url = format!("{ep_clean}/xrpc/com.atproto.server.getServiceAuth?aud={aud_encoded}&lxm={nsid}");
+                                        if let Ok(r2) = self
+                                            .http
+                                            .get(&ep_url)
+                                            .header(AUTHORIZATION, format!("Bearer {access_jwt}"))
+                                            .send()
+                                            .await
+                                        {
+                                            if r2.status().is_success() {
+                                                #[derive(Deserialize)]
+                                                struct SvcResp {
+                                                    token: String,
+                                                }
+                                                if let Ok(parsed) = r2.json::<SvcResp>().await {
+                                                    return Ok(parsed.token);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Ok(access_jwt)
             }
             (AuthMethod::AppPassword { .. }, None) => Err(CatmosError::AuthFailed(
