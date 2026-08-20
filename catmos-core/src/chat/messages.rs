@@ -25,7 +25,6 @@ struct MlsMessagePayload {
     text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reaction: Option<MlsReactionPayload>,
-    // embed, readReceipt, typing, adminRoster, adminAction omitted for now
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -33,7 +32,7 @@ struct MlsMessagePayload {
 struct MlsReactionPayload {
     message_id: String,
     emoji: String,
-    action: String, // "add" or "remove"
+    action: String,
 }
 
 #[allow(dead_code)]
@@ -191,6 +190,8 @@ fn extract_application_ciphertext(entry: &ApplicationEntryResp) -> Option<Vec<u8
     let app_msg = body.get("applicationMessage")?;
     if let Some(s) = app_msg.as_str() {
         BASE64.decode(s).ok()
+    } else if let Some(bytes_val) = app_msg.get("bytes").and_then(|v| v.as_str()) {
+        BASE64.decode(bytes_val).ok()
     } else if let Some(ct_val) = app_msg.get("ciphertext").and_then(|v| v.as_str()) {
         BASE64.decode(ct_val).ok()
     } else if let Some(b_obj) = app_msg.get("$bytes").and_then(|v| v.as_str()) {
@@ -807,7 +808,9 @@ impl ChatService {
             return Ok(());
         }
 
-        let mut after_seq = 0i64;
+        let actor_device_id = self.actor_device_id().await?;
+        let max_synced = self.db.get_max_seq(convo_id).await.ok().flatten().unwrap_or(0);
+        let mut after_seq = max_synced;
         let mut total_processed = 0u32;
 
         loop {
@@ -816,6 +819,7 @@ impl ChatService {
                 .xrpc_query(
                     "blue.catbird.chat.getEntries",
                     &[
+                        ("actorDeviceId", &actor_device_id),
                         ("conversationId", &convo_uuid),
                         ("afterSeq", &after_seq_str),
                         ("limit", "100"),
@@ -840,7 +844,6 @@ impl ChatService {
                 entries_resp.entries.len()
             );
 
-            let mut consecutive_failures = 0u32;
             for entry in &entries_resp.entries {
                 let commit_entry = match entry {
                     ConversationEntryResp::Commit(c) => c,
@@ -856,7 +859,6 @@ impl ChatService {
                 if self.own_commits.lock().await.remove(&hash).is_some() {
                     debug!("sync: skipping own commit {}", commit_entry.entry_id);
                     total_processed += 1;
-                    consecutive_failures = 0;
                     continue;
                 }
 
@@ -875,7 +877,6 @@ impl ChatService {
                         }) {
                             Ok(merged_epoch) => {
                                 total_processed += 1;
-                                consecutive_failures = 0;
                                 self.note_healthy_peer_commit(convo_id).await;
                                 debug!(
                                     "sync: staged+merged commit {} (local epoch now {merged_epoch})",
@@ -891,29 +892,29 @@ impl ChatService {
                                 }
                             }
                             Err(e) => {
-                                consecutive_failures += 1;
                                 warn!("sync: merge_incoming_commit failed for {} epoch={}: {e}", commit_entry.entry_id, new_epoch);
                                 let _ = self.mls.with_context(|ctx| {
                                     ctx.discard_incoming_commit(gid_bytes.clone(), new_epoch)
                                 });
-                                if self.note_epoch_divergence(convo_id).await {
-                                    return Ok(());
-                                }
-                                if consecutive_failures >= 3 {
-                                    break;
+                                let err_str = e.to_string();
+                                if !err_str.contains("WrongEpoch") && !err_str.contains("CannotDecryptOwnMessage") {
+                                    if self.note_epoch_divergence(convo_id).await {
+                                        return Ok(());
+                                    }
                                 }
                             }
                         }
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        consecutive_failures += 1;
-                        warn!("sync: process_message failed for {}: {e}", commit_entry.entry_id);
-                        if self.note_epoch_divergence(convo_id).await {
-                            return Ok(());
-                        }
-                        if consecutive_failures >= 3 {
-                            break;
+                        let err_str = e.to_string();
+                        if !err_str.contains("WrongEpoch") && !err_str.contains("CannotDecryptOwnMessage") {
+                            warn!("sync: process_message failed for {}: {e}", commit_entry.entry_id);
+                            if self.note_epoch_divergence(convo_id).await {
+                                return Ok(());
+                            }
+                        } else {
+                            debug!("sync: silent skip for already-applied/own commit {} ({err_str})", commit_entry.entry_id);
                         }
                     }
                 }
@@ -969,11 +970,13 @@ impl ChatService {
         let after_seq = since_seq.unwrap_or(0);
         let after_seq_str = after_seq.to_string();
         let limit_str = limit.to_string();
+        let actor_device_id = self.actor_device_id().await?;
 
         let resp: serde_json::Value = self
             .xrpc_query(
                 "blue.catbird.chat.getEntries",
                 &[
+                    ("actorDeviceId", &actor_device_id),
                     ("conversationId", &convo_uuid),
                     ("afterSeq", &after_seq_str),
                     ("limit", &limit_str),

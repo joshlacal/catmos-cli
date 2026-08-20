@@ -582,12 +582,13 @@ impl ChatService {
             _ => return Ok(None),
         };
         const NSID: &str = "blue.catbird.chat.getBlob";
-
         let bearer = self.get_service_token(NSID).await?;
         let (url, headers) = self.build_request(NSID, &bearer)?;
-
-        let params = [("blobId", blob_id)];
-
+        let actor_device_id = self.actor_device_id().await?;
+        let params = [
+            ("actorDeviceId", actor_device_id.as_str()),
+            ("blobId", blob_id),
+        ];
         let resp = self
             .http
             .get(&url)
@@ -666,7 +667,6 @@ impl ChatService {
     ) -> Result<()> {
         let _ = (convo_id, group_id, kind, metadata_version, reset_generation);
         const NSID: &str = "blue.catbird.chat.uploadBlob";
-
         let bearer = self.get_service_token(NSID).await?;
         let (url, mut headers) = self.build_request(NSID, &bearer)?;
         headers.insert(
@@ -674,8 +674,11 @@ impl ChatService {
             HeaderValue::from_static("application/octet-stream"),
         );
 
-        let params = [("uploadTicket", blob_locator)];
-
+        let actor_device_id = self.actor_device_id().await?;
+        let params = [
+            ("actorDeviceId", actor_device_id.as_str()),
+            ("uploadTicket", blob_locator),
+        ];
         let resp = self
             .http
             .post(&url)
