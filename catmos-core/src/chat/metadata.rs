@@ -34,10 +34,18 @@
 //! exporter and uploads under `(convoId, resetGeneration, kind)` so
 //! joining members can pick it up.
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::StatusCode;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
+fn derive_key_id(public_key: &[u8]) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let digest = Sha256::digest(public_key);
+    URL_SAFE_NO_PAD.encode(digest)
+}
 use catbird_mls::metadata::{self as mls_metadata, GroupMetadataV1, MetadataReference};
 
 use super::service::ChatService;
@@ -652,8 +660,8 @@ impl ChatService {
         Ok(Some(body_bytes.to_vec()))
     }
 
-    /// XRPC POST wrapper for `blue.catbird.chat.uploadBlob`.
-    /// Sends the ciphertext body raw (no `$bytes` envelope) per lexicon.
+    /// XRPC prepareBlobUpload + uploadBlob workflow.
+    /// Prepares upload ticket, uploads raw ciphertext against ticket, and returns the assigned blob_id.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn put_group_metadata_blob(
         &self,
@@ -664,21 +672,145 @@ impl ChatService {
         metadata_version: Option<i64>,
         reset_generation: Option<i64>,
         body: Vec<u8>,
-    ) -> Result<()> {
-        let _ = (convo_id, group_id, kind, metadata_version, reset_generation);
-        const NSID: &str = "blue.catbird.chat.uploadBlob";
-        let bearer = self.get_service_token(NSID).await?;
-        let (url, mut headers) = self.build_request(NSID, &bearer)?;
+    ) -> Result<String> {
+        let _ = (metadata_version, reset_generation);
+        let actor_device_id = self.actor_device_id().await?;
+        let user_did = self.did().to_string();
+        let mls_did = format!("{user_did}#{actor_device_id}");
+
+        let scoped_identity = mls_did.clone();
+        let public_key = self
+            .mls
+            .with_context(|ctx| ctx.identity_public_key(scoped_identity))?;
+        let key_id = derive_key_id(&public_key);
+
+        let blob_id = if !blob_locator.is_empty() {
+            blob_locator.to_string()
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+        let ciphertext_sha256 = Sha256::digest(&body);
+        let ciphertext_size = body.len() as i64;
+
+        let group_id_bytes = hex::decode(group_id).unwrap_or_default();
+        let current_epoch = self
+            .mls
+            .with_context(|ctx| ctx.get_epoch(group_id_bytes.clone()))
+            .unwrap_or(0);
+        let tag_bytes = self
+            .mls
+            .with_context(|ctx| ctx.get_confirmation_tag(group_id_bytes.clone()))
+            .unwrap_or_else(|_| vec![0u8; 32]);
+        let tag_bytes = if tag_bytes.len() == 32 {
+            tag_bytes
+        } else if tag_bytes.len() > 32 {
+            tag_bytes[tag_bytes.len() - 32..].to_vec()
+        } else {
+            let mut t = vec![0u8; 32];
+            t[..tag_bytes.len()].copy_from_slice(&tag_bytes);
+            t
+        };
+        let gc_hash = self
+            .mls
+            .with_context(|ctx| ctx.get_group_context_hash(group_id_bytes.clone()))
+            .unwrap_or_else(|_| vec![0u8; 32]);
+        let gc_hash = if gc_hash.len() == 32 {
+            gc_hash
+        } else if gc_hash.len() > 32 {
+            gc_hash[gc_hash.len() - 32..].to_vec()
+        } else {
+            let mut h = vec![0u8; 32];
+            h[..gc_hash.len()].copy_from_slice(&gc_hash);
+            h
+        };
+
+        let purpose = match kind {
+            Some("avatar") => "avatar",
+            _ => "groupMetadata",
+        };
+
+        let effective_convo_id = convo_id.unwrap_or(group_id);
+        let signed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let prep_body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#blobUploadPreparationBody",
+            "actorDeviceId": actor_device_id,
+            "actorDid": user_did,
+            "authGeneration": 1,
+            "blobId": blob_id,
+            "ciphertextSha256": BASE64.encode(&ciphertext_sha256),
+            "ciphertextSize": ciphertext_size,
+            "conversationId": effective_convo_id,
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "keyId": key_id,
+            "mediaType": "application/octet-stream",
+            "plaintextSize": ciphertext_size,
+            "prior": {
+                "confirmationTag": BASE64.encode(&tag_bytes),
+                "conversationId": effective_convo_id,
+                "epoch": current_epoch,
+                "generation": 0,
+                "groupContextHash": BASE64.encode(&gc_hash),
+                "groupId": BASE64.encode(&group_id_bytes),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "purpose": purpose,
+            "signatureDomain": "CATBIRD-CHAT-BLOB-PREPARE\0",
+            "signedAt": signed_at
+        });
+
+        let binding = catbird_mls::orchestrator::CleanChatSigningContext {
+            actor_did: user_did.clone(),
+            device_id: actor_device_id.clone(),
+            auth_generation: None,
+        };
+
+        let prepared = catbird_mls::orchestrator::canonical_transport::prepare_signed_request_with(
+            &binding,
+            catbird_mls::orchestrator::CanonicalOperation::PrepareBlobUpload,
+            serde_json::to_vec(&prep_body).map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?,
+            |transcript| {
+                self.mls.with_context(|ctx| {
+                    ctx.sign_with_identity_key(mls_did.clone(), transcript.to_vec())
+                })
+                .map_err(|_| catbird_mls::orchestrator::TransportError::Signing)
+            },
+        )
+        .map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?;
+
+        let prepared_bytes = prepared.body.ok_or_else(|| {
+            CatmosError::Mls(catbird_mls::MLSError::Internal("prepared blob body missing".into()))
+        })?;
+
+        let prep_resp: serde_json::Value = self
+            .xrpc_post_raw("blue.catbird.chat.prepareBlobUpload", &prepared_bytes)
+            .await?;
+
+        let upload_obj = prep_resp.get("upload").unwrap_or(&prep_resp);
+        let upload_ticket = upload_obj
+            .get("uploadTicket")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&blob_id);
+        let returned_blob_id = upload_obj
+            .get("blobId")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&blob_id)
+            .to_string();
+
+        // Step 2: Upload ciphertext against uploadTicket
+        const UPLOAD_NSID: &str = "blue.catbird.chat.uploadBlob";
+        let bearer = self.get_service_token(UPLOAD_NSID).await?;
+        let (url, mut headers) = self.build_request(UPLOAD_NSID, &bearer)?;
         headers.insert(
             reqwest::header::CONTENT_TYPE,
             HeaderValue::from_static("application/octet-stream"),
         );
 
-        let actor_device_id = self.actor_device_id().await?;
         let params = [
             ("actorDeviceId", actor_device_id.as_str()),
-            ("uploadTicket", blob_locator),
+            ("uploadTicket", upload_ticket),
         ];
+
         let resp = self
             .http
             .post(&url)
@@ -697,7 +829,8 @@ impl ChatService {
 
         if self.should_retry_after_refresh(status, &body_bytes) {
             let new_bearer = self.refresh_bearer().await?;
-            let (url, mut headers) = self.metadata_blob_request(NSID, &new_bearer)?;
+            let fresh_bearer = self.get_service_token(UPLOAD_NSID).await.unwrap_or(new_bearer);
+            let (url, mut headers) = self.build_request(UPLOAD_NSID, &fresh_bearer)?;
             headers.insert(
                 reqwest::header::CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
@@ -715,17 +848,17 @@ impl ChatService {
             if !retry_status.is_success() {
                 let body_str = retry_resp.text().await.unwrap_or_default();
                 return Err(CatmosError::Xrpc(format!(
-                    "{NSID} returned {retry_status}: {body_str}"
+                    "{UPLOAD_NSID} returned {retry_status}: {body_str}"
                 )));
             }
         } else if !status.is_success() {
             let body_str = String::from_utf8_lossy(&body_bytes);
             return Err(CatmosError::Xrpc(format!(
-                "{NSID} returned {status}: {body_str}"
+                "{UPLOAD_NSID} returned {status}: {body_str}"
             )));
         }
 
-        Ok(())
+        Ok(returned_blob_id)
     }
 
     /// Build URL + auth headers for the metadata-blob endpoints.

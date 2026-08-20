@@ -201,6 +201,26 @@ fn extract_application_ciphertext(entry: &ApplicationEntryResp) -> Option<Vec<u8
     }
 }
 
+fn is_replayed_or_own_commit_error(err: &CatmosError) -> bool {
+    if let CatmosError::Mls(mls_err) = err {
+        if mls_err.is_wrong_epoch() || mls_err.is_cannot_decrypt_own_message() {
+            return true;
+        }
+        if let catbird_mls::MLSError::InvalidInput { message } = mls_err {
+            if message.contains("forward secrecy prevents decrypting old epochs")
+                || message.contains("Cannot decrypt message from epoch")
+            {
+                return true;
+            }
+        }
+    }
+    let msg = err.to_string();
+    msg.contains("WrongEpoch")
+        || msg.contains("CannotDecryptOwnMessage")
+        || msg.contains("forward secrecy prevents decrypting old epochs")
+        || msg.contains("Cannot decrypt message from epoch")
+}
+
 /// Extract a `CreateConvoOutput`-shaped response from JSON.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -809,8 +829,17 @@ impl ChatService {
         }
 
         let actor_device_id = self.actor_device_id().await?;
-        let max_synced = self.db.get_max_seq(convo_id).await.ok().flatten().unwrap_or(0);
-        let mut after_seq = max_synced;
+        let sync_seq_key = format!("sync_seq_{convo_id}");
+        let max_synced = self
+            .db
+            .get_session_value(&sync_seq_key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let max_msg_seq = self.db.get_max_seq(convo_id).await.ok().flatten().unwrap_or(0);
+        let mut after_seq = max_synced.max(max_msg_seq);
         let mut total_processed = 0u32;
 
         loop {
@@ -896,8 +925,7 @@ impl ChatService {
                                 let _ = self.mls.with_context(|ctx| {
                                     ctx.discard_incoming_commit(gid_bytes.clone(), new_epoch)
                                 });
-                                let err_str = e.to_string();
-                                if !err_str.contains("WrongEpoch") && !err_str.contains("CannotDecryptOwnMessage") {
+                                if !is_replayed_or_own_commit_error(&e) {
                                     if self.note_epoch_divergence(convo_id).await {
                                         return Ok(());
                                     }
@@ -907,19 +935,22 @@ impl ChatService {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        let err_str = e.to_string();
-                        if !err_str.contains("WrongEpoch") && !err_str.contains("CannotDecryptOwnMessage") {
+                        if !is_replayed_or_own_commit_error(&e) {
                             warn!("sync: process_message failed for {}: {e}", commit_entry.entry_id);
                             if self.note_epoch_divergence(convo_id).await {
                                 return Ok(());
                             }
                         } else {
-                            debug!("sync: silent skip for already-applied/own commit {} ({err_str})", commit_entry.entry_id);
+                            debug!("sync: silent skip for already-applied/own commit {} ({e})", commit_entry.entry_id);
                         }
                     }
                 }
             }
 
+            let _ = self
+                .db
+                .store_session_value(&sync_seq_key, &entries_resp.next_after_seq.to_string())
+                .await;
             if entries_resp.has_more && entries_resp.next_after_seq > after_seq {
                 after_seq = entries_resp.next_after_seq;
             } else {
@@ -966,8 +997,17 @@ impl ChatService {
                 .unwrap_or_else(|| convo_id.to_string())
         };
 
-        let since_seq = self.db.get_max_seq(convo_id).await.ok().flatten();
-        let after_seq = since_seq.unwrap_or(0);
+        let sync_seq_key = format!("sync_seq_{convo_id}");
+        let max_synced = self
+            .db
+            .get_session_value(&sync_seq_key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let max_msg_seq = self.db.get_max_seq(convo_id).await.ok().flatten().unwrap_or(0);
+        let after_seq = max_synced.max(max_msg_seq);
         let after_seq_str = after_seq.to_string();
         let limit_str = limit.to_string();
         let actor_device_id = self.actor_device_id().await?;
@@ -1026,6 +1066,10 @@ impl ChatService {
                     if let Err(e) = self.db.store_message(&msg).await {
                         warn!("Failed to store message {}: {e}", msg.id);
                     }
+                    let _ = self
+                        .db
+                        .store_session_value(&sync_seq_key, &app_entry.seq.to_string())
+                        .await;
                     messages.push(msg);
                 }
                 Err(e) => {
