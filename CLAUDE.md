@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`catmos-cli` is a Rust CLI + TUI MLS group-chat client for the Catbird/Bluesky messaging stack. It consumes the `catbird-mls` Rust orchestrator **directly** (no UniFFI/WASM layer — unlike iOS, desktop, or web), via a Cargo path dependency. It talks to the same backends as the other clients: `nest` (OAuth BFF) for auth and `mlschat.catbird.blue` (mls-ds) for the MLS delivery service.
+`catmos-cli` is a Rust CLI + TUI MLS group-chat client for the Catbird/Bluesky messaging stack. It consumes the `catbird-mls` Rust orchestrator **directly** (no UniFFI/WASM layer — unlike iOS, desktop, or web), via a Cargo path dependency. It talks to the same backends as the other clients: `nest` (OAuth BFF) for auth and `chat.catbird.blue` (mls-ds) for the MLS delivery service.
 
 > **Name collision warning:** the binary crate here is named `catmos` and lives in `catmos-cli/catmos/`. This is **not** the same as the top-level `catmos/` Tauri desktop app (Svelte). When in this workspace, `catmos` = the CLI/TUI binary.
 
@@ -73,7 +73,7 @@ catmos (bin: clap dispatch, tracing)
         └─ catbird-mls  (OpenMLS orchestrator — used DIRECTLY, no FFI)
         └─ catbird-atproto / jacquard  (ATProto types + identity)
               ↓ XRPC
-        nest (OAuth BFF)  +  mls-ds (mlschat.catbird.blue)
+        nest (OAuth BFF)  +  mls-ds (chat.catbird.blue)
 ```
 
 Startup path (`init_service()` in `main.rs`; mirrored in `catmos_tui::run()`):
@@ -89,7 +89,7 @@ Auth (`catmos-core/src/auth/`):
 
 Default endpoints (`storage/config.rs`, overridable via `config.toml`):
 - `nest_url = "https://api.catbird.blue"`
-- `mls_url  = "https://mlschat.catbird.blue"`
+- `mls_url  = "https://chat.catbird.blue"`
 
 ## Relationship to catbird-mls
 

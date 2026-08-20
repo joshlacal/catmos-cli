@@ -31,7 +31,7 @@ impl Default for Config {
         Self {
             server: ServerConfig {
                 nest_url: "https://api.catbird.blue".into(),
-                mls_url: "https://mlschat.catbird.blue".into(),
+                mls_url: "https://chat.catbird.blue".into(),
             },
             ui: UiConfig {
                 sidebar_visible: true,
