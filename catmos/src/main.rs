@@ -12,6 +12,10 @@ use catmos_core::mls::{MlsManager, MLS_CIPHER_SUITE};
 use catmos_core::storage::aliases::AliasStore;
 use catmos_core::storage::config::Config;
 use catmos_core::storage::db::Database;
+use catmos_core::orchestrator_api::CliApiClient;
+use catmos_core::orchestrator_credentials::KeyringCredentialStore;
+use catmos_core::orchestrator_storage::SqliteStorage;
+use catmos_core::CliOrchestrator;
 use catmos_core::types::MessageContent;
 
 #[derive(Parser)]
@@ -188,11 +192,10 @@ enum AliasCommands {
     List,
     Remove { alias: String },
 }
-
 // ── Service initialization ──────────────────────────────────────────────────
 
 /// Load config, open the per-account database, restore auth, and build a ChatService.
-async fn init_service() -> anyhow::Result<ChatService> {
+async fn init_service() -> anyhow::Result<Arc<ChatService>> {
     let config = Config::load()?;
 
     let did = config
@@ -231,17 +234,37 @@ async fn init_service() -> anyhow::Result<ChatService> {
     let aliases = Arc::new(RwLock::new(AliasStore::load()?));
 
     let db = Arc::new(db);
-    let service = ChatService::new(
+    let service = Arc::new(ChatService::new(
         auth,
         token_session,
         mls.clone(),
         db.clone(),
         config,
         aliases,
-    );
+    ));
 
-    // Auto-register MLS device on startup (idempotent — skips if already registered)
-    match mls.ensure_registered(&service, &did, &db).await {
+    let orchestrator_db = account_dir.join("orchestrator.db");
+    let orchestrator_storage = Arc::new(
+        SqliteStorage::new(
+            orchestrator_db.to_string_lossy().as_ref(),
+            &db_key,
+        )?,
+    );
+    orchestrator_storage.set_mls_context(mls.context().clone());
+    let orchestrator_api = Arc::new(CliApiClient::new(service.clone()));
+    let credentials = Arc::new(KeyringCredentialStore::try_new()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?);
+    let orchestrator: Arc<CliOrchestrator> = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+        mls.context().clone(),
+        orchestrator_storage,
+        orchestrator_api,
+        credentials,
+        catbird_mls::orchestrator::OrchestratorConfig::default(),
+    ));
+    service.set_orchestrator(orchestrator.clone()).await;
+    if let Err(e) = orchestrator.initialize(&did).await {
+        tracing::warn!("orchestrator initialization failed: {e}");
+    }
         Ok(device_info) => {
             info!("MLS device ready: {}", device_info.device_id);
 
@@ -481,8 +504,11 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             let svc = init_service().await?;
             svc.fetch_conversations().await?;
             let convo_id = svc.resolve_convo(&convo).await?;
-            let msg = svc.send_message(&convo_id, &message).await?;
-            println!("Sent (seq={}, epoch={})", msg.seq, msg.epoch);
+            let orch = svc.orchestrator().await
+                .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+            let msg = orch.send_message(&convo_id, &message).await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            println!("Sent (epoch={})", msg.epoch);
         }
 
         Commands::Members { convo } => {
@@ -531,9 +557,10 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             } => {
                 let svc = init_service().await?;
                 let member_list = members.unwrap_or_default();
-                let convo = svc
-                    .create_conversation(&name, &member_list, description.as_deref())
-                    .await?;
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                let convo = orch.create_group(&name, Some(&member_list), description.as_deref()).await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Created conversation: {}", convo.group_id);
             }
 
@@ -541,7 +568,10 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let svc = init_service().await?;
                 svc.fetch_conversations().await?;
                 let convo_id = svc.resolve_convo(&convo).await?;
-                svc.leave_conversation(&convo_id).await?;
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                orch.leave_via_self_remove(&convo_id).await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Left conversation {convo}");
             }
 
@@ -596,8 +626,10 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let svc = init_service().await?;
                 svc.fetch_conversations().await?;
                 let convo_id = svc.resolve_convo(&convo).await?;
-                svc.update_conversation(&convo_id, name.as_deref(), description.as_deref())
-                    .await?;
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                orch.update_group_metadata_encrypted(&convo_id, name.as_deref(), description.as_deref(), None, None, None).await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Updated conversation {convo}");
             }
 
@@ -605,7 +637,10 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let svc = init_service().await?;
                 svc.fetch_conversations().await?;
                 let convo_id = svc.resolve_convo(&convo).await?;
-                svc.add_member(&convo_id, &did).await?;
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                orch.add_members(&convo_id, &[did.clone()]).await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Added {did} to {convo}");
             }
 
@@ -613,7 +648,10 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let svc = init_service().await?;
                 svc.fetch_conversations().await?;
                 let convo_id = svc.resolve_convo(&convo).await?;
-                svc.remove_member(&convo_id, &did).await?;
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                orch.remove_members(&convo_id, &[did.clone()]).await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Removed {did} from {convo}");
             }
 
@@ -657,46 +695,35 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             }
             DeviceCommands::Register { name } => {
                 let svc = init_service().await?;
-                // Device is auto-registered in init_service, just report status
-                let did = svc.did().to_string();
-                let db = svc.db.clone();
-                let device_name = name.as_deref().unwrap_or("catmos-cli");
-                let info = svc
-                    .mls
-                    .register_device(&svc, &did, device_name, &db)
-                    .await?;
-                println!(
-                    "Registered device: id={}, mls_did={}",
-                    info.device_id, info.mls_did
-                );
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                let device_id = orch.ensure_device_registered().await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("Registered device: id={device_id}");
             }
             DeviceCommands::Remove { device_id } => {
                 let svc = init_service().await?;
-                let (deleted, kp_deleted, convos_left) = svc.remove_device(&device_id).await?;
-                if deleted {
-                    println!(
-                        "Removed device {device_id} (key_packages={kp_deleted}, conversations_left={convos_left})"
-                    );
-                } else {
-                    println!("Device {device_id} was not found or already removed.");
-                }
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                orch.remove_device(&device_id).await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("Removed device {device_id}");
             }
         },
 
-        // ── Key packages ─────────────────────────────────────────────────
         Commands::KeyPackage(sub) => match sub {
             KeyPackageCommands::Status => {
                 let svc = init_service().await?;
                 let status = svc.get_key_package_status().await?;
-                println!(
-                    "Key packages: {}/{} (replenish={})",
-                    status.available, status.target, status.needs_replenish
-                );
+                println!("Key packages: {}/{} (replenish={})", status.available, status.target, status.needs_replenish);
             }
             KeyPackageCommands::Replenish => {
                 let svc = init_service().await?;
-                let accepted = svc.replenish_key_packages().await?;
-                println!("Published key packages: {accepted} accepted");
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                orch.replenish_if_needed().await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("Key packages replenished");
             }
         },
 

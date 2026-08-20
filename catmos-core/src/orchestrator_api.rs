@@ -6,6 +6,8 @@ use catbird_mls::orchestrator::canonical_transport::{GatewayResponse, PreparedRe
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 use catbird_mls::orchestrator::types::*;
 use reqwest::header::CONTENT_TYPE;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 
 use crate::chat::service::ChatService;
 
@@ -54,11 +56,76 @@ impl MLSAPIClient for CliApiClient {
         Ok(GatewayResponse { status, content_type, body })
     }
 
-    async fn get_conversations(&self, _limit: u32, _cursor: Option<&str>) -> Result<ConversationListPage> { self.unsupported("get_conversations") }
-    async fn get_messages(&self, _convo_id: &str, _cursor: Option<&str>, _limit: u32, _message_type: Option<&str>, _from_epoch: Option<u32>, _to_epoch: Option<u32>) -> Result<(Vec<IncomingEnvelope>, Option<String>)> { self.unsupported("get_messages") }
-    async fn get_key_packages(&self, _actor_device_id: &str, _dids: &[String]) -> Result<Vec<KeyPackageRef>> { self.unsupported("get_key_packages") }
-    async fn get_key_package_stats(&self) -> Result<KeyPackageStats> { self.unsupported("get_key_package_stats") }
-    async fn sync_key_packages(&self, _local_hashes: &[String], _device_id: &str) -> Result<KeyPackageSyncResult> { self.unsupported("sync_key_packages") }
-    async fn list_devices(&self, _actor_device_id: &str) -> Result<Vec<DeviceInfo>> { self.unsupported("list_devices") }
-    async fn get_group_info(&self, _convo_id: &str) -> Result<Vec<u8>> { self.unsupported("get_group_info") }
+    async fn get_conversations(&self, _limit: u32, _cursor: Option<&str>) -> Result<ConversationListPage> {
+        let convos = self.service.fetch_conversations().await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let views = convos.into_iter().map(|c| ConversationView {
+            group_id: c.group_id,
+            conversation_id: c.conversation_id,
+            epoch: c.epoch,
+            members: c.members.into_iter().map(|m| MemberView {
+                did: m.user_did,
+                role: if m.is_admin { MemberRole::Admin } else { MemberRole::Member },
+            }).collect(),
+            metadata: Some(ConversationMetadata {
+                name: c.name,
+                description: c.description,
+                avatar_url: None,
+            }),
+            created_at: Some(c.created_at),
+            updated_at: c.last_message_at,
+            sequencer_did: None,
+        }).collect();
+        Ok(ConversationListPage { conversations: views, cursor: None })
+    }
+
+    async fn get_messages(&self, _convo_id: &str, _cursor: Option<&str>, _limit: u32, _message_type: Option<&str>, _from_epoch: Option<u32>, _to_epoch: Option<u32>) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
+        Err(OrchestratorError::Api("CLI canonical message read is not implemented".into()))
+    }
+
+    async fn get_key_packages(&self, _actor_device_id: &str, dids: &[String]) -> Result<Vec<KeyPackageRef>> {
+        let refs = self.service.fetch_key_packages(dids).await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        Ok(refs.into_iter().map(|r| KeyPackageRef {
+            did: r.did,
+            key_package_data: r.key_package,
+            hash: r.key_package_hash,
+            cipher_suite: crate::mls::MLS_CIPHER_SUITE.to_string(),
+        }).collect())
+    }
+
+    async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
+        let status = self.service.get_key_package_status().await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        Ok(KeyPackageStats { available: status.available as u32, total: status.target as u32 })
+    }
+
+    async fn sync_key_packages(&self, _local_hashes: &[String], _device_id: &str) -> Result<KeyPackageSyncResult> {
+        Ok(KeyPackageSyncResult { orphaned_count: 0, deleted_count: 0 })
+    }
+
+    async fn list_devices(&self, _actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
+        let devices = self.service.list_devices().await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        Ok(devices.into_iter().map(|d| DeviceInfo {
+            device_id: d.device_id,
+            mls_did: d.mls_did,
+            device_uuid: String::new(),
+            created_at: None,
+            key_id: None,
+            signature_public_key: None,
+            auth_generation: None,
+            status: None,
+            available_package_count: None,
+            reserved_package_count: None,
+        }).collect())
+    }
+
+    async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {
+        let state = self.service.get_group_state(convo_id).await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let encoded = state.get("groupInfo").and_then(|v| v.as_str())
+            .ok_or_else(|| OrchestratorError::Api("group state did not contain groupInfo".into()))?;
+        BASE64.decode(encoded).map_err(|e| OrchestratorError::Api(e.to_string()))
+    }
 }

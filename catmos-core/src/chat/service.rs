@@ -24,6 +24,7 @@ use crate::storage::aliases::AliasStore;
 use crate::storage::config::Config;
 use crate::storage::db::Database;
 use crate::types::{BlobUsage, Conversation, Device, KeyPackageStatus};
+use crate::CliOrchestrator;
 
 #[derive(Debug, Clone)]
 pub enum QuarantineEvent {
@@ -138,6 +139,7 @@ pub struct ChatService {
     pub(crate) own_commits: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
     pub(crate) inventory_session: Arc<RwLock<Option<(String, String)>>>,
     pub(crate) quarantine_events: tokio::sync::broadcast::Sender<QuarantineEvent>,
+    pub(crate) orchestrator: Arc<RwLock<Option<Arc<CliOrchestrator>>>>,
 }
 
 impl ChatService {
@@ -162,10 +164,11 @@ impl ChatService {
             recovery_tracker: Arc::new(Mutex::new(RecoveryTracker::new())),
             groupinfo_404_tracker: Arc::new(Mutex::new(GroupInfo404Tracker::new())),
             decrypt_fail_counts: Arc::new(Mutex::new(HashMap::new())),
-            epoch_divergence_counts: Arc::new(Mutex::new(HashMap::new())),
             own_commits: Arc::new(Mutex::new(HashMap::new())),
+            epoch_divergence_counts: Arc::new(Mutex::new(HashMap::new())),
             inventory_session: Arc::new(RwLock::new(None)),
             quarantine_events: tokio::sync::broadcast::channel(32).0,
+            orchestrator: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -176,6 +179,14 @@ impl ChatService {
 
     pub fn subscribe_quarantine_events(&self) -> tokio::sync::broadcast::Receiver<QuarantineEvent> {
         self.quarantine_events.subscribe()
+    }
+
+    pub async fn set_orchestrator(&self, orchestrator: Arc<CliOrchestrator>) {
+        *self.orchestrator.write().await = Some(orchestrator);
+    }
+
+    pub async fn orchestrator(&self) -> Option<Arc<CliOrchestrator>> {
+        self.orchestrator.read().await.clone()
     }
 
     pub fn did(&self) -> &str {
