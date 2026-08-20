@@ -512,11 +512,10 @@ impl ChatService {
     /// Resolves all unique member DIDs to handles and populates
     /// `self.handle_cache` so the TUI can display friendly names.
     pub async fn fetch_conversations(&self) -> Result<Vec<Conversation>> {
-        let actor_device_id = self.actor_device_id().await?;
         let resp: serde_json::Value = self
             .xrpc_query(
                 "blue.catbird.chat.getConversations",
-                &[("actorDeviceId", &actor_device_id), ("limit", "50")],
+                &[("limit", "50")],
             )
             .await?;
 
@@ -534,6 +533,12 @@ impl ChatService {
                                 hex::encode(b)
                             } else {
                                 s.to_string()
+                            }
+                        } else if let Some(b_obj) = gid_val.get("$bytes").and_then(|v| v.as_str()) {
+                            if let Ok(b) = BASE64.decode(b_obj) {
+                                hex::encode(b)
+                            } else {
+                                b_obj.to_string()
                             }
                         } else if let Some(arr) = gid_val.as_array() {
                             let bytes: Vec<u8> = arr.iter().filter_map(|b| b.as_u64().map(|n| n as u8)).collect();
@@ -594,7 +599,7 @@ impl ChatService {
                 })
                 .collect()
         } else if let Some(convo_arr) = resp.get("conversations").and_then(|v| v.as_array()) {
-            let legacy_resp: GetConvosResp = serde_json::from_value(resp)
+            let legacy_resp: GetConvosResp = serde_json::from_value(resp.clone())
                 .map_err(|e| CatmosError::Xrpc(format!("parse conversations: {e}")))?;
             legacy_resp
                 .conversations
@@ -604,6 +609,14 @@ impl ChatService {
         } else {
             Vec::new()
         };
+
+        if let (Some(inv_session), Some(event_cursor)) = (
+            resp.get("inventorySessionId").and_then(|v| v.as_str()),
+            resp.get("snapshotEventCursor").and_then(|v| v.as_str()),
+        ) {
+            let mut sess = self.inventory_session.write().await;
+            *sess = Some((inv_session.to_string(), event_cursor.to_string()));
+        }
         // Hydrate locally-decrypted metadata into the freshly-built
         // Conversation values BEFORE the COALESCE-aware DB upsert below.
         // Without this step the in-memory cache published to the TUI
@@ -806,14 +819,15 @@ impl ChatService {
             // applied to reach current_epoch, which then fails with a
             // forward-secrecy error (sender_epoch = current-1). Skip past it.
             let from_epoch = current_epoch.saturating_add(1).to_string();
-            let actor_device_id = self.actor_device_id().await.unwrap_or_default();
+            let actor_device_id = self.actor_device_id().await?;
             let resp: GetMessagesResp = self
                 .xrpc_query(
                     "blue.catbird.chat.getEntries",
                     &[
                         ("actorDeviceId", &actor_device_id),
-                        ("convoId", convo_id),
                         ("conversationId", convo_id),
+                        ("convoId", convo_id),
+                        ("afterSeq", "0"),
                         ("type", "commit"),
                         ("fromEpoch", &from_epoch),
                         ("limit", "50"),
@@ -1037,12 +1051,14 @@ impl ChatService {
         let since_seq = self.db.get_max_seq(convo_id).await.ok().flatten();
         let limit_str = limit.to_string();
         let since_seq_str = since_seq.map(|s| s.to_string());
-
-        let actor_device_id = self.actor_device_id().await.unwrap_or_default();
+        let after_seq = since_seq.unwrap_or(0);
+        let after_seq_str = after_seq.to_string();
+        let actor_device_id = self.actor_device_id().await?;
         let mut params: Vec<(&str, &str)> = vec![
             ("actorDeviceId", &actor_device_id),
-            ("convoId", convo_id),
             ("conversationId", convo_id),
+            ("convoId", convo_id),
+            ("afterSeq", &after_seq_str),
             ("type", "app"),
             ("limit", &limit_str),
         ];

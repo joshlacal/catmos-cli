@@ -577,10 +577,14 @@ impl ChatService {
         kind: Option<&str>,
     ) -> Result<Option<Vec<u8>>> {
         const NSID: &str = "blue.catbird.chat.getBlob";
-        let mut params: Vec<(&str, String)> = Vec::new();
-        if let Ok(actor_device_id) = self.actor_device_id().await {
-            params.push(("actorDeviceId", actor_device_id));
-        }
+
+        let bearer = self.current_bearer().await?;
+        let (url, headers) = self.metadata_blob_request(NSID, &bearer)?;
+
+        let actor_device_id = self.actor_device_id().await?;
+        let mut params: Vec<(&str, String)> = vec![
+            ("actorDeviceId", actor_device_id),
+        ];
         if let Some(v) = blob_locator {
             params.push(("blobLocator", v.to_string()));
         }
@@ -685,10 +689,10 @@ impl ChatService {
             HeaderValue::from_static("application/octet-stream"),
         );
 
-        let mut params: Vec<(&str, String)> = Vec::new();
-        if let Ok(actor_device_id) = self.actor_device_id().await {
-            params.push(("actorDeviceId", actor_device_id));
-        }
+        let actor_device_id = self.actor_device_id().await?;
+        let mut params: Vec<(&str, String)> = vec![
+            ("actorDeviceId", actor_device_id),
+        ];
         params.push(("blobLocator", blob_locator.to_string()));
         params.push(("groupId", group_id.to_string()));
         if let Some(v) = convo_id {

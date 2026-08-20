@@ -335,7 +335,11 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
 
             if app_password {
                 eprint!("App password: ");
-                let password = rpassword::read_password()?;
+                let password = rpassword::read_password().or_else(|_| {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    Ok::<String, std::io::Error>(line.trim().to_string())
+                })?;
 
                 let session = AppPasswordAuth::login(&handle, &password).await?;
                 println!("Logged in as {} ({})", session.handle, session.did);

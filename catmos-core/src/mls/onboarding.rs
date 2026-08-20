@@ -4,6 +4,7 @@
 //! This module implements the complete flow that makes a catmos-cli device
 //! capable of decrypting messages in existing MLS conversations.
 
+use sha2::{Digest, Sha256};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -171,7 +172,7 @@ impl MlsManager {
             serde_json::to_vec(&body).map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?,
             |transcript| {
                 self.with_context(|ctx| {
-                    ctx.sign_with_identity_key(identity_bytes.clone(), transcript.to_vec())
+                    ctx.sign_with_identity_key(mls_did.clone(), transcript.to_vec())
                 })
                 .map_err(|_| catbird_mls::orchestrator::TransportError::Signing)
             },
@@ -181,6 +182,7 @@ impl MlsManager {
         let prepared_body_bytes = prepared.body.ok_or_else(|| {
             CatmosError::Mls(catbird_mls::MLSError::Internal("Prepared enrollment body is missing".into()))
         })?;
+
 
         // 5. Submit to enrollDevice
         let resp: serde_json::Value = service
@@ -193,6 +195,12 @@ impl MlsManager {
             .and_then(|v| v.as_str())
             .ok_or_else(|| CatmosError::Xrpc("enrollDevice response missing deviceId".into()))?
             .to_string();
+        if server_device_id != device_uuid {
+            return Err(CatmosError::AuthFailed(format!(
+                "server substituted device ID {} for client ID {}",
+                server_device_id, device_uuid
+            )));
+        }
         let mls_did = format!("{did}#{server_device_id}");
 
         // 6. Persist device info
@@ -531,7 +539,7 @@ impl MlsManager {
         service: &ChatService,
         convo_id: &str,
     ) -> Result<String> {
-        let actor_device_id = service.actor_device_id().await.unwrap_or_default();
+        let actor_device_id = service.actor_device_id().await?;
         let group_state: serde_json::Value = service
             .xrpc_query(
                 "blue.catbird.chat.getConversationState",
@@ -587,7 +595,7 @@ impl MlsManager {
         service: &ChatService,
         convo_id: &str,
     ) -> Result<Option<String>> {
-        let actor_device_id = service.actor_device_id().await.unwrap_or_default();
+        let actor_device_id = service.actor_device_id().await?;
         let group_state: serde_json::Value = match service
             .xrpc_query(
                 "blue.catbird.chat.getConversationState",
@@ -726,7 +734,7 @@ impl ChatService {
     /// Attempt to join conversations that this device doesn't have local
     /// MLS state for, via external commit.
     pub async fn join_missing_conversations(&self, did: &str) {
-        let convos = self.conversations.read().await.clone();
+        let convos = self.conversations().await;
         info!(
             "join_missing_conversations: checking {} conversations for missing local MLS state",
             convos.len()

@@ -16,7 +16,7 @@ use catbird_mls::{GroupConfig, KeyPackageData};
 
 use crate::auth::{AuthMethod, TokenSession};
 use crate::error::{CatmosError, Result};
-use crate::mls::{MlsManager, MLS_CIPHER_SUITE};
+use crate::mls::{MlsManager, KEY_PACKAGE_LOW_THRESHOLD, KEY_PACKAGE_TARGET, MLS_CIPHER_SUITE};
 use crate::recovery::{
     GroupInfo404Tracker, QuarantineExitReason, QuarantineReason, RecoveryTracker,
 };
@@ -25,13 +25,6 @@ use crate::storage::config::Config;
 use crate::storage::db::Database;
 use crate::types::{BlobUsage, Conversation, Device, KeyPackageStatus};
 
-/// Layer 3 quarantine event published on the broadcast channel held by
-/// `ChatService::quarantine_events`. The TUI subscribes and translates these
-/// into `AppEvent::Quarantined` / `AppEvent::QuarantineCleared`. Mirrors the
-/// `OrchestratorEventCallback::on_conversation_quarantined` /
-/// `_quarantine_cleared` pair from `catbird-mls/src/orchestrator_bridge.rs`
-/// (f363fd1) — catmos-cli doesn't consume the orchestrator bridge, so we
-/// publish at the platform layer instead.
 #[derive(Debug, Clone)]
 pub enum QuarantineEvent {
     Entered {
@@ -45,6 +38,7 @@ pub enum QuarantineEvent {
         via: QuarantineExitReason,
     },
 }
+
 /// Return true if the response status and body indicate an ExpiredToken error.
 pub(crate) fn is_expired_token_response(status: StatusCode, body: &[u8]) -> bool {
     if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST) {
@@ -52,74 +46,43 @@ pub(crate) fn is_expired_token_response(status: StatusCode, body: &[u8]) -> bool
     }
     if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) {
         if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
-            if err == "ExpiredToken" {
-                return true;
-            }
+            return err == "ExpiredToken";
         }
+        return false;
     }
     if let Ok(text) = std::str::from_utf8(body) {
-        if text.contains("ExpiredToken") {
-            return true;
-        }
+        return text.contains(r#""error":"ExpiredToken"#) || text.contains(r#""error": "ExpiredToken"#);
     }
     false
 }
 
-
-// ── Thin response wrappers for endpoints not covered in messages.rs ─────
-//
-// Jacquard-generated output types use lifetime parameters and don't implement
-// `DeserializeOwned`. We use thin owned wrappers whose field names match the
-// generated types exactly (camelCase via serde rename).
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ListDevicesResp {
-    devices: Vec<DeviceInfoResp>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeviceInfoResp {
-    device_id: String,
-    credential_did: String,
-    device_name: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KeyPackageStatusResp {
+struct CommitGroupChangeResp {
+    success: bool,
     #[serde(default)]
-    stats: Option<KeyPackageStatsResp>,
+    new_epoch: Option<i64>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct KeyPackageStatsResp {
-    total_available: i64,
+pub(crate) struct GetKeyPackagesResp {
+    pub key_packages: Vec<KeyPackageRefResp>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct PublishKeyPackagesResp {
+pub(crate) struct KeyPackageRefResp {
+    pub did: String,
+    pub key_package: Vec<u8>,
     #[serde(default)]
-    publish_result: Option<PublishResultResp>,
+    pub key_package_hash: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PublishResultResp {
-    succeeded: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RemoveDeviceResp {
-    deleted: bool,
-    #[serde(default)]
-    key_packages_deleted: Option<i64>,
-    #[serde(default)]
-    conversations_left: Option<i64>,
+struct ProfileBasic {
+    handle: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -129,198 +92,23 @@ struct UploadBlobResp {
     size: i64,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GetBlobUsageResp {
-    used_bytes: i64,
-    quota_bytes: i64,
-    blob_count: i64,
-}
-
-// ── commitGroupChange ───────────────────────────────────────────────────
-//
-// Thin DeserializeOwned response wrapper for `commitGroupChange`. Mirrors the
-// Jacquard-generated `CommitGroupChangeOutput` shape for the fields we care
-// about at the sender side — used to pick up the server-echoed `newEpoch`
-// which we fence `confirm_commit` against.
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CommitGroupChangeResp {
-    #[serde(default)]
-    success: bool,
-    #[serde(default)]
-    new_epoch: Option<i64>,
-}
-
-// ── getKeyPackages ──────────────────────────────────────────────────────
-//
-// DeserializeOwned wrapper for `getKeyPackages` output. The server emits
-// `keyPackage` as a `{"$bytes": "base64..."}` envelope (AT Protocol bytes
-// wrapper), so we use `serde_bytes_wrapper` below to unwrap it.
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // did / cipher_suite / key_package_hash are parsed but
-                    // not yet consumed — kept for log-line surface and for
-                    // future `keyPackageHashes` commit-group-change field.
-pub(crate) struct KeyPackageRefResp {
-    did: String,
-    cipher_suite: String,
-    #[serde(with = "serde_bytes_wrapper")]
-    key_package: Vec<u8>,
-    #[serde(default)]
-    key_package_hash: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GetKeyPackagesResp {
-    #[serde(default)]
-    key_packages: Vec<KeyPackageRefResp>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    missing: Option<Vec<String>>,
-}
-
-/// AT Protocol `{"$bytes": "base64..."}` envelope → raw `Vec<u8>`.
-///
-/// The server-side lexicon types serialize `bytes` fields as
-/// `{"$bytes": "<BASE64>"}`. Use this helper when deserializing into a
-/// plain `Vec<u8>` in our thin owned response wrappers.
-mod serde_bytes_wrapper {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-    use serde::{de::Error as DeError, Deserialize, Deserializer};
-
-    #[derive(Deserialize)]
-    struct Wrapper {
-        #[serde(rename = "$bytes")]
-        bytes: String,
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let w = Wrapper::deserialize(d)?;
-        BASE64
-            .decode(&w.bytes)
-            .map_err(|e| D::Error::custom(format!("invalid $bytes base64: {e}")))
-    }
-}
-
-/// Build a `CommitGroupChange<'static>` for the wire **without** going through
-/// the buggy `InputData → Input` adapter in `catbird-atproto`.
-///
-/// Why not use `catbird_atproto::catbird::mls_chat::commit_group_change::InputData`?
-/// That adapter types `commit` / `welcome` / `group_info` / `confirmation_tag` as
-/// `Option<String>`, and its `From<InputData> for Input` impl maps them via
-/// `String → bytes::Bytes`. `bytes::Bytes::from(String)` takes the UTF-8 bytes
-/// of the string verbatim — so when callers pass a pre-base64 string, the
-/// bytes field ends up containing the ASCII of the base64 text and the jacquard
-/// serializer then wraps it as `{"$bytes": base64(ASCII-base64)}`, producing
-/// double-encoded commits the server rejects or silently mis-decodes. Building
-/// the lexicon struct directly lets us pass raw `bytes::Bytes::from(Vec<u8>)`
-/// so the single serializer layer does the one correct base64 encode.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_commit_group_change(
-    convo_id: &str,
-    action: &str,
-    commit: Option<Vec<u8>>,
-    welcome: Option<Vec<u8>>,
-    group_info: Option<Vec<u8>>,
-    confirmation_tag: Option<Vec<u8>>,
-    member_dids: Option<Vec<String>>,
-    idempotency_key: Option<String>,
-) -> serde_json::Value {
-    let mut val = serde_json::json!({
-        "convoId": convo_id,
-        "action": action,
-    });
-    if let Some(c) = commit {
-        val["commit"] = serde_json::json!(BASE64.encode(c));
-    }
-    if let Some(w) = welcome {
-        val["welcome"] = serde_json::json!(BASE64.encode(w));
-    }
-    if let Some(gi) = group_info {
-        val["groupInfo"] = serde_json::json!(BASE64.encode(gi));
-    }
-    if let Some(ct) = confirmation_tag {
-        val["confirmationTag"] = serde_json::json!(BASE64.encode(ct));
-    }
-    if let Some(dids) = member_dids {
-        val["memberDids"] = serde_json::json!(dids);
-    }
-    if let Some(ik) = idempotency_key {
-        val["idempotencyKey"] = serde_json::json!(ik);
-    }
-    val
-}
-
-pub(crate) fn build_create_convo_request(
-    group_id: &str,
-    initial_members: &[String],
-    welcome_message: Option<Vec<u8>>,
-    key_package_hashes: Vec<(String, String)>,
-) -> serde_json::Value {
-    let current_epoch = if welcome_message.is_some() { 1 } else { 0 };
-
-    let mut val = serde_json::json!({
-        "groupId": group_id,
-        "cipherSuite": MLS_CIPHER_SUITE,
-        "currentEpoch": current_epoch,
-    });
-    if !initial_members.is_empty() {
-        val["initialMembers"] = serde_json::json!(initial_members);
-    }
-    if let Some(w) = welcome_message {
-        val["welcomeMessage"] = serde_json::json!(BASE64.encode(w));
-    }
-    if !key_package_hashes.is_empty() {
-        let kps: Vec<serde_json::Value> = key_package_hashes
-            .into_iter()
-            .map(|(did, hash)| serde_json::json!({ "did": did, "hash": hash }))
-            .collect();
-        val["keyPackageHashes"] = serde_json::json!(kps);
-    }
-    val
-}
-
-/// Central coordinator for chat operations: XRPC calls, message encryption,
-/// WebSocket subscriptions, and local storage.
+#[derive(Clone)]
 pub struct ChatService {
     pub(crate) http: reqwest::Client,
     pub(crate) auth: AuthMethod,
-    /// Jacquard-backed token lifecycle (login/refresh) for AppPassword auth.
-    /// `None` for OAuth, which is refreshed server-side by nest.
     pub(crate) token_session: Option<TokenSession>,
     pub mls: Arc<MlsManager>,
     pub db: Arc<Database>,
     pub(crate) config: Config,
     pub(crate) aliases: Arc<RwLock<AliasStore>>,
     pub(crate) conversations: Arc<RwLock<Vec<Conversation>>>,
-    /// DID -> handle cache, populated during fetch_conversations.
     pub(crate) handle_cache: Arc<RwLock<HashMap<String, String>>>,
-    /// Process-wide rejoin tracker (spec §8.4). Replaces the previous
-    /// `repair_cooldowns` map — the new tracker also enforces the global
-    /// `MIN_REJOIN_INTERVAL` floor across all conversations and the per-convo
-    /// `MAX_REJOIN_ATTEMPTS` cap.
     pub(crate) recovery_tracker: Arc<Mutex<RecoveryTracker>>,
-    /// Per-conversation GroupInfo 404 circuit breaker (spec §8.3).
     pub(crate) groupinfo_404_tracker: Arc<Mutex<GroupInfo404Tracker>>,
-    /// Per-conversation consecutive decryption failures at the same epoch.
-    /// Reset on every successful decrypt; threshold = `DECRYPTION_FAILURE_THRESHOLD`
-    /// (spec §10).
     pub(crate) decrypt_fail_counts: Arc<Mutex<HashMap<String, u32>>>,
-    /// Per-conversation consecutive `merge_incoming_commit` / WrongEpoch
-    /// failures. Threshold = `EPOCH_DIVERGENCE_THRESHOLD` (spec §10).
     pub(crate) epoch_divergence_counts: Arc<Mutex<HashMap<String, u32>>>,
-    /// Own-commit SHA256 dedup: hash → timestamp. Prevents processing our own commits
-    /// as incoming messages (spec §5.4). Entries expire after 5 minutes.
     pub(crate) own_commits: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
-    /// Broadcast channel for Layer 3 quarantine state changes. The TUI
-    /// subscribes via `subscribe_quarantine_events`; off-the-record
-    /// listeners (tests, future telemetry) can also subscribe. Capacity 32
-    /// keeps slow consumers from blocking the sender; a missed event just
-    /// means the next `get_recovery_flags` read will reconcile state.
+    pub(crate) inventory_session: Arc<RwLock<Option<(String, String)>>>,
     pub(crate) quarantine_events: tokio::sync::broadcast::Sender<QuarantineEvent>,
 }
 
@@ -348,18 +136,20 @@ impl ChatService {
             decrypt_fail_counts: Arc::new(Mutex::new(HashMap::new())),
             epoch_divergence_counts: Arc::new(Mutex::new(HashMap::new())),
             own_commits: Arc::new(Mutex::new(HashMap::new())),
+            inventory_session: Arc::new(RwLock::new(None)),
             quarantine_events: tokio::sync::broadcast::channel(32).0,
         }
     }
 
-    /// Subscribe to Layer 3 quarantine state changes (TUI banner / status
-    /// line, tests). Receivers fall behind safely — bursts of >32 events
-    /// drop oldest first.
+    pub async fn conversations(&self) -> Vec<Conversation> {
+        let guard = self.conversations.read().await;
+        guard.clone()
+    }
+
     pub fn subscribe_quarantine_events(&self) -> tokio::sync::broadcast::Receiver<QuarantineEvent> {
         self.quarantine_events.subscribe()
     }
 
-    /// The authenticated user's DID.
     pub fn did(&self) -> &str {
         match &self.auth {
             AuthMethod::OAuth { did, .. } => did,
@@ -367,37 +157,30 @@ impl ChatService {
         }
     }
 
-    /// Snapshot of cached conversations.
-    pub async fn conversations(&self) -> Vec<Conversation> {
-        self.conversations.read().await.clone()
-    }
-
-    /// Snapshot of the DID -> handle cache.
     pub async fn handle_cache(&self) -> HashMap<String, String> {
         self.handle_cache.read().await.clone()
     }
 
-    /// Resolve user input (alias, name, or ID prefix) to a conversation ID.
     pub async fn resolve_convo(&self, input: &str) -> Result<String> {
-        let aliases = self.aliases.read().await;
-        let convos = self.conversations.read().await;
-        aliases
-            .resolve(input, &convos)
-            .ok_or_else(|| CatmosError::ConvoNotFound(input.to_string()))
+        if let Some(target) = self.aliases.read().await.get(input) {
+            return Ok(target.to_string());
+        }
+        let convos = self.conversations().await;
+        if let Some(c) = convos.iter().find(|c| c.group_id == input || c.conversation_id == input) {
+            return Ok(c.group_id.clone());
+        }
+        Ok(input.to_string())
     }
 
-    /// Resolve a DID to a handle via the public Bluesky API.
     pub async fn resolve_handle(&self, did: &str) -> Result<String> {
-        #[derive(serde::Deserialize)]
-        struct ProfileBasic {
-            handle: Option<String>,
-        }
-        // Use public API directly — no auth needed
+        let base_url = match &self.auth {
+            AuthMethod::OAuth { nest_url, .. } => nest_url.clone(),
+            AuthMethod::AppPassword { pds_url, .. } => pds_url.clone(),
+        };
         let resp = self
             .http
-            .get(format!(
-                "https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor={did}"
-            ))
+            .get(format!("{}/xrpc/app.bsky.actor.getProfile", base_url.trim_end_matches('/')))
+            .query(&[("actor", did)])
             .send()
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
@@ -416,16 +199,12 @@ impl ChatService {
 
     // ── XRPC transport ──────────────────────────────────────────────────
 
-    /// POST an XRPC procedure (e.g. `blue.catbird.chat.sendMessage`).
-    ///
-    /// On 401/Unauthorized from AppPassword sessions, refreshes the jacquard
-    /// session and retries exactly once.
     pub async fn xrpc_procedure<Req: Serialize + ?Sized, Resp: DeserializeOwned>(
         &self,
         nsid: &str,
         input: &Req,
     ) -> Result<Resp> {
-        let bearer = self.current_bearer().await?;
+        let bearer = self.get_service_token(nsid).await?;
         let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC POST {nsid} -> {url}");
 
@@ -446,7 +225,8 @@ impl ChatService {
 
         let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
             let new_bearer = self.refresh_bearer().await?;
-            let (url, headers) = self.build_request(nsid, &new_bearer)?;
+            let fresh_bearer = self.get_service_token(nsid).await.unwrap_or(new_bearer);
+            let (url, headers) = self.build_request(nsid, &fresh_bearer)?;
             debug!("XRPC POST {nsid} retry after refresh -> {url}");
             let retry_resp = self
                 .http
@@ -482,13 +262,12 @@ impl ChatService {
             .map_err(|e| CatmosError::Xrpc(format!("Failed to parse {nsid} response: {e}")))
     }
 
-    /// POST raw JSON bytes to an XRPC procedure.
     pub async fn xrpc_post_raw<Resp: DeserializeOwned>(
         &self,
         nsid: &str,
         body_json: &[u8],
     ) -> Result<Resp> {
-        let bearer = self.current_bearer().await?;
+        let bearer = self.get_service_token(nsid).await?;
         let (url, mut headers) = self.build_request(nsid, &bearer)?;
         headers.insert(
             reqwest::header::CONTENT_TYPE,
@@ -538,26 +317,18 @@ impl ChatService {
                 .await
                 .map_err(|e| CatmosError::Network(e.to_string()))?;
             if !retry_status.is_success() {
-                if is_sensitive_device_endpoint {
-                    return Err(CatmosError::Xrpc(format!("{nsid} returned {retry_status}")));
-                } else {
-                    let body_str = String::from_utf8_lossy(&retry_bytes);
-                    return Err(CatmosError::Xrpc(format!(
-                        "{nsid} returned {retry_status}: {body_str}"
-                    )));
-                }
+                let body_str = String::from_utf8_lossy(&retry_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "{nsid} returned {retry_status}: {body_str}"
+                )));
             }
             retry_bytes
         } else {
             if !status.is_success() {
-                if is_sensitive_device_endpoint {
-                    return Err(CatmosError::Xrpc(format!("{nsid} returned {status}")));
-                } else {
-                    let body_str = String::from_utf8_lossy(&body_bytes);
-                    return Err(CatmosError::Xrpc(format!(
-                        "{nsid} returned {status}: {body_str}"
-                    )));
-                }
+                let body_str = String::from_utf8_lossy(&body_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "{nsid} returned {status}: {body_str}"
+                )));
             }
             body_bytes
         };
@@ -566,16 +337,12 @@ impl ChatService {
             .map_err(|e| CatmosError::Xrpc(format!("Failed to parse {nsid} response: {e}")))
     }
 
-    /// GET an XRPC query (e.g. `blue.catbird.chat.getConversations`).
-    ///
-    /// On 401/Unauthorized from AppPassword sessions, refreshes the jacquard
-    /// session and retries exactly once.
     pub async fn xrpc_query<R: DeserializeOwned>(
         &self,
         nsid: &str,
         params: &[(&str, &str)],
     ) -> Result<R> {
-        let bearer = self.current_bearer().await?;
+        let bearer = self.get_service_token(nsid).await?;
         let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC GET {nsid} -> {url}");
 
@@ -601,7 +368,8 @@ impl ChatService {
 
         let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
             let new_bearer = self.refresh_bearer().await?;
-            let (url, headers) = self.build_request(nsid, &new_bearer)?;
+            let fresh_bearer = self.get_service_token(nsid).await.unwrap_or(new_bearer);
+            let (url, headers) = self.build_request(nsid, &fresh_bearer)?;
             debug!("XRPC GET {nsid} retry after refresh -> {url}");
             let retry_resp = self
                 .http
@@ -617,26 +385,18 @@ impl ChatService {
                 .await
                 .map_err(|e| CatmosError::Network(e.to_string()))?;
             if !retry_status.is_success() {
-                if is_sensitive_device_endpoint {
-                    return Err(CatmosError::Xrpc(format!("{nsid} returned {retry_status}")));
-                } else {
-                    let body_str = String::from_utf8_lossy(&retry_bytes);
-                    return Err(CatmosError::Xrpc(format!(
-                        "{nsid} returned {retry_status}: {body_str}"
-                    )));
-                }
+                let body_str = String::from_utf8_lossy(&retry_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "{nsid} returned {retry_status}: {body_str}"
+                )));
             }
             retry_bytes
         } else {
             if !status.is_success() {
-                if is_sensitive_device_endpoint {
-                    return Err(CatmosError::Xrpc(format!("{nsid} returned {status}")));
-                } else {
-                    let body_str = String::from_utf8_lossy(&body_bytes);
-                    return Err(CatmosError::Xrpc(format!(
-                        "{nsid} returned {status}: {body_str}"
-                    )));
-                }
+                let body_str = String::from_utf8_lossy(&body_bytes);
+                return Err(CatmosError::Xrpc(format!(
+                    "{nsid} returned {status}: {body_str}"
+                )));
             }
             body_bytes
         };
@@ -651,21 +411,18 @@ impl ChatService {
             } else {
                 let sample_len = body_bytes.len().min(300);
                 CatmosError::Xrpc(format!(
-                    "Failed to parse {nsid}: {e}\nBody: {}",
+                    "Failed to parse {nsid}: {e}
+Body: {}",
                     String::from_utf8_lossy(&body_bytes[..sample_len])
                 ))
             }
         })
     }
 
-    /// True if we should refresh & retry after the server returned this status
-    /// code and body (AppPassword only — OAuth is refreshed server-side by nest).
-    /// Only retries when the response is explicitly an ExpiredToken error.
     pub(crate) fn should_retry_after_refresh(&self, status: StatusCode, body: &[u8]) -> bool {
         self.token_session.is_some() && is_expired_token_response(status, body)
     }
 
-    /// Return the active registered device ID for this account.
     pub async fn actor_device_id(&self) -> Result<String> {
         if let Some(id) = self.db.get_session_value("mls_device_id").await? {
             if !id.trim().is_empty() {
@@ -681,7 +438,41 @@ impl ChatService {
             "No registered MLS device ID found. Please register a device first.".into(),
         ))
     }
-    /// Fetch the current bearer token for the active auth method.
+
+    pub(crate) async fn get_service_token(&self, nsid: &str) -> Result<String> {
+        match (&self.auth, &self.token_session) {
+            (AuthMethod::OAuth { session_cookie, .. }, _) => Ok(session_cookie.clone()),
+            (AuthMethod::AppPassword { pds_url, .. }, Some(sess)) => {
+                let access_jwt = sess.current_bearer().await?;
+                // Mint service auth token from user's PDS for did:web:chat.catbird.blue#atproto_mls
+                let aud = crate::mls::atproto_proxy_header_value();
+                let url = format!("{}/xrpc/com.atproto.server.getServiceAuth", pds_url.trim_end_matches('/'));
+                let resp = self
+                    .http
+                    .get(&url)
+                    .query(&[("aud", aud.as_str()), ("lxm", nsid)])
+                    .header(AUTHORIZATION, format!("Bearer {access_jwt}"))
+                    .send()
+                    .await;
+                if let Ok(r) = resp {
+                    if r.status().is_success() {
+                        #[derive(Deserialize)]
+                        struct SvcResp {
+                            token: String,
+                        }
+                        if let Ok(parsed) = r.json::<SvcResp>().await {
+                            return Ok(parsed.token);
+                        }
+                    }
+                }
+                Ok(access_jwt)
+            }
+            (AuthMethod::AppPassword { .. }, None) => Err(CatmosError::AuthFailed(
+                "AppPassword auth without a TokenSession — restart catmos".into(),
+            )),
+        }
+    }
+
     pub(crate) async fn current_bearer(&self) -> Result<String> {
         match (&self.auth, &self.token_session) {
             (AuthMethod::OAuth { session_cookie, .. }, _) => Ok(session_cookie.clone()),
@@ -692,8 +483,6 @@ impl ChatService {
         }
     }
 
-    /// Force a `refreshSession` call on the AppPassword token session, persist
-    /// the new tokens, and return the fresh bearer. Fails if no token session.
     pub(crate) async fn refresh_bearer(&self) -> Result<String> {
         let sess = self
             .token_session
@@ -705,16 +494,6 @@ impl ChatService {
 
     // ── Conversation management ──────────────────────────────────────────
 
-    /// Create a new MLS group conversation on the server.
-    ///
-    /// Per the MLS metadata cutover (Phase C), this **does not** ship a
-    /// plaintext `metadata { name, description }` field on `createConvo`. The
-    /// returned `Conversation` has `name: None` / `description: None`; the
-    /// caller is expected to drive the encrypted-bootstrap path via
-    /// `bootstrap_group_metadata_for_convo` (see `chat/metadata.rs`) once the
-    /// local MLS group exists. `name` / `description` are persisted as part
-    /// of `GroupMetadataV1` and uploaded as an opaque blob through
-    /// `putGroupMetadataBlob`.
     pub async fn create_conversation(
         &self,
         name: &str,
@@ -868,29 +647,6 @@ impl ChatService {
         Ok(())
     }
 
-    /// Submit a `bootstrapResetGroup` call for the first-responder bootstrap
-    /// path (spec §8.5 Phase 1, mls-ds endpoint added in task #17 / commit
-    /// `mls-ds@da85949`). The MLS group at `new_group_id_hex` MUST already
-    /// exist locally (created via `MLSContext::create_group_with_id` and its
-    /// `group_info` blob exported via `MLSContext::export_group_info`).
-    ///
-    /// Why a dedicated endpoint vs. `createConvo` with a predetermined
-    /// `groupId`: post-reset, the server holds a row at
-    /// `(id=originalConvoId, group_id=newGroupId)` waiting to be bootstrapped.
-    /// `createConvo` would INSERT a brand-new row at `id=newGroupId` and
-    /// orphan the post-reset row. `bootstrapResetGroup` UPDATEs the existing
-    /// row in place via `WHERE id=originalConvoId AND group_id=newGroupId AND
-    /// group_info IS NULL`.
-    ///
-    /// Race-loser detection: server returns HTTP 409 with body
-    /// `"AlreadyBootstrapped"` when the post-reset row's `group_info` was
-    /// already set by another caller; classified by
-    /// `recovery_ops::is_bootstrap_already_bootstrapped`.
-    ///
-    /// `welcome_message` is `None` because race-winners broadcast Welcome via
-    /// the next `add_members` cycle (mirrors
-    /// `catbird-mls/src/orchestrator/recovery.rs:1654`).
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn bootstrap_reset_group(
         &self,
         original_convo_id: &str,
@@ -921,7 +677,6 @@ impl ChatService {
         Ok(())
     }
 
-    /// Leave (remove self from) a conversation.
     pub async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
         let req = serde_json::json!({
             "convoId": convo_id,
@@ -934,7 +689,6 @@ impl ChatService {
         Ok(())
     }
 
-    /// List devices registered for the authenticated user.
     pub async fn list_devices(&self) -> Result<Vec<Device>> {
         let actor_device_id = self.actor_device_id().await?;
         let resp: serde_json::Value = self
@@ -998,7 +752,6 @@ impl ChatService {
         Ok(Vec::new())
     }
 
-    /// Get the current key package availability status.
     pub async fn get_key_package_status(&self) -> Result<KeyPackageStatus> {
         let actor_device_id = self.actor_device_id().await?;
         let resp: serde_json::Value = self
@@ -1019,8 +772,8 @@ impl ChatService {
                         .unwrap_or(0);
                     return Ok(KeyPackageStatus {
                         available: avail as u64,
-                        target: 25,
-                        needs_replenish: avail < 10,
+                        target: KEY_PACKAGE_TARGET,
+                        needs_replenish: (avail as u64) < KEY_PACKAGE_LOW_THRESHOLD,
                     });
                 }
             }
@@ -1033,57 +786,24 @@ impl ChatService {
                 .unwrap_or(0);
             return Ok(KeyPackageStatus {
                 available: avail as u64,
-                target: 50,
-                needs_replenish: avail < 10,
+                target: KEY_PACKAGE_TARGET,
+                needs_replenish: (avail as u64) < KEY_PACKAGE_LOW_THRESHOLD,
             });
         }
 
         Ok(KeyPackageStatus {
             available: 0,
-            target: 25,
+            target: KEY_PACKAGE_TARGET,
             needs_replenish: true,
         })
     }
 
-    // ── Join / Update / Member management ─────────────────────────────────
-
-    // NOTE: the former `join_conversation` method lived here. It POSTed
-    // `commitGroupChange` with `action: "externalCommit"` and every commit/
-    // welcome/group_info field set to None — no MLS crypto was performed
-    // locally, so the server always rejected it as `InvalidCommit`. The real
-    // external-commit join flow is in `crate::mls::onboarding::MlsManager::
-    // join_via_external_commit`, which fetches GroupInfo, constructs the
-    // external commit via `MLSContext::create_external_commit`, and merges
-    // locally on success. Removed in task #65 along with fixing the same
-    // double-encoding wire bug in onboarding.rs. CLI `convo join` now routes
-    // there directly.
-
-    /// Update conversation metadata (name, description).
-    ///
-    /// This drives a client-side MLS commit (GroupContextExtensions update) via
-    /// the three-phase `stage_commit` / `confirm_commit` / `discard_pending`
-    /// API on `MLSContext` and posts to `commitGroupChange` with
-    /// `action: "updateMetadata"`.
-    ///
-    /// Note: the generic `"commit" | "updateMetadata"` branch on the server
-    /// rejects requests that set `welcome` or `memberDids`, so those stay
-    /// `None`. The server also does not echo `newEpoch` reliably for this
-    /// action, so we fence `confirm_commit` with the skip sentinel and trust
-    /// the staged target epoch.
     pub async fn update_conversation(
         &self,
         convo_id: &str,
         name: Option<&str>,
         description: Option<&str>,
     ) -> Result<()> {
-        // Phase A.2 encrypted-only path. The previous plaintext-0xff00 +
-        // FFICommitKind::UpdateMetadata route is retired; the MLS group
-        // context only carries an encrypted MetadataReference (see
-        // catbird-mls/src/metadata.rs), and the title/description/avatar
-        // live in a ChaCha20-Poly1305 blob the DS holds opaquely.
-        //
-        // 1. Stage commit + derive post-commit metadata key + encrypt
-        //    `GroupMetadataV1` payload + assemble artifacts in one FFI call.
         let group_id_bytes = hex::decode(convo_id)
             .map_err(|_| CatmosError::Other(format!("Invalid hex group ID: {convo_id}")))?;
         let result = self.mls.with_context(|ctx| {
@@ -1091,19 +811,13 @@ impl ChatService {
                 group_id_bytes.clone(),
                 name.map(str::to_string),
                 description.map(str::to_string),
-                None, // avatar_blob_locator (separate flow when wired)
-                None, // avatar_content_type
+                None,
+                None,
             )
         })?;
 
-        // Track our own commit BEFORE shipping it so the incoming sync/WS
-        // path doesn't reprocess (spec §5.4 — own-commit dedup).
         self.track_own_commit(&result.commit_bytes).await;
 
-        // 2. Upload the encrypted blob FIRST. If the upload fails we must
-        //    clear the local pending commit so the local epoch doesn't
-        //    advance past a state other clients can't reach (no blob → no
-        //    decryptable metadata).
         if let Err(e) = self
             .put_group_metadata_blob(
                 &result.metadata_blob_locator,
@@ -1122,8 +836,6 @@ impl ChatService {
             return Err(e);
         }
 
-        // 3. POST commitGroupChange. Server enforces non-add-action contract:
-        //    welcome / memberDids must be None for updateMetadata.
         let req = build_commit_group_change(
             convo_id,
             "updateMetadata",
@@ -1140,8 +852,6 @@ impl ChatService {
             .await
         {
             Ok(resp) if resp.success => {
-                // 4. Merge locally — advances epoch, applies the new
-                //    MetadataReference in AppDataDictionary 0x8001.
                 if let Err(e) = self
                     .mls
                     .with_context(|ctx| ctx.merge_pending_commit(group_id_bytes.clone()))
@@ -1150,8 +860,7 @@ impl ChatService {
                     return Err(e);
                 }
                 info!(
-                    "Updated metadata for conversation {convo_id} \
-                     (encrypted, version={}, locator={})",
+                    "Updated metadata for conversation {convo_id}                      (encrypted, version={}, locator={})",
                     result.metadata_version, result.metadata_blob_locator
                 );
                 Ok(())
@@ -1173,15 +882,7 @@ impl ChatService {
         }
     }
 
-    /// Add a member to a conversation.
-    ///
-    /// Drives a client-side MLS `addMembers` commit (three-phase:
-    /// `stage_commit` → POST → `confirm_commit` on success, `discard_pending`
-    /// on any failure). Fetches the target device's key packages from the
-    /// server first, then constructs and ships the commit + Welcome.
     pub async fn add_member(&self, convo_id: &str, member_did: &str) -> Result<()> {
-        // 1. Fetch key packages for the target DID (server returns one KP per
-        //    registered device). Missing DIDs surface as an error.
         let kp_refs = self.fetch_key_packages(&[member_did.to_string()]).await?;
         if kp_refs.is_empty() {
             return Err(CatmosError::Other(format!(
@@ -1190,7 +891,6 @@ impl ChatService {
         }
         let key_packages: Vec<Vec<u8>> = kp_refs.iter().map(|k| k.key_package.clone()).collect();
 
-        // 2. Stage the addMembers commit locally.
         let did = self.did().to_string();
         let plan = self.mls.with_commit_context(|ctx| {
             ctx.stage_commit(
@@ -1207,7 +907,6 @@ impl ChatService {
             CatmosError::Other("stage_commit(AddMembers) did not return welcome bytes".to_string())
         })?;
 
-        // 3. POST commitGroupChange with commit + welcome + memberDids.
         let req = build_commit_group_change(
             convo_id,
             "addMembers",
@@ -1227,10 +926,6 @@ impl ChatService {
             .await
         {
             Ok(resp) if resp.success => {
-                // Server echoes `newEpoch` on the addMembers path (see
-                // mls-ds `handle_add_members`). Use it to fence
-                // confirm_commit, mirroring iOS. Fall back to the skip
-                // sentinel for idempotency hits where the server returns 0.
                 let server_epoch = match resp.new_epoch {
                     Some(e) if e > 0 => e as u64,
                     _ => catbird_mls::mls_skip_server_epoch_fence(),
@@ -1268,12 +963,7 @@ impl ChatService {
         }
     }
 
-    /// Remove a member from a conversation.
-    ///
-    /// Drives a client-side MLS `removeMembers` commit (three-phase). No
-    /// Welcome is produced by this path.
     pub async fn remove_member(&self, convo_id: &str, member_did: &str) -> Result<()> {
-        // 1. Stage the removeMembers commit locally.
         let did = self.did().to_string();
         let plan = self.mls.with_commit_context(|ctx| {
             ctx.stage_commit(
@@ -1285,7 +975,6 @@ impl ChatService {
             )
         })?;
 
-        // 2. POST commitGroupChange with commit + memberDids. No welcome.
         let req = build_commit_group_change(
             convo_id,
             "removeMembers",
@@ -1305,10 +994,6 @@ impl ChatService {
             .await
         {
             Ok(resp) if resp.success => {
-                // Server echoes `newEpoch` on the removeMembers path (see
-                // mls-ds handler, returns Some(new_epoch as i64)). Fence
-                // confirm_commit against it; fall back to skip sentinel for
-                // idempotency hits.
                 let server_epoch = match resp.new_epoch {
                     Some(e) if e > 0 => e as u64,
                     _ => catbird_mls::mls_skip_server_epoch_fence(),
@@ -1346,27 +1031,17 @@ impl ChatService {
         }
     }
 
-    /// Record a SHA-256 of our outgoing commit ciphertext so the incoming
-    /// sync / WebSocket paths can dedup the server-fanned echo (spec §5.4).
     async fn track_own_commit(&self, commit_bytes: &[u8]) {
         let hash: [u8; 32] = Sha256::digest(commit_bytes).into();
         let mut own = self.own_commits.lock().await;
         own.insert(hash, Instant::now());
-        // Expire entries older than 5 minutes.
         own.retain(|_, ts| ts.elapsed() < std::time::Duration::from_secs(300));
     }
 
-    /// Fetch key packages for the given DIDs from the server.
-    ///
-    /// The server returns one key package per registered device for each DID.
-    /// Missing DIDs are surfaced in `missing` (we currently ignore that — the
-    /// caller will just see an empty `key_packages` and can decide policy).
     pub(crate) async fn fetch_key_packages(
         &self,
         dids: &[String],
     ) -> Result<Vec<KeyPackageRefResp>> {
-        // xrpc_query takes `&[(&str, &str)]`; `dids` is a repeated query
-        // parameter per AT Protocol convention.
         let params: Vec<(&str, &str)> = dids.iter().map(|d| ("dids", d.as_str())).collect();
         let resp: GetKeyPackagesResp = self
             .xrpc_query("blue.catbird.chat.getKeyPackages", &params)
@@ -1374,7 +1049,6 @@ impl ChatService {
         Ok(resp.key_packages)
     }
 
-    /// Promote a member to admin or moderator.
     pub async fn promote_member(
         &self,
         convo_id: &str,
@@ -1397,7 +1071,6 @@ impl ChatService {
         Ok(())
     }
 
-    /// Send a reaction (add or remove) to a message.
     pub async fn send_reaction(
         &self,
         convo_id: &str,
@@ -1406,7 +1079,6 @@ impl ChatService {
         remove: bool,
     ) -> Result<()> {
         let action = if remove { "remove" } else { "add" };
-        // Match the iOS MLSMessagePayload format with nested reaction object
         let payload = serde_json::json!({
             "version": 1,
             "messageType": "reaction",
@@ -1418,12 +1090,49 @@ impl ChatService {
         });
         let plaintext = serde_json::to_vec(&payload)?;
 
-        // Encrypt via MLS -- ciphertext padding is handled by the MLS layer
         let group_id_bytes = hex::decode(convo_id)
             .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
 
         let encrypt_result = self
-    /// Fetch group state from the server.
+            .mls
+            .with_context(|ctx| ctx.encrypt_message(group_id_bytes.clone(), plaintext))?;
+
+        let epoch = self.get_epoch(convo_id).unwrap_or(0);
+        let msg_id = ulid::Ulid::new().to_string();
+        let padded_size = encrypt_result.ciphertext.len() as i64;
+        let confirmation_tag = self.get_confirmation_tag_b64(&group_id_bytes);
+
+        let req = serde_json::json!({
+            "convoId": convo_id,
+            "ciphertext": BASE64.encode(&encrypt_result.ciphertext),
+            "epoch": epoch,
+            "msgId": msg_id,
+            "paddedSize": padded_size,
+            "confirmationTag": confirmation_tag,
+        });
+
+        let _: serde_json::Value = self
+            .xrpc_procedure("blue.catbird.chat.sendMessage", &req)
+            .await?;
+
+        Ok(())
+    }
+
+    pub fn get_epoch(&self, convo_id: &str) -> Result<u64> {
+        let group_id_bytes = hex::decode(convo_id)
+            .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
+        self.mls.with_context(|ctx| ctx.get_epoch(group_id_bytes))
+    }
+
+    pub fn get_tree_hash(&self, convo_id: &str) -> Result<Vec<u8>> {
+        let group_id_bytes = hex::decode(convo_id)
+            .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
+        let data = self
+            .mls
+            .with_context(|ctx| ctx.get_tree_hash(group_id_bytes))?;
+        Ok(data.tree_hash)
+    }
+
     pub async fn get_group_state(&self, convo_id: &str) -> Result<serde_json::Value> {
         let actor_device_id = self.actor_device_id().await?;
         let resp: serde_json::Value = self
@@ -1439,10 +1148,6 @@ impl ChatService {
         Ok(resp)
     }
 
-    // ── Blob operations ─────────────────────────────────────────────────
-
-    /// Upload a file as an encrypted blob associated with a conversation.
-    /// Returns the server-assigned blob ID.
     pub async fn upload_blob(&self, convo_id: &str, file_path: &str) -> Result<String> {
         let data = tokio::fs::read(file_path)
             .await
@@ -1450,7 +1155,7 @@ impl ChatService {
 
         let actor_device_id = self.actor_device_id().await?;
         let nsid = "blue.catbird.chat.uploadBlob";
-        let bearer = self.current_bearer().await?;
+        let bearer = self.get_service_token(nsid).await?;
         let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC POST {nsid} -> {url}");
 
@@ -1479,7 +1184,8 @@ impl ChatService {
 
         let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
             let new_bearer = self.refresh_bearer().await?;
-            let (url, headers) = self.build_request(nsid, &new_bearer)?;
+            let fresh_bearer = self.get_service_token(nsid).await.unwrap_or(new_bearer);
+            let (url, headers) = self.build_request(nsid, &fresh_bearer)?;
             let retry_resp = self
                 .http
                 .post(&url)
@@ -1519,11 +1225,10 @@ impl ChatService {
         Ok(resp.blob_id)
     }
 
-    /// Download a blob by ID and write it to the given output path.
     pub async fn download_blob(&self, blob_id: &str, output_path: &str) -> Result<()> {
         let actor_device_id = self.actor_device_id().await?;
         let nsid = "blue.catbird.chat.getBlob";
-        let bearer = self.current_bearer().await?;
+        let bearer = self.get_service_token(nsid).await?;
         let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC GET {nsid} -> {url}");
 
@@ -1549,7 +1254,8 @@ impl ChatService {
 
         let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
             let new_bearer = self.refresh_bearer().await?;
-            let (url, headers) = self.build_request(nsid, &new_bearer)?;
+            let fresh_bearer = self.get_service_token(nsid).await.unwrap_or(new_bearer);
+            let (url, headers) = self.build_request(nsid, &fresh_bearer)?;
             let retry_resp = self
                 .http
                 .get(&url)
@@ -1587,7 +1293,6 @@ impl ChatService {
         Ok(())
     }
 
-    /// Get the authenticated user's blob storage usage stats.
     pub async fn get_blob_usage(&self) -> Result<BlobUsage> {
         let actor_device_id = self.actor_device_id().await?;
         let resp: serde_json::Value = self
@@ -1608,11 +1313,52 @@ impl ChatService {
         })
     }
 
-    /// Build the target URL and auth headers for an XRPC call, given a
-    /// pre-resolved bearer token.
-    ///
-    /// - OAuth: routes through nest (confidential client proxy)
-    /// - AppPassword: routes to user's PDS (`pds_url`) with `atproto-proxy` header
+    pub async fn remove_device(&self, device_id: &str) -> Result<(bool, i64, i64)> {
+        let req = serde_json::json!({
+            "deviceId": device_id,
+        });
+
+        let resp: serde_json::Value = self
+            .xrpc_procedure("blue.catbird.chat.revokeDevice", &req)
+            .await?;
+
+        let deleted = resp.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false);
+        let kp_deleted = resp.get("keyPackagesDeleted").and_then(|v| v.as_i64()).unwrap_or(0);
+        let convos_left = resp.get("conversationsLeft").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        Ok((deleted, kp_deleted, convos_left))
+    }
+
+    pub async fn replenish_key_packages(&self) -> Result<u32> {
+        let actor_device_id = self.actor_device_id().await?;
+        let identity = format!("{}#{}", self.did(), actor_device_id);
+        let packages = self.mls.create_key_packages(identity.as_bytes(), 25)?;
+
+        let key_packages_json: Vec<serde_json::Value> = packages
+            .iter()
+            .map(|kp| {
+                serde_json::json!({
+                    "framing": "mlsMessage",
+                    "contentType": "keyPackage",
+                    "bytes": BASE64.encode(&kp.key_package_data),
+                    "sha256": BASE64.encode(Sha256::digest(&kp.key_package_data)),
+                    "keyPackageRef": BASE64.encode(&kp.hash_ref),
+                })
+            })
+            .collect();
+
+        let req = serde_json::json!({
+            "keyPackages": key_packages_json,
+        });
+
+        let resp: serde_json::Value = self
+            .xrpc_procedure("blue.catbird.chat.replenishKeyPackages", &req)
+            .await?;
+
+        let accepted = resp.get("accepted").and_then(|v| v.as_u64()).unwrap_or(0);
+        Ok(accepted as u32)
+    }
+
     pub(crate) fn build_request(&self, nsid: &str, bearer: &str) -> Result<(String, HeaderMap)> {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1632,13 +1378,84 @@ impl ChatService {
                             hv,
                         );
                     }
+                    let chat_base = std::env::var("ATPROTO_CHAT_HOST")
+                        .unwrap_or_else(|_| self.config.server.mls_url.clone());
+                    format!("{}/xrpc/{nsid}", chat_base.trim_end_matches('/'))
+                } else {
+                    format!("{}/xrpc/{nsid}", pds_url.trim_end_matches('/'))
                 }
-                format!("{}/xrpc/{nsid}", pds_url.trim_end_matches('/'))
             }
         };
 
         Ok((url, headers))
     }
+}
+
+pub(crate) fn build_create_convo_request(
+    group_id_hex: &str,
+    initial_members: &[String],
+    welcome_bytes: Option<Vec<u8>>,
+    key_package_hashes: Vec<(String, String)>,
+) -> serde_json::Value {
+    let mut req = serde_json::json!({
+        "groupId": group_id_hex,
+        "cipherSuite": MLS_CIPHER_SUITE,
+        "currentEpoch": if welcome_bytes.is_some() { 1 } else { 0 },
+    });
+    if let Some(welcome) = welcome_bytes {
+        req["welcomeMessage"] = serde_json::json!(BASE64.encode(&welcome));
+    }
+    if !initial_members.is_empty() {
+        req["initialMembers"] = serde_json::json!(initial_members);
+    }
+    if !key_package_hashes.is_empty() {
+        let hashes: Vec<serde_json::Value> = key_package_hashes
+            .into_iter()
+            .map(|(did, hash)| {
+                serde_json::json!({
+                    "did": did,
+                    "hash": hash,
+                })
+            })
+            .collect();
+        req["keyPackageHashes"] = serde_json::json!(hashes);
+    }
+    req
+}
+
+pub(crate) fn build_commit_group_change(
+    convo_id: &str,
+    action: &str,
+    commit: Option<Vec<u8>>,
+    welcome: Option<Vec<u8>>,
+    group_info: Option<Vec<u8>>,
+    confirmation_tag: Option<Vec<u8>>,
+    member_dids: Option<Vec<String>>,
+    idempotency_key: Option<String>,
+) -> serde_json::Value {
+    let mut val = serde_json::json!({
+        "convoId": convo_id,
+        "action": action,
+    });
+    if let Some(c) = commit {
+        val["commit"] = serde_json::json!(BASE64.encode(c));
+    }
+    if let Some(w) = welcome {
+        val["welcome"] = serde_json::json!(BASE64.encode(w));
+    }
+    if let Some(gi) = group_info {
+        val["groupInfo"] = serde_json::json!(BASE64.encode(gi));
+    }
+    if let Some(ct) = confirmation_tag {
+        val["confirmationTag"] = serde_json::json!(BASE64.encode(ct));
+    }
+    if let Some(dids) = member_dids {
+        val["memberDids"] = serde_json::json!(dids);
+    }
+    if let Some(ik) = idempotency_key {
+        val["idempotencyKey"] = serde_json::json!(ik);
+    }
+    val
 }
 
 #[cfg(test)]
@@ -1701,7 +1518,7 @@ mod tests {
         ));
         assert!(!is_expired_token_response(
             StatusCode::BAD_REQUEST,
-            br#"{"error":"InvalidRequest","message":"Bad payload"}"#
+            br#"{"error":"InvalidRequest","message":"ExpiredToken flow not allowed here"}"#
         ));
         assert!(!is_expired_token_response(
             StatusCode::UNAUTHORIZED,
