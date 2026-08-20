@@ -576,33 +576,17 @@ impl ChatService {
         reset_generation: Option<i64>,
         kind: Option<&str>,
     ) -> Result<Option<Vec<u8>>> {
+        let _ = (convo_id, group_id, metadata_version, reset_generation, kind);
+        let blob_id = match blob_locator {
+            Some(id) if !id.trim().is_empty() => id,
+            _ => return Ok(None),
+        };
         const NSID: &str = "blue.catbird.chat.getBlob";
 
-        let bearer = self.current_bearer().await?;
-        let (url, headers) = self.metadata_blob_request(NSID, &bearer)?;
+        let bearer = self.get_service_token(NSID).await?;
+        let (url, headers) = self.build_request(NSID, &bearer)?;
 
-        let actor_device_id = self.actor_device_id().await?;
-        let mut params: Vec<(&str, String)> = vec![
-            ("actorDeviceId", actor_device_id),
-        ];
-        if let Some(v) = blob_locator {
-            params.push(("blobLocator", v.to_string()));
-        }
-        if let Some(v) = convo_id {
-            params.push(("convoId", v.to_string()));
-        }
-        if let Some(v) = group_id {
-            params.push(("groupId", v.to_string()));
-        }
-        if let Some(v) = metadata_version {
-            params.push(("metadataVersion", v.to_string()));
-        }
-        if let Some(v) = reset_generation {
-            params.push(("resetGeneration", v.to_string()));
-        }
-        if let Some(v) = kind {
-            params.push(("kind", v.to_string()));
-        }
+        let params = [("blobId", blob_id)];
 
         let resp = self
             .http
@@ -680,33 +664,17 @@ impl ChatService {
         reset_generation: Option<i64>,
         body: Vec<u8>,
     ) -> Result<()> {
+        let _ = (convo_id, group_id, kind, metadata_version, reset_generation);
         const NSID: &str = "blue.catbird.chat.uploadBlob";
 
-        let bearer = self.current_bearer().await?;
-        let (url, mut headers) = self.metadata_blob_request(NSID, &bearer)?;
+        let bearer = self.get_service_token(NSID).await?;
+        let (url, mut headers) = self.build_request(NSID, &bearer)?;
         headers.insert(
             reqwest::header::CONTENT_TYPE,
             HeaderValue::from_static("application/octet-stream"),
         );
 
-        let actor_device_id = self.actor_device_id().await?;
-        let mut params: Vec<(&str, String)> = vec![
-            ("actorDeviceId", actor_device_id),
-        ];
-        params.push(("blobLocator", blob_locator.to_string()));
-        params.push(("groupId", group_id.to_string()));
-        if let Some(v) = convo_id {
-            params.push(("convoId", v.to_string()));
-        }
-        if let Some(v) = kind {
-            params.push(("kind", v.to_string()));
-        }
-        if let Some(v) = metadata_version {
-            params.push(("metadataVersion", v.to_string()));
-        }
-        if let Some(v) = reset_generation {
-            params.push(("resetGeneration", v.to_string()));
-        }
+        let params = [("uploadTicket", blob_locator)];
 
         let resp = self
             .http

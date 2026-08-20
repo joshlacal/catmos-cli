@@ -156,17 +156,18 @@ impl ChatService {
     fn build_ws_url(
         config: &crate::storage::config::Config,
         ticket: &str,
+        cursor: &str,
         endpoint: Option<&str>,
     ) -> String {
         let endpoint = endpoint.map(String::from).unwrap_or_else(|| {
             let base = config.server.mls_url.clone();
-            format!("{base}/xrpc/blue.catbird.chat.subscribeEvents?ticket={ticket}&cursor=0")
+            format!("{base}/xrpc/blue.catbird.chat.subscribeEvents?ticket={ticket}&cursor={cursor}")
         });
 
         let mut url_str = endpoint;
         if !url_str.contains("cursor=") {
             let sep = if url_str.contains('?') { "&" } else { "?" };
-            url_str = format!("{url_str}{sep}cursor=0");
+            url_str = format!("{url_str}{sep}cursor={cursor}");
         }
         if !url_str.contains("ticket=") {
             let sep = if url_str.contains('?') { "&" } else { "?" };
@@ -209,6 +210,7 @@ impl ChatService {
         let ws_url = Self::build_ws_url(
             &self.config,
             &ticket_resp.ticket,
+            &event_cursor,
             ticket_resp.endpoint.as_deref(),
         );
 
@@ -338,6 +340,7 @@ impl ChatService {
                         let ws_url = ChatService::build_ws_url(
                             &config,
                             &ticket_resp.ticket,
+                            &event_cursor_task,
                             ticket_resp.endpoint.as_deref(),
                         );
                         debug!("Reconnecting WebSocket to {ws_url}");
@@ -423,14 +426,16 @@ async fn get_subscription_ticket_standalone(
         Ok(headers)
     };
 
+    let ticket_body = serde_json::json!({
+        "actorDeviceId": actor_device_id,
+        "eventCursor": event_cursor,
+        "inventorySessionId": inventory_session_id,
+    });
+
     let resp = http
         .post(&base_url)
         .headers(build_headers(&initial_bearer)?)
-        .json(&serde_json::json!({
-            "actorDeviceId": actor_device_id,
-            "eventCursor": event_cursor,
-            "inventorySessionId": inventory_session_id,
-        }))
+        .json(&ticket_body)
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
@@ -451,10 +456,7 @@ async fn get_subscription_ticket_standalone(
         let retry_resp = http
             .post(&base_url)
             .headers(build_headers(&new_bearer)?)
-            .json(&serde_json::json!({
-                "eventCursor": "0",
-                "inventorySessionId": "catmos-cli-session",
-            }))
+            .json(&ticket_body)
             .send()
             .await
             .map_err(|e| format!("Network error (retry): {e}"))?;

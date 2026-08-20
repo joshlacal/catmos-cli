@@ -74,9 +74,37 @@ pub(crate) struct GetKeyPackagesResp {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct KeyPackageRefResp {
     pub did: String,
+    #[serde(with = "serde_bytes_wrapper")]
     pub key_package: Vec<u8>,
     #[serde(default)]
     pub key_package_hash: Option<String>,
+}
+
+mod serde_bytes_wrapper {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+    use serde::{de::Error as DeError, Deserialize, Deserializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BytesEnvelope {
+        DollarBytes {
+            #[serde(rename = "$bytes")]
+            bytes: String,
+        },
+        Base64String(String),
+        ByteArray(Vec<u8>),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        match BytesEnvelope::deserialize(d)? {
+            BytesEnvelope::DollarBytes { bytes } | BytesEnvelope::Base64String(bytes) => {
+                BASE64
+                    .decode(&bytes)
+                    .map_err(|e| D::Error::custom(format!("invalid $bytes base64: {e}")))
+            }
+            BytesEnvelope::ByteArray(vec) => Ok(vec),
+        }
+    }
 }
 
 #[derive(Deserialize)]

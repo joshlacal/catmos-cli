@@ -62,12 +62,6 @@ impl MlsMessagePayload {
 }
 
 // ── Response deserialization helpers ────────────────────────────────────
-//
-// The Jacquard-generated output types use lifetime parameters and don't
-// implement `DeserializeOwned`, so they can't be used directly with
-// reqwest's `.json()` or `serde_json::from_str`. We deserialize responses
-// as `serde_json::Value` and extract fields manually using the correct
-// field names from the generated types.
 
 /// Extract a `SendMessageOutput`-shaped response from JSON.
 #[derive(Deserialize)]
@@ -78,27 +72,28 @@ pub(crate) struct SendMessageResp {
     pub epoch: i64,
 }
 
-/// Extract a `GetConvosOutput`-shaped response from JSON.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GetConvosResp {
+    #[serde(default)]
     pub conversations: Vec<ConvoViewResp>,
+    #[serde(default)]
+    pub items: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub inventory_session_id: Option<String>,
+    #[serde(default)]
+    pub snapshot_event_cursor: Option<String>,
+    #[serde(default)]
+    pub has_more: Option<bool>,
+    #[serde(default)]
+    pub next_page_cursor: Option<String>,
 }
 
 /// Thin deserialization wrapper matching the generated `ConvoView` field names.
-///
-/// Note: the server still emits a `metadata: { name, description }` field
-/// during the rollout window (it is removed from the lexicon in Phase D of
-/// the metadata cutover plan). We deserialize it tolerantly into
-/// `serde_json::Value` so a stale field doesn't break parsing, but it is
-/// **never read** — group titles are decrypted exclusively via
-/// `bootstrap_group_metadata` (`chat/metadata.rs`).
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConvoViewResp {
     pub group_id: String,
-    /// Stable conversation identifier (survives group resets).
-    /// Falls back to group_id when not provided by the server.
     #[serde(default)]
     pub conversation_id: Option<String>,
     pub creator: String,
@@ -108,15 +103,13 @@ pub(crate) struct ConvoViewResp {
     pub created_at: String,
     #[serde(default)]
     pub last_message_at: Option<String>,
-    /// Tolerated for forward/backward compatibility during the cutover.
-    /// Intentionally never read — see `convo_resp_to_conversation`.
     #[serde(default)]
     #[allow(dead_code)]
     pub metadata: Option<serde_json::Value>,
 }
 
 /// Thin deserialization wrapper matching the generated `MemberView` field names.
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MemberViewResp {
     pub did: String,
@@ -131,34 +124,80 @@ pub(crate) struct MemberViewResp {
     pub joined_at: String,
 }
 
-/// AT Protocol `$bytes` encoding: `{"$bytes":"base64..."}`
-#[derive(Deserialize)]
-pub(crate) struct AtBytes {
-    #[serde(rename = "$bytes")]
-    pub bytes: String,
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GetEntriesResp {
+    #[serde(default)]
+    pub entries: Vec<ConversationEntryResp>,
+    #[serde(default)]
+    pub next_after_seq: i64,
+    #[serde(default)]
+    pub has_more: bool,
 }
 
-/// Thin deserialization wrapper matching the generated `MessageView` field names.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(tag = "$type")]
+pub(crate) enum ConversationEntryResp {
+    #[serde(rename = "blue.catbird.chat.defs#commitEntry")]
+    Commit(CommitEntryResp),
+    #[serde(rename = "blue.catbird.chat.defs#applicationEntry")]
+    Application(ApplicationEntryResp),
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct MessageViewResp {
-    pub id: String,
-    pub convo_id: String,
-    pub ciphertext: AtBytes,
-    pub epoch: i64,
+pub(crate) struct CommitEntryResp {
+    #[serde(default)]
+    pub conversation_id: String,
+    #[serde(default)]
+    pub entry_id: String,
+    #[serde(default)]
     pub seq: i64,
-    pub created_at: String,
-    #[serde(default)]
-    pub message_type: Option<String>,
+    pub signed_request: serde_json::Value,
 }
 
-/// Extract a `GetMessagesOutput`-shaped response from JSON.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct GetMessagesResp {
-    pub messages: Vec<MessageViewResp>,
+pub(crate) struct ApplicationEntryResp {
     #[serde(default)]
-    pub last_seq: Option<i64>,
+    pub conversation_id: String,
+    #[serde(default)]
+    pub entry_id: String,
+    #[serde(default)]
+    pub seq: i64,
+    #[serde(default)]
+    pub received_at: Option<String>,
+    pub signed_request: serde_json::Value,
+}
+
+fn extract_commit_bytes(entry: &CommitEntryResp) -> Option<Vec<u8>> {
+    let body = entry.signed_request.get("body")?;
+    let commit_val = body.get("commit")?;
+    if let Some(s) = commit_val.as_str() {
+        BASE64.decode(s).ok()
+    } else if let Some(bytes_val) = commit_val.get("bytes").and_then(|v| v.as_str()) {
+        BASE64.decode(bytes_val).ok()
+    } else if let Some(b_obj) = commit_val.get("$bytes").and_then(|v| v.as_str()) {
+        BASE64.decode(b_obj).ok()
+    } else {
+        None
+    }
+}
+
+fn extract_application_ciphertext(entry: &ApplicationEntryResp) -> Option<Vec<u8>> {
+    let body = entry.signed_request.get("body")?;
+    let app_msg = body.get("applicationMessage")?;
+    if let Some(s) = app_msg.as_str() {
+        BASE64.decode(s).ok()
+    } else if let Some(ct_val) = app_msg.get("ciphertext").and_then(|v| v.as_str()) {
+        BASE64.decode(ct_val).ok()
+    } else if let Some(b_obj) = app_msg.get("$bytes").and_then(|v| v.as_str()) {
+        BASE64.decode(b_obj).ok()
+    } else {
+        None
+    }
 }
 
 /// Extract a `CreateConvoOutput`-shaped response from JSON.
@@ -171,14 +210,6 @@ pub(crate) struct CreateConvoResp {
 // ── Conversions from response types to domain types ─────────────────────
 
 /// Convert a `ConvoViewResp` into our domain `Conversation`.
-///
-/// **Title / description / avatar are intentionally `None`.** After the MLS
-/// metadata cutover the server is cryptographically blind to group metadata,
-/// so the only authoritative source is the locally-decrypted blob persisted
-/// via `bootstrap_group_metadata` (see `chat/metadata.rs`). The DB layer's
-/// `store_conversation` upsert uses `COALESCE(excluded.col, conversations.col)`
-/// to preserve any decrypted metadata already written, so callers don't need
-/// to merge by hand.
 pub(crate) fn convo_resp_to_conversation(view: &ConvoViewResp) -> Conversation {
     let members = view.members.iter().map(member_resp_to_member).collect();
 
@@ -188,10 +219,6 @@ pub(crate) fn convo_resp_to_conversation(view: &ConvoViewResp) -> Conversation {
             .clone()
             .unwrap_or_else(|| view.group_id.clone()),
         group_id: view.group_id.clone(),
-        // Encrypted-only path — never read view.metadata. The server returns
-        // `metadata: None` post-cutover; reading it would be an empty fallback
-        // anyway, but accepting any plaintext from the wire would normalise
-        // the leak we just plugged.
         name: None,
         description: None,
         creator: view.creator.clone(),
@@ -231,8 +258,6 @@ pub(crate) fn member_resp_to_member(view: &MemberViewResp) -> Member {
     }
 }
 
-// ── Padding ─────────────────────────────────────────────────────────────
-
 /// Strip trailing zero-byte padding.
 fn unpad(data: &[u8]) -> &[u8] {
     let end = data.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
@@ -243,14 +268,7 @@ fn unpad(data: &[u8]) -> &[u8] {
 
 impl ChatService {
     /// Encrypt and send a text message to a conversation.
-    ///
-    /// On a 409 epoch conflict, syncs commits to advance the local epoch,
-    /// re-encrypts at the new epoch, and retries once.
     pub async fn send_message(&self, convo_id: &str, text: &str) -> Result<Message> {
-        // Layer 3 quarantine gate (catbird-mls f363fd1): if the conversation is
-        // quarantined we refuse to send. No API call, no encrypt, no preSend
-        // sync. The user must `:reset` (TUI) or call
-        // `user_confirmed_manual_reset` to exit quarantine first.
         if self.is_quarantined(convo_id).await {
             return Err(CatmosError::Other(format!(
                 "Conversation paused. Type :reset to continue. (convo={})",
@@ -258,17 +276,14 @@ impl ChatService {
             )));
         }
 
-        // Build the plaintext payload (matches iOS MLSMessagePayload format)
         let payload = MlsMessagePayload::text(text);
         let plaintext = serde_json::to_vec(&payload)?;
 
-        // Sync commits before sending to ensure local epoch is current
         if let Err(e) = self.sync_conversation(convo_id).await {
             let convo_label = &convo_id[..12.min(convo_id.len())];
             debug!("send_message: pre-send sync failed for {convo_label}: {e}");
         }
 
-        // Encrypt via MLS -- ciphertext padding is handled by the MLS layer
         let group_id_bytes = hex::decode(convo_id)
             .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
 
@@ -276,23 +291,18 @@ impl ChatService {
             .mls
             .with_context(|ctx| ctx.encrypt_message(group_id_bytes.clone(), plaintext.clone()))?;
 
-        // Track own commit for dedup (spec §5.4)
         {
             let hash: [u8; 32] = Sha256::digest(&encrypt_result.ciphertext).into();
             let mut own = self.own_commits.lock().await;
             own.insert(hash, Instant::now());
-            // Expire entries older than 5 minutes
             own.retain(|_, ts| ts.elapsed() < std::time::Duration::from_secs(300));
         }
 
         let epoch = self.get_epoch(convo_id).unwrap_or(0);
         let msg_id = ulid::Ulid::new().to_string();
         let padded_size = encrypt_result.ciphertext.len() as i64;
-
-        // Get local confirmation tag for divergence detection
         let confirmation_tag = self.get_confirmation_tag_b64(&group_id_bytes);
 
-        // Build the SendMessage input
         let req = serde_json::json!({
             "convoId": convo_id,
             "ciphertext": BASE64.encode(&encrypt_result.ciphertext),
@@ -321,9 +331,8 @@ impl ChatService {
             }
             Err(e) if Self::is_tree_diverged(&e) => {
                 let convo_label = &convo_id[..12.min(convo_id.len())];
-                warn!("send_message: TreeStateDiverged for {convo_label}, syncing commits (spec §5.3)");
+                warn!("send_message: TreeStateDiverged for {convo_label}, syncing commits");
 
-                // Spec §5.3: Lightweight sync — catch up WITHOUT External Commit.
                 for _round in 0..3 {
                     if let Err(sync_err) = self.sync_conversation(convo_id).await {
                         warn!("send recovery sync failed for {convo_label}: {sync_err}");
@@ -331,7 +340,6 @@ impl ChatService {
                     }
                 }
 
-                // Re-encrypt at new epoch and retry once
                 let new_encrypt = self.mls.with_context(|ctx| {
                     ctx.encrypt_message(group_id_bytes.clone(), plaintext.clone())
                 })?;
@@ -367,11 +375,6 @@ impl ChatService {
                         Ok(msg)
                     }
                     Err(_) => {
-                        // Spec §5.3: send-path recovery is lightweight sync
-                        // only; on second failure flag NEEDS_REJOIN so the
-                        // post-sync deferred-recovery loop (§8.5) handles
-                        // the External Commit. NEVER EC inline from the send
-                        // path.
                         warn!("send_message: retry also failed for {convo_label}, flagging NEEDS_REJOIN");
                         self.flag_needs_rejoin(convo_id).await;
                         Err(CatmosError::Other(
@@ -384,12 +387,10 @@ impl ChatService {
                 let convo_label = &convo_id[..12.min(convo_id.len())];
                 warn!("send_message: 409 epoch conflict for {convo_label}, syncing and retrying");
 
-                // Sync commits to advance local epoch
                 if let Err(sync_err) = self.sync_conversation(convo_id).await {
                     warn!("send_message: sync failed during 409 recovery for {convo_label}: {sync_err}");
                 }
 
-                // Re-encrypt at the new epoch
                 let new_epoch = self.get_epoch(convo_id).unwrap_or(0);
                 let retry_encrypt = self
                     .mls
@@ -430,7 +431,6 @@ impl ChatService {
         }
     }
 
-    /// Get the base64-encoded confirmation tag for a group, or None if unavailable.
     pub(crate) fn get_confirmation_tag_b64(&self, group_id_bytes: &[u8]) -> Option<String> {
         self.mls
             .with_context(|ctx| ctx.get_confirmation_tag(group_id_bytes.to_vec()))
@@ -438,25 +438,21 @@ impl ChatService {
             .ok()
     }
 
-    /// Check whether an error indicates a 409 epoch conflict.
     fn is_epoch_conflict(err: &CatmosError) -> bool {
         let msg = err.to_string();
         msg.contains("returned 409") || msg.contains("EpochMismatch")
     }
 
-    /// Check whether an error indicates a tree state divergence.
     fn is_tree_diverged(err: &CatmosError) -> bool {
         err.to_string().contains("TreeStateDiverged")
     }
 
-    /// Check whether an error indicates the server rate-limited the request (429).
+    #[allow(dead_code)]
     fn is_rate_limited(err: &CatmosError) -> bool {
         let msg = err.to_string();
         msg.contains("returned 429") || msg.contains("RateLimited")
     }
 
-    /// Decrypt a raw ciphertext for a conversation.
-    /// Returns (plaintext_text, sender_did).
     pub fn decrypt_message(
         &self,
         convo_id: &str,
@@ -472,7 +468,6 @@ impl ChatService {
         let unpadded = unpad(&result.plaintext);
         let plaintext = String::from_utf8_lossy(unpadded).to_string();
 
-        // Extract sender DID from credential identity
         let sender_did = if !result.sender_credential.identity.is_empty() {
             Some(String::from_utf8_lossy(&result.sender_credential.identity).to_string())
         } else {
@@ -482,11 +477,8 @@ impl ChatService {
         Ok((plaintext, sender_did))
     }
 
-    /// Send a typing indicator (ephemeral message).
     pub async fn send_typing(&self, convo_id: &str, is_typing: bool) -> Result<()> {
         let action = if is_typing { "typing" } else { "typingStop" };
-
-        // Use a 512-byte no-op ciphertext for ephemeral messages
         let noop = vec![0u8; 512];
         let msg_id = ulid::Ulid::new().to_string();
 
@@ -508,24 +500,48 @@ impl ChatService {
     }
 
     /// Fetch all conversations from the server, decrypt metadata, and cache locally.
-    ///
-    /// Resolves all unique member DIDs to handles and populates
-    /// `self.handle_cache` so the TUI can display friendly names.
     pub async fn fetch_conversations(&self) -> Result<Vec<Conversation>> {
-        let resp: serde_json::Value = self
-            .xrpc_query(
-                "blue.catbird.chat.getConversations",
-                &[("limit", "50")],
-            )
-            .await?;
+        let actor_device_id = self.actor_device_id().await?;
+        let mut convos: Vec<Conversation> = Vec::new();
+        let mut page_cursor: Option<String> = None;
 
-        let mut convos: Vec<Conversation> = if let Some(items) = resp.get("items").and_then(|v| v.as_array()) {
-            items
-                .iter()
-                .filter_map(|item| {
-                    let state_obj = item.get("state")?;
-                    let coords = state_obj.get("coordinates")?;
-                    let convo_id = coords.get("conversationId").and_then(|v| v.as_str())?.to_string();
+        loop {
+            let mut params = vec![
+                ("actorDeviceId", actor_device_id.as_str()),
+                ("limit", "50"),
+            ];
+            let cursor_holder;
+            if let Some(ref c) = page_cursor {
+                cursor_holder = c.clone();
+                params.push(("pageCursor", &cursor_holder));
+            }
+
+            let resp: serde_json::Value = self
+                .xrpc_query("blue.catbird.chat.getConversations", &params)
+                .await?;
+
+            if let (Some(inv_session), Some(event_cursor)) = (
+                resp.get("inventorySessionId").and_then(|v| v.as_str()),
+                resp.get("snapshotEventCursor").and_then(|v| v.as_str()),
+            ) {
+                let mut sess = self.inventory_session.write().await;
+                *sess = Some((inv_session.to_string(), event_cursor.to_string()));
+            }
+
+            if let Some(items) = resp.get("items").and_then(|v| v.as_array()) {
+                for item in items {
+                    let state_obj = match item.get("state") {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let coords = match state_obj.get("coordinates") {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let convo_id = match coords.get("conversationId").and_then(|v| v.as_str()) {
+                        Some(id) => id.to_string(),
+                        None => continue,
+                    };
                     let epoch = coords.get("epoch").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
                     let group_id = if let Some(gid_val) = coords.get("groupId") {
                         if let Some(s) = gid_val.as_str() {
@@ -577,7 +593,7 @@ impl ChatService {
                             });
                         }
                     }
-                    Some(Conversation {
+                    convos.push(Conversation {
                         conversation_id: convo_id,
                         group_id,
                         name: None,
@@ -595,36 +611,27 @@ impl ChatService {
                         avatar_blob_locator: None,
                         avatar_bytes: None,
                         avatar_content_type: None,
-                    })
-                })
-                .collect()
-        } else if let Some(convo_arr) = resp.get("conversations").and_then(|v| v.as_array()) {
-            let legacy_resp: GetConvosResp = serde_json::from_value(resp.clone())
-                .map_err(|e| CatmosError::Xrpc(format!("parse conversations: {e}")))?;
-            legacy_resp
-                .conversations
-                .iter()
-                .map(convo_resp_to_conversation)
-                .collect()
-        } else {
-            Vec::new()
-        };
+                    });
+                }
+            } else if let Some(convo_arr) = resp.get("conversations").and_then(|v| v.as_array()) {
+                if let Ok(legacy_resp) = serde_json::from_value::<GetConvosResp>(resp.clone()) {
+                    for c_resp in &legacy_resp.conversations {
+                        convos.push(convo_resp_to_conversation(c_resp));
+                    }
+                }
+            }
 
-        if let (Some(inv_session), Some(event_cursor)) = (
-            resp.get("inventorySessionId").and_then(|v| v.as_str()),
-            resp.get("snapshotEventCursor").and_then(|v| v.as_str()),
-        ) {
-            let mut sess = self.inventory_session.write().await;
-            *sess = Some((inv_session.to_string(), event_cursor.to_string()));
+            let has_more = resp.get("hasMore").and_then(|v| v.as_bool()).unwrap_or(false);
+            let next_cursor = resp.get("nextPageCursor").and_then(|v| v.as_str()).map(String::from);
+            if has_more && next_cursor.is_some() {
+                page_cursor = next_cursor;
+            } else {
+                break;
+            }
         }
-        // Hydrate locally-decrypted metadata into the freshly-built
-        // Conversation values BEFORE the COALESCE-aware DB upsert below.
-        // Without this step the in-memory cache published to the TUI
-        // would briefly show empty titles between the API response and
-        // the next bootstrap pass, causing visible flicker.
+
         match self.db.list_conversations().await {
             Ok(rows) => {
-                use std::collections::HashMap;
                 let local_by_id: HashMap<String, Conversation> = rows
                     .into_iter()
                     .map(|c| (c.conversation_id.clone(), c))
@@ -644,15 +651,7 @@ impl ChatService {
             Err(e) => debug!("fetch_conversations: list_conversations(local hydrate) failed: {e}"),
         }
 
-        // Phase F: legacy 0xff00 plaintext fallback removed. Conversation
-        // names / descriptions now come exclusively from the encrypted
-        // bootstrap path (chat/metadata.rs::bootstrap_group_metadata)
-        // which lifts decrypted state into the conversations row.
-
-        // ── Resolve all unique user DIDs to handles ──────────────────────
         let my_did = self.did().to_string();
-
-        // Collect all unique user DIDs across all conversations
         let all_user_dids: HashSet<String> = convos
             .iter()
             .flat_map(|c| c.members.iter().map(|m| m.user_did.clone()))
@@ -664,7 +663,6 @@ impl ChatService {
             all_user_dids.len()
         );
 
-        // Resolve each DID to a handle (reuse existing cache entries)
         let mut new_handles: HashMap<String, String> = HashMap::new();
         {
             let existing = self.handle_cache.read().await;
@@ -675,7 +673,6 @@ impl ChatService {
             }
         }
 
-        // Resolve any DIDs not already cached
         let uncached: Vec<&String> = all_user_dids
             .iter()
             .filter(|d| !new_handles.contains_key(d.as_str()))
@@ -696,18 +693,15 @@ impl ChatService {
             }
         }
 
-        // Update the service-wide handle cache
         {
             let mut cache = self.handle_cache.write().await;
             cache.extend(new_handles.clone());
         }
 
-        // For unnamed 1:1 conversations, use the resolved handle as the name
         for convo in &mut convos {
             if convo.name.is_some() {
                 continue;
             }
-            // Find unique user DIDs (excluding our own)
             let other_dids: Vec<&str> = convo
                 .members
                 .iter()
@@ -729,23 +723,14 @@ impl ChatService {
             }
         }
 
-        // Persist to local DB
         for convo in &convos {
             if let Err(e) = self.db.store_conversation(convo).await {
                 warn!("Failed to store conversation {}: {e}", convo.group_id);
             }
         }
 
-        // Update cached conversations
         *self.conversations.write().await = convos.clone();
 
-        // Encrypted-bootstrap pass: for every conversation we have local MLS
-        // state for, fetch+decrypt the latest metadata blob and persist
-        // title/description/avatar. Skips quickly when the local
-        // metadata_version is already at-or-ahead of the server's
-        // MetadataReference. Errors are logged, not fatal — the legacy
-        // fallback above and the empty `name` carry the UX through to the
-        // next refresh.
         for convo in &convos {
             let group_id_hex = convo.group_id.clone();
             let convo_id = convo.conversation_id.clone();
@@ -772,7 +757,6 @@ impl ChatService {
             }
         }
 
-        // Sync alias display names
         let mut aliases = self.aliases.write().await;
         for convo in &convos {
             if let Some(ref alias) = convo.alias {
@@ -786,15 +770,34 @@ impl ChatService {
     }
 
     /// Sync MLS state for a conversation by processing all commit messages
-    /// in epoch/seq order. Pages through results to handle large backlogs.
-    ///
-    /// Call this before `fetch_messages` to ensure the local epoch is current.
+    /// in seq order.
     pub async fn sync_conversation(&self, convo_id: &str) -> Result<()> {
-        let convo_label = &convo_id[..12.min(convo_id.len())];
-        let gid_bytes = hex::decode(convo_id)
-            .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
+        let (convo_uuid, gid_bytes) = if let Ok(parsed) = uuid::Uuid::parse_str(convo_id) {
+            let uuid_str = parsed.to_string();
+            let gid = self
+                .conversations
+                .read()
+                .await
+                .iter()
+                .find(|c| c.conversation_id == uuid_str)
+                .map(|c| hex::decode(&c.group_id).unwrap_or_default())
+                .unwrap_or_else(|| hex::decode(convo_id).unwrap_or_default());
+            (uuid_str, gid)
+        } else {
+            let gid = hex::decode(convo_id).unwrap_or_default();
+            let uuid_str = self
+                .conversations
+                .read()
+                .await
+                .iter()
+                .find(|c| c.group_id == convo_id)
+                .map(|c| c.conversation_id.clone())
+                .unwrap_or_else(|| convo_id.to_string());
+            (uuid_str, gid)
+        };
 
-        // Skip sync if we don't have local MLS state for this group — nothing to sync from
+        let convo_label = &convo_id[..12.min(convo_id.len())];
+
         let has_local_state = self
             .mls
             .with_context(|ctx| ctx.get_epoch(gid_bytes.clone()))
@@ -804,80 +807,59 @@ impl ChatService {
             return Ok(());
         }
 
-        let mut current_epoch = {
-            self.mls
-                .with_context(|ctx| ctx.get_epoch(gid_bytes.clone()))
-                .unwrap_or(0)
-        };
-
+        let mut after_seq = 0i64;
         let mut total_processed = 0u32;
 
         loop {
-            // Server stores each commit at the epoch it LANDS ON (post-apply),
-            // and its get_messages filter is `epoch >= fromEpoch`. Requesting
-            // `fromEpoch = current_epoch` would return the commit we already
-            // applied to reach current_epoch, which then fails with a
-            // forward-secrecy error (sender_epoch = current-1). Skip past it.
-            let from_epoch = current_epoch.saturating_add(1).to_string();
-            let actor_device_id = self.actor_device_id().await?;
-            let resp: GetMessagesResp = self
+            let after_seq_str = after_seq.to_string();
+            let resp: serde_json::Value = self
                 .xrpc_query(
                     "blue.catbird.chat.getEntries",
                     &[
-                        ("actorDeviceId", &actor_device_id),
-                        ("conversationId", convo_id),
-                        ("convoId", convo_id),
-                        ("afterSeq", "0"),
-                        ("type", "commit"),
-                        ("fromEpoch", &from_epoch),
-                        ("limit", "50"),
+                        ("conversationId", &convo_uuid),
+                        ("afterSeq", &after_seq_str),
+                        ("limit", "100"),
                     ],
                 )
                 .await?;
 
-            if resp.messages.is_empty() {
-                if total_processed == 0 {
-                    debug!(
-                        "sync {convo_label}: no commits to process (local epoch {current_epoch})"
-                    );
+            let entries_resp: GetEntriesResp = match serde_json::from_value(resp) {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("sync {convo_label}: getEntries parse empty or error: {e}");
+                    break;
                 }
+            };
+
+            if entries_resp.entries.is_empty() {
                 break;
             }
 
             debug!(
-                "sync {convo_label}: processing {} commits from epoch {current_epoch}",
-                resp.messages.len()
+                "sync {convo_label}: processing {} entries from seq {after_seq}",
+                entries_resp.entries.len()
             );
 
-            let page_count = resp.messages.len();
             let mut consecutive_failures = 0u32;
-            let epoch_before_page = current_epoch;
+            for entry in &entries_resp.entries {
+                let commit_entry = match entry {
+                    ConversationEntryResp::Commit(c) => c,
+                    _ => continue,
+                };
 
-            for entry in &resp.messages {
-                let ciphertext = base64::engine::general_purpose::STANDARD
-                    .decode(&entry.ciphertext.bytes)
-                    .map_err(|e| CatmosError::Other(format!("Invalid base64 ciphertext: {e}")))?;
+                let ciphertext = match extract_commit_bytes(commit_entry) {
+                    Some(c) => c,
+                    None => continue,
+                };
 
-                // Own-commit dedup (spec §5.4): skip commits we sent ourselves
                 let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
                 if self.own_commits.lock().await.remove(&hash).is_some() {
-                    debug!(
-                        "sync: skipping own commit {} epoch={}",
-                        entry.id, entry.epoch
-                    );
+                    debug!("sync: skipping own commit {}", commit_entry.entry_id);
                     total_processed += 1;
                     consecutive_failures = 0;
                     continue;
                 }
 
-                // Task #47: three-phase receive — process_message stages the commit
-                // (does NOT advance the epoch). We must then explicitly call
-                // merge_incoming_commit to confirm, or discard_incoming_commit to
-                // abandon. Auto-merge behavior moved out of catbird-mls in task #33.
-                //
-                // Policy here: always merge after successful stage. catmos-cli sees
-                // commits only via server fan-out, so anything that deserialised and
-                // staged cleanly is the canonical next epoch.
                 let process_result = self
                     .mls
                     .with_context(|ctx| ctx.process_message(gid_bytes.clone(), ciphertext.clone()));
@@ -887,14 +869,7 @@ impl ChatService {
                         commit_metadata,
                         ..
                     }) => {
-                        // Track whether the staged commit announced a metadata
-                        // update for the new epoch. After the merge succeeds we
-                        // re-bootstrap so the locally-decrypted title/desc/avatar
-                        // catch up to the new MetadataReference (per Phase B of
-                        // the metadata cutover plan). `commit_metadata.is_some()`
-                        // is the only signal — server can't tell us this.
                         let metadata_updated = commit_metadata.is_some();
-                        // Confirm the merge so the local epoch actually advances.
                         match self.mls.with_context(|ctx| {
                             ctx.merge_incoming_commit(gid_bytes.clone(), new_epoch)
                         }) {
@@ -903,108 +878,50 @@ impl ChatService {
                                 consecutive_failures = 0;
                                 self.note_healthy_peer_commit(convo_id).await;
                                 debug!(
-                                    "sync: staged+merged commit {} epoch={} (local now {merged_epoch})",
-                                    entry.id, entry.epoch
+                                    "sync: staged+merged commit {} (local epoch now {merged_epoch})",
+                                    commit_entry.entry_id
                                 );
                                 if metadata_updated {
-                                    // sync_conversation's `convo_id` parameter is actually
-                                    // the hex group id (it's hex-decoded into gid_bytes
-                                    // above). Resolve the stable conversation_id from the
-                                    // in-memory cache so the DB row update lands on the
-                                    // post-reset row when group_id != conversation_id.
-                                    let stable_convo_id = self
-                                        .conversations
-                                        .read()
-                                        .await
-                                        .iter()
-                                        .find(|c| c.group_id == convo_id)
-                                        .map(|c| c.conversation_id.clone())
-                                        .unwrap_or_else(|| convo_id.to_string());
                                     if let Err(e) = self
-                                        .bootstrap_group_metadata(&stable_convo_id, convo_id)
+                                        .bootstrap_group_metadata(&convo_uuid, convo_id)
                                         .await
                                     {
-                                        warn!(
-                                            "sync: bootstrap_group_metadata after metadata-update commit failed for {convo_label}: {e}"
-                                        );
+                                        warn!("sync: bootstrap_group_metadata failed for {convo_label}: {e}");
                                     }
                                 }
                             }
                             Err(e) => {
                                 consecutive_failures += 1;
-                                warn!(
-                                    "sync: merge_incoming_commit failed for {} epoch={}: {e}",
-                                    entry.id, entry.epoch
-                                );
-                                // Best-effort discard so we don't leak a staged handle.
+                                warn!("sync: merge_incoming_commit failed for {} epoch={}: {e}", commit_entry.entry_id, new_epoch);
                                 let _ = self.mls.with_context(|ctx| {
                                     ctx.discard_incoming_commit(gid_bytes.clone(), new_epoch)
                                 });
-                                // §10 EPOCH_DIVERGENCE_THRESHOLD: bump per-convo
-                                // counter; if hit, flag NEEDS_REJOIN and stop
-                                // syncing this conversation (spec §8.2).
                                 if self.note_epoch_divergence(convo_id).await {
                                     return Ok(());
                                 }
                                 if consecutive_failures >= 3 {
-                                    debug!("sync {convo_label}: bailing after {consecutive_failures} consecutive merge failures");
                                     break;
                                 }
                             }
                         }
                     }
-                    Ok(_) => {
-                        // Proposal / ApplicationMessage delivered down the commit
-                        // endpoint is unusual but harmless — nothing to merge.
-                        total_processed += 1;
-                        consecutive_failures = 0;
-                        debug!(
-                            "sync: non-commit processed for {} epoch={}",
-                            entry.id, entry.epoch
-                        );
-                    }
+                    Ok(_) => {}
                     Err(e) => {
-                        let local_epoch = self
-                            .mls
-                            .with_context(|ctx| ctx.get_epoch(gid_bytes.clone()))
-                            .ok();
-                        if Self::classify_peer_bad_error(&e, local_epoch, current_epoch) {
-                            let quarantined =
-                                self.note_peer_bad_commit(convo_id, &entry.id, None).await;
-                            debug!(
-                                "sync: peer-bad commit {} epoch={} classified for quarantine: {e}",
-                                entry.id, entry.epoch
-                            );
-                            if quarantined {
-                                break;
-                            }
-                            continue;
-                        }
                         consecutive_failures += 1;
-                        debug!("sync: skip commit {} epoch={}: {e}", entry.id, entry.epoch);
-                        // Bail early: if 3+ consecutive commits fail, the rest likely will too
+                        warn!("sync: process_message failed for {}: {e}", commit_entry.entry_id);
+                        if self.note_epoch_divergence(convo_id).await {
+                            return Ok(());
+                        }
                         if consecutive_failures >= 3 {
-                            debug!("sync {convo_label}: bailing after {consecutive_failures} consecutive failures");
                             break;
                         }
                     }
                 }
             }
 
-            // Update current epoch for next page
-            current_epoch = self
-                .mls
-                .with_context(|ctx| ctx.get_epoch(gid_bytes.clone()))
-                .unwrap_or(current_epoch);
-
-            // If epoch didn't advance, stop — we're stuck and need a rejoin, not more fetches
-            if current_epoch == epoch_before_page {
-                debug!("sync {convo_label}: epoch stuck at {current_epoch}, stopping");
-                break;
-            }
-
-            // If we got fewer than the limit, we've reached the end
-            if page_count < 50 {
+            if entries_resp.has_more && entries_resp.next_after_seq > after_seq {
+                after_seq = entries_resp.next_after_seq;
+            } else {
                 break;
             }
         }
@@ -1028,10 +945,7 @@ impl ChatService {
     }
 
     /// Fetch messages for a conversation from the server, decrypt each, and store locally.
-    ///
-    /// Automatically syncs commits first to ensure the local MLS epoch is current.
     pub async fn fetch_messages(&self, convo_id: &str, limit: u32) -> Result<Vec<Message>> {
-        // Sync commits first to bring our epoch up to date
         if let Err(e) = self.sync_conversation(convo_id).await {
             warn!(
                 "Failed to sync commits for {}: {e}",
@@ -1039,73 +953,72 @@ impl ChatService {
             );
         }
 
-        // Get local epoch to skip old messages we can't decrypt
-        let local_epoch = {
-            let group_id_bytes = hex::decode(convo_id).unwrap_or_default();
-            self.mls
-                .with_context(|ctx| ctx.get_epoch(group_id_bytes))
-                .ok()
+        let convo_uuid = if let Ok(parsed) = uuid::Uuid::parse_str(convo_id) {
+            parsed.to_string()
+        } else {
+            self.conversations
+                .read()
+                .await
+                .iter()
+                .find(|c| c.group_id == convo_id)
+                .map(|c| c.conversation_id.clone())
+                .unwrap_or_else(|| convo_id.to_string())
         };
 
-        // Only fetch messages newer than what we already have locally
         let since_seq = self.db.get_max_seq(convo_id).await.ok().flatten();
-        let limit_str = limit.to_string();
-        let since_seq_str = since_seq.map(|s| s.to_string());
         let after_seq = since_seq.unwrap_or(0);
         let after_seq_str = after_seq.to_string();
-        let actor_device_id = self.actor_device_id().await?;
-        let mut params: Vec<(&str, &str)> = vec![
-            ("actorDeviceId", &actor_device_id),
-            ("conversationId", convo_id),
-            ("convoId", convo_id),
-            ("afterSeq", &after_seq_str),
-            ("type", "app"),
-            ("limit", &limit_str),
-        ];
-        if let Some(ref seq) = since_seq_str {
-            params.push(("sinceSeq", seq));
-        }
+        let limit_str = limit.to_string();
 
-        let resp: GetMessagesResp = self
-            .xrpc_query("blue.catbird.chat.getEntries", &params)
+        let resp: serde_json::Value = self
+            .xrpc_query(
+                "blue.catbird.chat.getEntries",
+                &[
+                    ("conversationId", &convo_uuid),
+                    ("afterSeq", &after_seq_str),
+                    ("limit", &limit_str),
+                ],
+            )
             .await?;
 
-        let convo_label = &convo_id[..12.min(convo_id.len())];
-        let mut messages = Vec::with_capacity(resp.messages.len());
-        let mut consecutive_failures_at_epoch = 0u32;
-        let mut last_failure_epoch: Option<u64> = None;
-
-        for entry in &resp.messages {
-            // Skip messages from epochs before we joined
-            if let Some(our_epoch) = local_epoch {
-                if (entry.epoch as u64) < our_epoch {
-                    continue;
-                }
+        let entries_resp: GetEntriesResp = match serde_json::from_value(resp) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("fetch_messages: getEntries parse empty or error: {e}");
+                return self.db.get_messages(convo_id, limit, None).await;
             }
+        };
 
-            let ciphertext = base64::engine::general_purpose::STANDARD
-                .decode(&entry.ciphertext.bytes)
-                .map_err(|e| CatmosError::Other(format!("Invalid base64 ciphertext: {e}")))?;
+        let mut messages = Vec::new();
+        for entry in &entries_resp.entries {
+            let app_entry = match entry {
+                ConversationEntryResp::Application(a) => a,
+                _ => continue,
+            };
 
-            match self.decrypt_message(&entry.convo_id, &ciphertext) {
+            let ciphertext = match extract_application_ciphertext(app_entry) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            match self.decrypt_message(convo_id, &ciphertext) {
                 Ok((plaintext, sender_did)) => {
-                    // Reset failure counter on successful decrypt
-                    consecutive_failures_at_epoch = 0;
-                    last_failure_epoch = None;
-                    // §8.2 reset both threshold counters on success.
-                    self.reset_recovery_counters(&entry.convo_id).await;
-
+                    self.reset_recovery_counters(convo_id).await;
                     let content = parse_message_content(&plaintext);
+                    let created_at = app_entry
+                        .received_at
+                        .as_deref()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(Utc::now);
                     let msg = Message {
-                        id: entry.id.clone(),
-                        convo_id: entry.convo_id.clone(),
+                        id: app_entry.entry_id.clone(),
+                        convo_id: convo_id.to_string(),
                         sender_did,
                         content,
-                        epoch: entry.epoch as u64,
-                        seq: entry.seq as u64,
-                        created_at: chrono::DateTime::parse_from_rfc3339(&entry.created_at)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now()),
+                        epoch: 0,
+                        seq: app_entry.seq as u64,
+                        created_at,
                     };
                     if let Err(e) = self.db.store_message(&msg).await {
                         warn!("Failed to store message {}: {e}", msg.id);
@@ -1113,67 +1026,23 @@ impl ChatService {
                     messages.push(msg);
                 }
                 Err(e) => {
-                    // Track consecutive decryption failures at the same epoch
-                    let msg_epoch = entry.epoch as u64;
-                    if last_failure_epoch == Some(msg_epoch) {
-                        consecutive_failures_at_epoch += 1;
-                    } else {
-                        consecutive_failures_at_epoch = 1;
-                        last_failure_epoch = Some(msg_epoch);
-                    }
-
-                    // §10 DECRYPTION_FAILURE_THRESHOLD: feed the per-convo
-                    // counter; on threshold this flags NEEDS_REJOIN and we
-                    // bail.
-                    let threshold_hit = self.note_decrypt_failure(&entry.convo_id).await;
-                    if threshold_hit || consecutive_failures_at_epoch == 3 {
-                        warn!(
-                            "Possible tree divergence for {convo_label} — \
-                             {consecutive_failures_at_epoch} consecutive failures at epoch {msg_epoch} (local: {}). \
-                             Skipping remaining messages.",
-                            local_epoch.unwrap_or(0)
-                        );
-                        // Bail early — remaining messages at this epoch will also fail
-                        break;
-                    }
-
-                    debug!(
-                        "Failed to decrypt message {} in {}: {e}",
-                        entry.id, entry.convo_id
-                    );
+                    debug!("fetch_messages: decrypt error for {convo_id}: {e}");
                 }
             }
         }
 
-        // Return full message history from local DB (includes both old cached
-        // messages and the newly fetched ones we just stored above).
-        if since_seq.is_some() && !messages.is_empty() {
-            // We only fetched incremental — return the full local view
-            return self.db.get_messages(convo_id, limit, None).await;
-        }
-
-        Ok(messages)
+        self.db.get_messages(convo_id, limit, None).await
     }
 
     /// Repair a diverged group via External Commit rejoin (spec §8.4).
-    ///
-    /// This is now a thin wrapper around `external_commit_rejoin` (in
-    /// `recovery_ops.rs`) so all rejoin paths share the same `RecoveryTracker`
-    /// gating: global `MIN_REJOIN_INTERVAL`, per-convo backoff
-    /// (`REJOIN_BACKOFF`), `MAX_REJOIN_ATTEMPTS` cap with auto-transition to
-    /// `UNRECOVERABLE_LOCAL`, and the `GROUPINFO_404_CIRCUIT_BREAKER`.
     pub async fn repair_group(&self, convo_id: &str) -> Result<()> {
         self.external_commit_rejoin(convo_id).await
     }
 }
 
 /// Parse a decrypted JSON payload into a `MessageContent`.
-///
-/// Supports the iOS `MLSMessagePayload` format (field `messageType`) and the
-/// legacy catmos format (field `type`) for backwards compatibility.
 fn parse_message_content(plaintext: &str) -> MessageContent {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(plaintext) {
-        // Determine message type -- iOS uses "messageType", legacy used "type"
         let msg_type = v
             .get("messageType")
             .or_else(|| v.get("type"))
@@ -1189,7 +1058,6 @@ fn parse_message_content(plaintext: &str) -> MessageContent {
                 MessageContent::Text(text)
             }
             Some("reaction") => {
-                // iOS nests reaction data under a "reaction" key
                 let reaction_obj = v.get("reaction");
                 let (target, emoji, action_str) = if let Some(r) = reaction_obj {
                     (
@@ -1204,7 +1072,6 @@ fn parse_message_content(plaintext: &str) -> MessageContent {
                         r.get("action").and_then(|a| a.as_str()).unwrap_or("add"),
                     )
                 } else {
-                    // Legacy flat format fallback
                     (
                         v.get("targetMessageId")
                             .and_then(|t| t.as_str())
@@ -1239,7 +1106,6 @@ fn parse_message_content(plaintext: &str) -> MessageContent {
             _ => MessageContent::Unknown,
         }
     } else {
-        // Plain text fallback
         MessageContent::Text(plaintext.to_string())
     }
 }
