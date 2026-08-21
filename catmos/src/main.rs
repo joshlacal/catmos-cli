@@ -572,9 +572,8 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             let convos = svc.conversations().await;
             let convo_data = convos
                 .iter()
-                .find(|c| c.group_id == convo_id)
+                .find(|c| c.conversation_id == convo_id || c.group_id == convo_id)
                 .ok_or_else(|| anyhow::anyhow!("Conversation not found after fetch"))?;
-
             if convo_data.members.is_empty() {
                 println!("No members (metadata may be sparse).");
                 return Ok(());
@@ -614,7 +613,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
                 let convo = orch.create_group(&name, Some(&member_list), description.as_deref()).await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                println!("Created conversation: {}", convo.group_id);
+                println!("Created conversation: id={} group_id={}", convo.conversation_id, convo.group_id);
             }
 
             ConvoCommands::Leave { convo } => {
@@ -636,23 +635,24 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let convos = svc.conversations().await;
                 let c = convos
                     .iter()
-                    .find(|c| c.group_id == convo_id)
+                    .find(|c| c.conversation_id == convo_id || c.group_id == convo_id)
                     .ok_or_else(|| anyhow::anyhow!("Conversation not found"))?;
 
-                println!("Name:         {}", c.name.as_deref().unwrap_or("<unnamed>"));
-                println!("Group ID:     {}", c.group_id);
-                println!("Creator:      {}", c.creator);
-                println!("Epoch:        {}", c.epoch);
-                println!("Cipher suite: {}", c.cipher_suite);
-                println!("Members:      {}", c.members.len());
-                println!("Created:      {}", c.created_at);
-                if let Some(ref desc) = c.description {
-                    println!("Description:  {desc}");
+                println!("Name:            {}", c.name.as_deref().unwrap_or("<unnamed>"));
+                println!("Conversation ID: {}", c.conversation_id);
+                println!("Group ID:        {}", c.group_id);
+                println!("Creator:         {}", c.creator);
+                println!("Epoch:           {}", c.epoch);
+                println!("Cipher suite:    {}", c.cipher_suite);
+                println!("Members:         {}", c.members.len());
+                println!("Created:         {}", c.created_at);
+                if let Some(desc) = &c.description {
+                    println!("Description:     {desc}");
                 }
                 if let Some(last) = c.last_message_at {
-                    println!("Last message: {last}");
+                    println!("Last message:    {last}");
                 }
-                println!("Unread:       {}", c.unread_count);
+                println!("Unread:          {}", c.unread_count);
             }
 
             ConvoCommands::Join { convo_id } => {

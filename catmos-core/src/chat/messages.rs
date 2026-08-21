@@ -139,6 +139,10 @@ pub(crate) struct GetEntriesResp {
 pub(crate) enum ConversationEntryResp {
     #[serde(rename = "blue.catbird.chat.defs#commitEntry")]
     Commit(CommitEntryResp),
+    #[serde(rename = "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry")]
+    Fulfillment(CommitEntryResp),
+    #[serde(rename = "blue.catbird.chat.defs#leaveCommitFulfillmentEntry")]
+    LeaveCommit(CommitEntryResp),
     #[serde(rename = "blue.catbird.chat.defs#applicationEntry")]
     Application(ApplicationEntryResp),
     #[serde(other)]
@@ -479,9 +483,13 @@ impl ChatService {
         convo_id: &str,
         ciphertext: &[u8],
     ) -> Result<(String, Option<String>)> {
-        let group_id_bytes = hex::decode(convo_id)
-            .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
-
+        let group_id_bytes = if let Ok(bytes) = hex::decode(convo_id) {
+            bytes
+        } else if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(convo_id) {
+            bytes
+        } else {
+            return Err(CatmosError::Other(format!("Invalid group ID format: {convo_id}")));
+        };
         let result = self
             .mls
             .with_context(|ctx| ctx.decrypt_message(group_id_bytes.clone(), ciphertext.to_vec()))?;
@@ -614,11 +622,44 @@ impl ChatService {
                             });
                         }
                     }
+                    let mut name = None;
+                    let mut description = None;
+                    let mut metadata_version = None;
+                    if let Some(meta_obj) = state_obj.get("metadataSnapshot") {
+                        if let Some(mv) = meta_obj.get("metadataVersion").and_then(|v| v.as_i64()) {
+                            metadata_version = Some(mv);
+                        }
+                        let ct_b64 = meta_obj.get("ciphertext")
+                            .and_then(|v| v.get("$bytes").and_then(|b| b.as_str()).or_else(|| v.as_str()));
+                        let nonce_b64 = meta_obj.get("nonce")
+                            .and_then(|v| v.get("$bytes").and_then(|b| b.as_str()).or_else(|| v.as_str()));
+                        if let (Some(ct_str), Some(nonce_str)) = (ct_b64, nonce_b64) {
+                            if let (Ok(ct), Ok(nonce_bytes)) = (BASE64.decode(ct_str), BASE64.decode(nonce_str)) {
+                                if nonce_bytes.len() == 12 {
+                                    let mut nonce_arr = [0u8; 12];
+                                    nonce_arr.copy_from_slice(&nonce_bytes);
+                                    let gid_bytes = hex::decode(&group_id).unwrap_or_default();
+                                    if let Ok(epoch_key) = self.mls.with_context(|ctx| ctx.export_metadata_key(gid_bytes.clone(), epoch)) {
+                                        if let Ok(key_arr) = <[u8; 32]>::try_from(epoch_key.as_slice()) {
+                                            if let Ok(payload) = catbird_mls::metadata::decrypt_metadata_snapshot(&key_arr, &gid_bytes, epoch, metadata_version.unwrap_or(1) as u64, &nonce_arr, &ct) {
+                                                if !payload.title.is_empty() {
+                                                    name = Some(payload.title);
+                                                }
+                                                if !payload.description.is_empty() {
+                                                    description = Some(payload.description);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     convos.push(Conversation {
                         conversation_id: convo_id,
                         group_id,
-                        name: None,
-                        description: None,
+                        name,
+                        description,
                         creator,
                         epoch,
                         cipher_suite,
@@ -627,7 +668,7 @@ impl ChatService {
                         last_message_at: None,
                         unread_count: 0,
                         alias: None,
-                        metadata_version: None,
+                        metadata_version,
                         metadata_blob_locator: None,
                         avatar_blob_locator: None,
                         avatar_bytes: None,
@@ -659,9 +700,15 @@ impl ChatService {
                     .collect();
                 for c in convos.iter_mut() {
                     if let Some(local) = local_by_id.get(&c.conversation_id) {
-                        c.name = local.name.clone();
-                        c.description = local.description.clone();
-                        c.metadata_version = local.metadata_version;
+                        if c.name.is_none() {
+                            c.name = local.name.clone();
+                        }
+                        if c.description.is_none() {
+                            c.description = local.description.clone();
+                        }
+                        if c.metadata_version.is_none() {
+                            c.metadata_version = local.metadata_version;
+                        }
                         c.metadata_blob_locator = local.metadata_blob_locator.clone();
                         c.avatar_blob_locator = local.avatar_blob_locator.clone();
                         c.avatar_bytes = local.avatar_bytes.clone();
@@ -819,14 +866,24 @@ impl ChatService {
 
         let convo_label = &convo_id[..12.min(convo_id.len())];
 
-        let has_local_state = self
+        let local_epoch = match self
             .mls
-            .with_context(|ctx| ctx.get_epoch(gid_bytes.clone()))
-            .is_ok();
-        if !has_local_state {
-            debug!("sync {convo_label}: no local MLS state, skipping");
-            return Ok(());
-        }
+            .with_context(|ctx| ctx.get_epoch(gid_bytes.clone())) {
+            Ok(e) => e,
+            Err(_) => {
+                debug!("sync {convo_label}: no local MLS state, skipping");
+                return Ok(());
+            }
+        };
+
+        let server_epoch = self
+            .conversations
+            .read()
+            .await
+            .iter()
+            .find(|c| c.conversation_id == convo_uuid || c.group_id == convo_id)
+            .map(|c| c.epoch)
+            .unwrap_or(local_epoch);
 
         let actor_device_id = self.actor_device_id().await?;
         let sync_seq_key = format!("sync_seq_{convo_id}");
@@ -839,7 +896,11 @@ impl ChatService {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
         let max_msg_seq = self.db.get_max_seq(convo_id).await.ok().flatten().unwrap_or(0);
-        let mut after_seq = max_synced.max(max_msg_seq);
+        let mut after_seq = if local_epoch < server_epoch {
+            0
+        } else {
+            max_synced.max(max_msg_seq)
+        };
         let mut total_processed = 0u32;
 
         loop {
@@ -875,7 +936,9 @@ impl ChatService {
 
             for entry in &entries_resp.entries {
                 let commit_entry = match entry {
-                    ConversationEntryResp::Commit(c) => c,
+                    ConversationEntryResp::Commit(c)
+                    | ConversationEntryResp::Fulfillment(c)
+                    | ConversationEntryResp::LeaveCommit(c) => c,
                     _ => continue,
                 };
 
@@ -1044,7 +1107,16 @@ impl ChatService {
                 None => continue,
             };
 
-            match self.decrypt_message(convo_id, &ciphertext) {
+            let gid = if let Ok(_parsed) = uuid::Uuid::parse_str(convo_id) {
+                self.conversations
+                    .try_read()
+                    .ok()
+                    .and_then(|cs| cs.iter().find(|c| c.conversation_id == convo_id).map(|c| c.group_id.clone()))
+                    .unwrap_or_else(|| convo_id.to_string())
+            } else {
+                convo_id.to_string()
+            };
+            match self.decrypt_message(&gid, &ciphertext) {
                 Ok((plaintext, sender_did)) => {
                     self.reset_recovery_counters(convo_id).await;
                     let content = parse_message_content(&plaintext);

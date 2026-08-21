@@ -196,7 +196,7 @@ impl MLSAPIClient for CliApiClient {
 
                 if let Some(ciphertext) = ciphertext_opt {
                     envelopes.push(IncomingEnvelope {
-                        conversation_id: convo_id.to_string(),
+                        conversation_id: convo_uuid.clone(),
                         sender_did,
                         ciphertext,
                         timestamp,

@@ -59,30 +59,44 @@ impl AliasStore {
     /// Resolution order:
     /// 1. Exact alias match
     /// 2. Exact conversation title match (case-insensitive)
-    /// 3. Conversation ID prefix match
+    /// 3. Exact ID match (conversation_id or group_id)
+    /// 4. Conversation ID or group ID prefix match
     pub fn resolve(&self, input: &str, conversations: &[Conversation]) -> Option<String> {
         // 1. Alias
         if let Some(id) = self.aliases.get(input) {
+            if let Some(convo) = conversations
+                .iter()
+                .find(|c| &c.conversation_id == id || &c.group_id == id)
+            {
+                return Some(convo.conversation_id.clone());
+            }
             return Some(id.clone());
         }
 
         // 2. Title match (case-insensitive)
         let input_lower = input.to_lowercase();
         for convo in conversations {
-            if let Some(ref name) = convo.name {
+            if let Some(name) = &convo.name {
                 if name.to_lowercase() == input_lower {
-                    return Some(convo.group_id.clone());
+                    return Some(convo.conversation_id.clone());
                 }
             }
         }
 
-        // 3. ID prefix match
+        // 3. Exact ID match
+        for convo in conversations {
+            if convo.conversation_id == input || convo.group_id == input {
+                return Some(convo.conversation_id.clone());
+            }
+        }
+
+        // 4. ID prefix match
         let mut matches: Vec<_> = conversations
             .iter()
-            .filter(|c| c.group_id.starts_with(input))
+            .filter(|c| c.conversation_id.starts_with(input) || c.group_id.starts_with(input))
             .collect();
         if matches.len() == 1 {
-            return Some(matches.remove(0).group_id.clone());
+            return Some(matches.remove(0).conversation_id.clone());
         }
 
         None
