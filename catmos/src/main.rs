@@ -786,7 +786,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
                 orch.add_members(&convo_id, &[did.clone()]).await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                println!("Added {did} to {convo}");
+                println!("Invited {did} to {convo} (pending acceptance)");
             }
 
             ConvoCommands::RemoveMember { convo, did } => {
