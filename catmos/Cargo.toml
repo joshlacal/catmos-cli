@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 catmos-core = { workspace = true }
 catmos-tui = { workspace = true }
+catbird-mls = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tokio = { workspace = true }
 tracing = { workspace = true }

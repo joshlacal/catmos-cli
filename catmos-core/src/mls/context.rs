@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use catbird_mls::EpochSecretStorage;
 use catbird_mls::{KeychainAccess, MLSCommitError, MLSContext, MLSError};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
@@ -213,6 +214,9 @@ impl MlsManager {
 
         let context =
             MLSContext::new(storage_path, encryption_key, keychain).map_err(CatmosError::Mls)?;
+        context
+            .set_epoch_secret_storage(Box::new(MlsEpochSecretStorage::new()))
+            .map_err(CatmosError::Mls)?;
 
         Ok(Self { context })
     }
@@ -269,5 +273,55 @@ impl MlsManager {
             return hex::decode(s).ok();
         }
         None
+    }
+}
+
+pub struct MlsEpochSecretStorage {
+    secrets: Mutex<HashMap<(String, u64), Vec<u8>>>,
+}
+
+impl MlsEpochSecretStorage {
+    pub fn new() -> Self {
+        Self {
+            secrets: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EpochSecretStorage for MlsEpochSecretStorage {
+    async fn store_epoch_secret(
+        &self,
+        conversation_id: String,
+        epoch: u64,
+        secret_data: Vec<u8>,
+    ) -> bool {
+        let mut guard = self.secrets.lock().unwrap();
+        guard.insert((conversation_id, epoch), secret_data);
+        true
+    }
+
+    async fn get_epoch_secret(&self, conversation_id: String, epoch: u64) -> Option<Vec<u8>> {
+        let guard = self.secrets.lock().unwrap();
+        guard.get(&(conversation_id, epoch)).cloned()
+    }
+
+    async fn delete_epoch_secret(&self, conversation_id: String, epoch: u64) -> bool {
+        let mut guard = self.secrets.lock().unwrap();
+        guard.remove(&(conversation_id, epoch)).is_some()
+    }
+
+    async fn delete_epochs_before(&self, conversation_id: String, cutoff_epoch: u64) -> u32 {
+        let mut guard = self.secrets.lock().unwrap();
+        let mut count = 0;
+        guard.retain(|(convo, epoch), _| {
+            if convo == &conversation_id && *epoch < cutoff_epoch {
+                count += 1;
+                false
+            } else {
+                true
+            }
+        });
+        count
     }
 }

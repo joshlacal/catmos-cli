@@ -265,62 +265,51 @@ async fn init_service() -> anyhow::Result<Arc<ChatService>> {
     if let Err(e) = orchestrator.initialize(&did).await {
         tracing::warn!("orchestrator initialization failed: {e}");
     }
-        Ok(device_info) => {
-            info!("MLS device ready: {}", device_info.device_id);
+    if let Err(e) = orchestrator.ensure_device_registered().await {
+        tracing::warn!("orchestrator ensure_device_registered failed: {e}");
+    }
 
-            // Fetch conversations and join any that lack local MLS state
-            match service.fetch_conversations().await {
-                Ok(convos) => {
-                    info!(
-                        "Fetched {} conversations, joining missing groups...",
-                        convos.len()
-                    );
-                    service.join_missing_conversations(&did).await;
+    // Fetch conversations and join any that lack local MLS state
+    match service.fetch_conversations().await {
+        Ok(_convos) => {
+            // Block reconciliation: leave any MLS group containing a
+            // user from this account's own block list. Catches up on
+            // blocks made from other clients (iOS, web, etc.) before
+            // catmos-cli last ran.
+            match service.list_own_blocks().await {
+                Ok(blocks) if !blocks.is_empty() => {
+                    let blocked: std::collections::HashSet<String> =
+                        blocks.into_iter().collect();
+                    let convos_to_leave: Vec<String> = service
+                        .conversations()
+                        .await
+                        .into_iter()
+                        .filter(|c| c.members.iter().any(|m| blocked.contains(&m.user_did)))
+                        .map(|c| c.group_id)
+                        .collect();
 
-                    // Block reconciliation: leave any MLS group containing a
-                    // user from this account's own block list. Catches up on
-                    // blocks made from other clients (iOS, web, etc.) before
-                    // catmos-cli last ran.
-                    match service.list_own_blocks().await {
-                        Ok(blocks) if !blocks.is_empty() => {
-                            let blocked: std::collections::HashSet<String> =
-                                blocks.into_iter().collect();
-                            let convos_to_leave: Vec<String> = service
-                                .conversations()
-                                .await
-                                .into_iter()
-                                .filter(|c| c.members.iter().any(|m| blocked.contains(&m.user_did)))
-                                .map(|c| c.group_id)
-                                .collect();
-
-                            let mut left = 0usize;
-                            for id in &convos_to_leave {
-                                if let Err(e) = service.leave_conversation(id).await {
-                                    tracing::warn!("reconcile leave {id}: {e}");
-                                } else {
-                                    left += 1;
-                                }
-                            }
-                            if left > 0 {
-                                println!(
-                                    "Reconciled: left {left} group(s) containing blocked users."
-                                );
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!("Failed to fetch own block list: {e}");
+                    let mut left = 0usize;
+                    for id in &convos_to_leave {
+                        if let Err(e) = service.leave_conversation(id).await {
+                            tracing::warn!("reconcile leave {id}: {e}");
+                        } else {
+                            left += 1;
                         }
                     }
+                    if left > 0 {
+                        println!(
+                            "Reconciled: left {left} group(s) containing blocked users."
+                        );
+                    }
                 }
+                Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!("Failed to fetch conversations for group joining: {e}");
+                    tracing::warn!("Failed to fetch own block list: {e}");
                 }
             }
         }
         Err(e) => {
-            // Non-fatal: the user can still use non-MLS commands
-            tracing::warn!("MLS device registration skipped: {e}");
+            tracing::warn!("Failed to fetch conversations: {e}");
         }
     }
 

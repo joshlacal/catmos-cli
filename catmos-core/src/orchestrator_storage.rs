@@ -250,6 +250,11 @@ impl SqliteStorage {
                 key TEXT PRIMARY KEY,
                 val_int INTEGER
             );
+
+            CREATE TABLE IF NOT EXISTS pending_local_deletes (
+                conversation_id TEXT PRIMARY KEY,
+                group_id_hex TEXT
+            );
             ",
         )?;
         Self::ensure_messages_delivery_status_column(&conn)?;
@@ -1329,6 +1334,51 @@ impl MLSStorageBackend for SqliteStorage {
         Ok(())
     }
 
+    async fn mark_pending_local_delete(
+        &self,
+        conversation_id: &str,
+        group_id_hex: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_local_deletes (conversation_id, group_id_hex)
+             VALUES (?1, ?2)",
+            rusqlite::params![conversation_id, group_id_hex],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn clear_pending_local_delete(&self, conversation_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM pending_local_deletes WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_pending_local_deletes(&self) -> Result<Vec<PendingLocalDelete>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT conversation_id, group_id_hex FROM pending_local_deletes")
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PendingLocalDelete {
+                    conversation_id: row.get(0)?,
+                    group_id_hex: row.get(1)?,
+                })
+            })
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r.map_err(|e| OrchestratorError::Storage(e.to_string()))?);
+        }
+        Ok(list)
+    }
+
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
         &[
             "get_conversation_state",
@@ -1343,6 +1393,9 @@ impl MLSStorageBackend for SqliteStorage {
             "set_recovery_backoff",
             "clear_recovery_backoff",
             "set_last_global_rejoin_attempt_at",
+            "mark_pending_local_delete",
+            "clear_pending_local_delete",
+            "list_pending_local_deletes",
         ]
     }
 }

@@ -733,6 +733,7 @@ name = "catmos"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "catbird_mls",
  "catmos-core",
  "catmos-tui",
  "clap",
@@ -776,6 +777,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",

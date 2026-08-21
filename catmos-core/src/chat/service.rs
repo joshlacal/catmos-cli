@@ -13,6 +13,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use catbird_mls::orchestrator_bridge::FFICommitKind;
 use catbird_mls::{GroupConfig, KeyPackageData};
+use catbird_mls::orchestrator::credentials::CredentialStore;
 
 use crate::auth::{AuthMethod, TokenSession};
 use crate::error::{CatmosError, Result};
@@ -463,12 +464,24 @@ Body: {}",
     }
 
     pub async fn actor_device_id(&self) -> Result<String> {
+        if let Some(orch) = self.orchestrator().await {
+            if let Ok(Some(uuid)) = orch.credentials().get_device_uuid(self.did()).await {
+                if !uuid.trim().is_empty() {
+                    return Ok(uuid);
+                }
+            }
+        }
         if let Some(id) = self.db.get_session_value("mls_device_id").await? {
             if !id.trim().is_empty() {
                 return Ok(id);
             }
         }
         if let Some(id) = self.db.get_session_value("device_uuid").await? {
+            if !id.trim().is_empty() {
+                return Ok(id);
+            }
+        }
+        if let Some(id) = self.db.get_session_value("device_id").await? {
             if !id.trim().is_empty() {
                 return Ok(id);
             }
