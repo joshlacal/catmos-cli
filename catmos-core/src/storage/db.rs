@@ -474,7 +474,7 @@ impl Database {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )
             .bind(&member.did)
-            .bind(&convo.group_id)
+            .bind(&convo.conversation_id)
             .bind(&member.user_did)
             .bind(&member.device_id)
             .bind(&member.device_name)
@@ -1092,7 +1092,7 @@ impl Database {
     pub async fn get_members(&self, group_id: &str) -> Result<Vec<Member>> {
         let rows = sqlx::query(
             "SELECT did, user_did, device_id, device_name, is_admin, is_moderator, joined_at
-             FROM members WHERE group_id = ?1",
+             FROM members WHERE group_id = ?1 OR group_id IN (SELECT conversation_id FROM conversations WHERE group_id = ?1)",
         )
         .bind(group_id)
         .fetch_all(&self.pool)

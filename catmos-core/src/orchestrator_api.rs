@@ -151,8 +151,9 @@ impl MLSAPIClient for CliApiClient {
                 let body = signed_request.and_then(|sr| sr.get("body"));
                 let sender_did = signed_request
                     .and_then(|sr| {
-                        sr.get("did")
+                        sr.get("body").and_then(|b| b.get("actorDid"))
                             .or_else(|| sr.get("actorDid"))
+                            .or_else(|| sr.get("did"))
                             .or_else(|| sr.get("signerDid"))
                     })
                     .and_then(|v| v.as_str())

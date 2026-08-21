@@ -123,6 +123,52 @@ enum ConvoCommands {
     Join {
         convo_id: String,
     },
+    Accept {
+        convo: String,
+        #[arg(long)]
+        inviter_did: Option<String>,
+        #[arg(long)]
+        inviter_device_id: Option<String>,
+        #[arg(long)]
+        invitation_transition_id: Option<String>,
+        #[arg(long)]
+        group_id: Option<String>,
+        #[arg(long)]
+        confirmation_tag: Option<String>,
+        #[arg(long)]
+        group_context_hash: Option<String>,
+    },
+    Fulfill {
+        convo: String,
+        #[arg(long)]
+        recovery_request_id: Option<String>,
+        #[arg(long)]
+        requester_did: Option<String>,
+        #[arg(long)]
+        requester_device_id: Option<String>,
+        #[arg(long)]
+        key_package_base64: Option<String>,
+        #[arg(long)]
+        key_package_ref_base64: Option<String>,
+    },
+    JoinWelcome {
+        convo: String,
+    },
+    RequestRecovery {
+        convo: String,
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        confirmation_tag: String,
+        #[arg(long)]
+        group_context_hash: String,
+        #[arg(long, default_value = "0")]
+        epoch: u64,
+        #[arg(long, default_value = "1")]
+        state_version: i64,
+        #[arg(long)]
+        kind: Option<String>,
+    },
     Leave {
         convo: String,
     },
@@ -436,7 +482,25 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             let svc = init_service().await?;
             svc.fetch_conversations().await?;
             let convo_id = svc.resolve_convo(&convo).await?;
-            let messages = svc.fetch_messages(&convo_id, 50).await?;
+            let messages: Vec<catmos_core::types::Message> = if let Some(orch) = svc.orchestrator().await {
+                if let Ok((orch_msgs, _)) = orch.fetch_messages(&convo_id, None, 50, None, None, None).await {
+                    orch_msgs.into_iter().map(|om| {
+                        catmos_core::types::Message {
+                            id: om.id,
+                            convo_id: om.conversation_id,
+                            sender_did: Some(om.sender_did),
+                            content: MessageContent::Text(om.text),
+                            epoch: om.epoch,
+                            seq: om.sequence_number,
+                            created_at: om.timestamp,
+                        }
+                    }).collect()
+                } else {
+                    svc.fetch_messages(&convo_id, 50).await.unwrap_or_default()
+                }
+            } else {
+                svc.fetch_messages(&convo_id, 50).await?
+            };
             let handle_cache = svc.handle_cache().await;
             let my_did = svc.did().to_string();
 
@@ -605,6 +669,98 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     "Joined conversation {}",
                     &convo_id[..12.min(convo_id.len())]
                 );
+            }
+            ConvoCommands::Accept {
+                convo,
+                inviter_did,
+                inviter_device_id,
+                invitation_transition_id,
+                group_id,
+                confirmation_tag,
+                group_context_hash,
+            } => {
+                let svc = init_service().await?;
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                let res = if let (Some(inv_trans), Some(inv_did), Some(inv_dev), Some(gid), Some(tag), Some(gch)) = (
+                    invitation_transition_id,
+                    inviter_did,
+                    inviter_device_id,
+                    group_id,
+                    confirmation_tag,
+                    group_context_hash,
+                ) {
+                    let prior = serde_json::json!({
+                        "conversationId": convo,
+                        "groupId": gid,
+                        "epoch": 0,
+                        "generation": 0,
+                        "stateVersion": 0,
+                        "groupContextHash": gch,
+                        "confirmationTag": tag,
+                        "lifecycle": "active"
+                    });
+                    orch.accept_conversation_with_invitation(&convo, &inv_trans, &inv_did, &inv_dev, prior).await
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                } else {
+                    orch.accept_conversation(&convo).await
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                };
+                println!("Accepted conversation {convo}: {}", serde_json::to_string(&res)?);
+            }
+
+            ConvoCommands::Fulfill {
+                convo,
+                recovery_request_id,
+                requester_did,
+                requester_device_id,
+                key_package_base64,
+                key_package_ref_base64,
+            } => {
+                let svc = init_service().await?;
+                let convo_id = if convo.len() == 36 && convo.contains('-') {
+                    convo.clone()
+                } else {
+                    let _ = svc.fetch_conversations().await;
+                    svc.resolve_convo(&convo).await.unwrap_or_else(|_| convo.clone())
+                };
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                let res = orch.fulfill_leaf_recovery_with_target(
+                    &convo_id,
+                    recovery_request_id.as_deref(),
+                    requester_did.as_deref(),
+                    requester_device_id.as_deref(),
+                    key_package_base64.as_deref(),
+                    key_package_ref_base64.as_deref(),
+                ).await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("Fulfilled leaf recovery for {convo}: {}", serde_json::to_string(&res)?);
+            }
+
+            ConvoCommands::JoinWelcome { convo } => {
+                let svc = init_service().await?;
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                let view = orch.join_conversation_from_entries(&convo).await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("Joined conversation via Welcome: {} (epoch={})", view.group_id, view.epoch);
+            }
+            ConvoCommands::RequestRecovery {
+                convo,
+                group_id,
+                confirmation_tag,
+                group_context_hash,
+                epoch,
+                state_version,
+                kind,
+            } => {
+                let svc = init_service().await?;
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                let res = orch.request_leaf_recovery(&convo, kind.as_deref(), &group_id, &group_context_hash, &confirmation_tag, epoch, state_version).await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("Requested leaf recovery for {convo}: {}", serde_json::to_string(&res)?);
             }
 
             ConvoCommands::Update {

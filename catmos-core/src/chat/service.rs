@@ -206,7 +206,13 @@ impl ChatService {
             return Ok(target.to_string());
         }
         let convos = self.conversations().await;
-        if let Some(c) = convos.iter().find(|c| c.group_id == input || c.conversation_id == input) {
+        if let Some(c) = convos.iter().find(|c| {
+            c.group_id == input
+                || c.conversation_id == input
+                || c.group_id.starts_with(input)
+                || c.conversation_id.starts_with(input)
+                || c.name.as_deref() == Some(input)
+        }) {
             return Ok(c.group_id.clone());
         }
         Ok(input.to_string())
@@ -382,6 +388,17 @@ impl ChatService {
         nsid: &str,
         params: &[(&str, &str)],
     ) -> Result<R> {
+        let mut query_params: Vec<(&str, &str)> = params.to_vec();
+        let mut device_id_holder = String::new();
+        if !params.iter().any(|(k, _)| *k == "actorDeviceId") {
+            if let Ok(dev_id) = self.actor_device_id().await {
+                device_id_holder = dev_id;
+            }
+        }
+        if !device_id_holder.is_empty() {
+            query_params.push(("actorDeviceId", &device_id_holder));
+        }
+
         let bearer = self.get_service_token(nsid).await?;
         let (url, headers) = self.build_request(nsid, &bearer)?;
         debug!("XRPC GET {nsid} -> {url}");
@@ -390,7 +407,7 @@ impl ChatService {
             .http
             .get(&url)
             .headers(headers)
-            .query(params)
+            .query(&query_params)
             .send()
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
@@ -415,7 +432,7 @@ impl ChatService {
                 .http
                 .get(&url)
                 .headers(headers)
-                .query(params)
+                .query(&query_params)
                 .send()
                 .await
                 .map_err(|e| CatmosError::Network(e.to_string()))?;
@@ -495,63 +512,70 @@ Body: {}",
         match (&self.auth, &self.token_session) {
             (AuthMethod::OAuth { session_cookie, .. }, _) => Ok(session_cookie.clone()),
             (AuthMethod::AppPassword { pds_url, .. }, Some(sess)) => {
-                let access_jwt = sess.current_bearer().await?;
+                let mut access_jwt = sess.current_bearer().await?;
                 let aud = crate::mls::atproto_proxy_header_value();
                 let aud_encoded = aud.replace('#', "%23");
                 let pds_base = pds_url.trim_end_matches('/');
 
-                let url = format!("{pds_base}/xrpc/com.atproto.server.getServiceAuth?aud={aud_encoded}&lxm={nsid}");
-                let resp = self
-                    .http
-                    .get(&url)
-                    .header(AUTHORIZATION, format!("Bearer {access_jwt}"))
-                    .send()
-                    .await;
-
-                if let Ok(r) = resp {
-                    if r.status().is_success() {
-                        #[derive(Deserialize)]
-                        struct SvcResp {
-                            token: String,
-                        }
-                        if let Ok(parsed) = r.json::<SvcResp>().await {
-                            return Ok(parsed.token);
+                // Helper closure to attempt getServiceAuth
+                let try_get_service_auth = |base: &str, token: &str| {
+                    let url = format!("{base}/xrpc/com.atproto.server.getServiceAuth?aud={aud_encoded}&lxm={nsid}");
+                    let client = self.http.clone();
+                    let auth_hdr = format!("Bearer {token}");
+                    async move {
+                        let resp = client
+                            .get(&url)
+                            .header(AUTHORIZATION, auth_hdr)
+                            .send()
+                            .await?;
+                        if resp.status().is_success() {
+                            #[derive(Deserialize)]
+                            struct SvcResp {
+                                token: String,
+                            }
+                            let parsed = resp.json::<SvcResp>().await?;
+                            Ok::<Option<String>, reqwest::Error>(Some(parsed.token))
+                        } else {
+                            Ok(None)
                         }
                     }
+                };
+
+                // 1. Try direct pds_url
+                if let Ok(Some(tok)) = try_get_service_auth(pds_base, &access_jwt).await {
+                    return Ok(tok);
                 }
 
-                // If pds_base was bsky.social, resolve actual PDS from plc.directory
-                if pds_base.contains("bsky.social") {
-                    let did = self.did();
-                    if let Ok(plc_resp) = self.http.get(&format!("https://plc.directory/{did}")).send().await {
-                        if let Ok(doc) = plc_resp.json::<serde_json::Value>().await {
-                            if let Some(services) = doc.get("service").and_then(|v| v.as_array()) {
-                                for svc in services {
-                                    if let Some(endpoint) = svc.get("serviceEndpoint").and_then(|v| v.as_str()) {
-                                        let ep_clean = endpoint.trim_end_matches('/');
-                                        let ep_url = format!("{ep_clean}/xrpc/com.atproto.server.getServiceAuth?aud={aud_encoded}&lxm={nsid}");
-                                        if let Ok(r2) = self
-                                            .http
-                                            .get(&ep_url)
-                                            .header(AUTHORIZATION, format!("Bearer {access_jwt}"))
-                                            .send()
-                                            .await
-                                        {
-                                            if r2.status().is_success() {
-                                                #[derive(Deserialize)]
-                                                struct SvcResp {
-                                                    token: String,
-                                                }
-                                                if let Ok(parsed) = r2.json::<SvcResp>().await {
-                                                    return Ok(parsed.token);
-                                                }
-                                            }
+                // 2. If pds_base was bsky.social or direct failed, resolve actual PDS from plc.directory
+                let did = self.did();
+                if let Ok(plc_resp) = self.http.get(&format!("https://plc.directory/{did}")).send().await {
+                    if let Ok(doc) = plc_resp.json::<serde_json::Value>().await {
+                        if let Some(services) = doc.get("service").and_then(|v| v.as_array()) {
+                            for svc in services {
+                                if let Some(endpoint) = svc.get("serviceEndpoint").and_then(|v| v.as_str()) {
+                                    let ep_clean = endpoint.trim_end_matches('/');
+                                    if let Ok(Some(tok)) = try_get_service_auth(ep_clean, &access_jwt).await {
+                                        return Ok(tok);
+                                    }
+                                    // Try refreshing access_jwt and retrying
+                                    if let Ok(new_jwt) = sess.refresh(&self.db).await {
+                                        access_jwt = new_jwt;
+                                        if let Ok(Some(tok)) = try_get_service_auth(ep_clean, &access_jwt).await {
+                                            return Ok(tok);
                                         }
                                     }
                                 }
                             }
                         }
                     }
+                }
+
+                // Fallback: try refreshing access_jwt against pds_base
+                if let Ok(new_jwt) = sess.refresh(&self.db).await {
+                    if let Ok(Some(tok)) = try_get_service_auth(pds_base, &new_jwt).await {
+                        return Ok(tok);
+                    }
+                    return Ok(new_jwt);
                 }
 
                 Ok(access_jwt)

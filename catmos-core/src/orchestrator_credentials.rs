@@ -62,14 +62,57 @@ impl KeyringCredentialStore {
         format!("server_device_id:{}", user_did)
     }
 
+    fn file_fallback_path(key: &str) -> Option<std::path::PathBuf> {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(key.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+        let dir = crate::storage::config::Config::data_dir().ok()?.join("credentials");
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir.join(format!("{hash}.key")))
+    }
+
     async fn get_string(key: String) -> Result<Option<String>> {
         match Self::entry(&key) {
             Ok(entry) => match entry.get_password() {
                 Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
-                Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
-                Err(error) => Err(OrchestratorError::Credential(error.to_string())),
+                Ok(_) | Err(keyring::Error::NoEntry) => {
+                    if let Some(path) = Self::file_fallback_path(&key) {
+                        if path.exists() {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                if !content.trim().is_empty() {
+                                    return Ok(Some(content.trim().to_string()));
+                                }
+                            }
+                        }
+                    }
+                    Ok(None)
+                }
+                Err(error) => {
+                    if let Some(path) = Self::file_fallback_path(&key) {
+                        if path.exists() {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                if !content.trim().is_empty() {
+                                    return Ok(Some(content.trim().to_string()));
+                                }
+                            }
+                        }
+                    }
+                    Err(OrchestratorError::Credential(error.to_string()))
+                }
             },
-            Err(error) => Err(OrchestratorError::Credential(error.to_string())),
+            Err(error) => {
+                if let Some(path) = Self::file_fallback_path(&key) {
+                    if path.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if !content.trim().is_empty() {
+                                return Ok(Some(content.trim().to_string()));
+                            }
+                        }
+                    }
+                }
+                Err(OrchestratorError::Credential(error.to_string()))
+            }
         }
     }
 
@@ -80,18 +123,40 @@ impl KeyringCredentialStore {
                 "cannot persist an empty device identifier".to_string(),
             ));
         }
-        Self::entry(&key)
-            .map_err(|error| OrchestratorError::Credential(error.to_string()))?
-            .set_password(value)
-            .map_err(|error| OrchestratorError::Credential(error.to_string()))
+        if let Some(path) = Self::file_fallback_path(&key) {
+            let _ = std::fs::write(&path, value);
+        }
+        match Self::entry(&key) {
+            Ok(entry) => match entry.set_password(value) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    if let Some(path) = Self::file_fallback_path(&key) {
+                        if path.exists() {
+                            return Ok(());
+                        }
+                    }
+                    Err(OrchestratorError::Credential(e.to_string()))
+                }
+            },
+            Err(e) => {
+                if let Some(path) = Self::file_fallback_path(&key) {
+                    if path.exists() {
+                        return Ok(());
+                    }
+                }
+                Err(OrchestratorError::Credential(e.to_string()))
+            }
+        }
     }
 
     fn delete_key(key: String) {
+        if let Some(path) = Self::file_fallback_path(&key) {
+            let _ = std::fs::remove_file(&path);
+        }
         if let Ok(entry) = Self::entry(&key) {
             let _ = entry.delete_credential();
         }
     }
-
     /// Store the client-generated UUID independently from the server ID.
     pub async fn store_local_device_uuid(&self, user_did: &str, uuid: &str) -> Result<()> {
         Self::store_string(Self::key_local_device_uuid(user_did), uuid).await
@@ -128,55 +193,33 @@ impl CredentialStore for KeyringCredentialStore {
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()> {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(key_data);
-        Self::entry(&Self::key_signing(user_did))
-            .map_err(|e| OrchestratorError::Credential(e.to_string()))?
-            .set_password(&encoded)
-            .map_err(|e| OrchestratorError::Credential(e.to_string()))
+        Self::store_string(Self::key_signing(user_did), &encoded).await
     }
 
     async fn get_signing_key(&self, user_did: &str) -> Result<Option<Vec<u8>>> {
         use base64::Engine;
-        match Self::entry(&Self::key_signing(user_did)) {
-            Ok(entry) => match entry.get_password() {
-                Ok(encoded) => {
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(&encoded)
-                        .map_err(|e| OrchestratorError::Credential(e.to_string()))?;
-                    Ok(Some(bytes))
-                }
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(e) => Err(OrchestratorError::Credential(e.to_string())),
-            },
-            Err(e) => Err(OrchestratorError::Credential(e.to_string())),
+        match Self::get_string(Self::key_signing(user_did)).await? {
+            Some(encoded) => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&encoded)
+                    .map_err(|e| OrchestratorError::Credential(e.to_string()))?;
+                Ok(Some(bytes))
+            }
+            None => Ok(None),
         }
     }
 
     async fn delete_signing_key(&self, user_did: &str) -> Result<()> {
-        match Self::entry(&Self::key_signing(user_did)) {
-            Ok(entry) => match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(e) => Err(OrchestratorError::Credential(e.to_string())),
-            },
-            Err(e) => Err(OrchestratorError::Credential(e.to_string())),
-        }
+        Self::delete_key(Self::key_signing(user_did));
+        Ok(())
     }
 
     async fn store_mls_did(&self, user_did: &str, mls_did: &str) -> Result<()> {
-        Self::entry(&Self::key_mls_did(user_did))
-            .map_err(|e| OrchestratorError::Credential(e.to_string()))?
-            .set_password(mls_did)
-            .map_err(|e| OrchestratorError::Credential(e.to_string()))
+        Self::store_string(Self::key_mls_did(user_did), mls_did).await
     }
 
     async fn get_mls_did(&self, user_did: &str) -> Result<Option<String>> {
-        match Self::entry(&Self::key_mls_did(user_did)) {
-            Ok(entry) => match entry.get_password() {
-                Ok(val) => Ok(Some(val)),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(e) => Err(OrchestratorError::Credential(e.to_string())),
-            },
-            Err(e) => Err(OrchestratorError::Credential(e.to_string())),
-        }
+        Self::get_string(Self::key_mls_did(user_did)).await
     }
 
     async fn store_device_uuid(&self, user_did: &str, uuid: &str) -> Result<()> {
