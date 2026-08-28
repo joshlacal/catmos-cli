@@ -48,15 +48,30 @@ impl MLSAPIClient for CliApiClient {
         let req_body = request.body.unwrap_or_default();
         if !req_body.is_empty() {
             headers.insert(CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
-            let _ = std::fs::write(format!("/tmp/last_{nsid}_body.json"), &req_body);
-            tracing::info!(nsid, body = %String::from_utf8_lossy(&req_body), "submit_prepared_request body");
         }
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let response = self.service.http.request(method, url).headers(headers)
-            .body(req_body).send().await
+        let mut response = self.service.http.request(method.clone(), url.clone()).headers(headers.clone())
+            .body(req_body.clone()).send().await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let status = response.status().as_u16();
+        let mut status = response.status().as_u16();
+        if status == 401 {
+            if let Ok(new_bearer) = self.service.refresh_bearer().await {
+                let fresh_bearer = self.service.get_service_token(nsid).await.unwrap_or(new_bearer);
+                if let Ok((mut retry_url, retry_headers)) = self.service.build_request(nsid, &fresh_bearer) {
+                    if let Some(query) = request.path.split_once('?').map(|(_, query)| query) {
+                        retry_url.push('?');
+                        retry_url.push_str(query);
+                    }
+                    if let Ok(retry_resp) = self.service.http.request(method, retry_url).headers(retry_headers)
+                        .body(req_body).send().await
+                    {
+                        response = retry_resp;
+                        status = response.status().as_u16();
+                    }
+                }
+            }
+        }
         let content_type = response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_owned);
         let body = response.bytes().await.map_err(|e| OrchestratorError::Api(e.to_string()))?.to_vec();
         if status != 200 {
@@ -160,36 +175,25 @@ impl MLSAPIClient for CliApiClient {
                     .unwrap_or("")
                     .to_string();
 
+                // Clean-chat bytes fields are `{"$bytes": b64}`, possibly nested
+                // under `bytes`; older shapes were bare base64 strings.
+                let decode_bytes = |v: &serde_json::Value| -> Option<Vec<u8>> {
+                    let s = v
+                        .as_str()
+                        .or_else(|| v.get("$bytes").and_then(|x| x.as_str()))
+                        .or_else(|| v.get("bytes").and_then(|b| b.as_str().or_else(|| b.get("$bytes").and_then(|x| x.as_str()))))?;
+                    BASE64.decode(s).ok()
+                };
                 let ciphertext_opt = if entry_type.contains("applicationEntry") || entry_type == "application" {
                     body.and_then(|b| {
                         b.get("applicationMessage")
                             .or_else(|| b.get("messageData"))
                             .or_else(|| b.get("message"))
                     })
-                    .and_then(|v| {
-                        if let Some(s) = v.as_str() {
-                            BASE64.decode(s).ok()
-                        } else if let Some(b_str) =
-                            v.get("bytes").or_else(|| v.get("$bytes")).and_then(|x| x.as_str())
-                        {
-                            BASE64.decode(b_str).ok()
-                        } else {
-                            None
-                        }
-                    })
+                    .and_then(decode_bytes)
                 } else if entry_type.contains("commitEntry") || entry_type == "commit" {
                     body.and_then(|b| b.get("commit").or_else(|| b.get("commitData")))
-                        .and_then(|v| {
-                            if let Some(s) = v.as_str() {
-                                BASE64.decode(s).ok()
-                            } else if let Some(b_str) =
-                                v.get("bytes").or_else(|| v.get("$bytes")).and_then(|x| x.as_str())
-                            {
-                                BASE64.decode(b_str).ok()
-                            } else {
-                                None
-                            }
-                        })
+                        .and_then(decode_bytes)
                 } else {
                     None
                 };
@@ -301,12 +305,86 @@ impl MLSAPIClient for CliApiClient {
         Ok(devices)
     }
 
-    async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {
-        let state = self.service.get_group_state(convo_id).await
+    /// Clean-chat exposes no GroupInfo read; External Commit is never an
+    /// option. Failing here routes the orchestrator to leaf recovery / reset.
+    async fn get_group_info(&self, _convo_id: &str) -> Result<Vec<u8>> {
+        Err(OrchestratorError::ServerError {
+            status: 404,
+            body: "GroupInfo is not retrievable under blue.catbird.chat".into(),
+        })
+    }
+
+    /// The newest pending Welcome addressed to this device for `convo_id`
+    /// from the device-scoped `getPendingWelcomes` inventory. The welcome
+    /// page is served from the inventory session `getConversations` minted.
+    async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
+        use sha2::Digest as _;
+        let device_id = self
+            .service
+            .actor_device_id()
+            .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let encoded = state.get("groupInfo").and_then(|v| v.as_str())
-            .ok_or_else(|| OrchestratorError::Api("group state did not contain groupInfo".into()))?;
-        BASE64.decode(encoded).map_err(|e| OrchestratorError::Api(e.to_string()))
+        let session_id = {
+            let cached = self.service.inventory_session.read().await.clone();
+            match cached {
+                Some((session, _)) => session,
+                None => {
+                    self.service
+                        .fetch_conversations()
+                        .await
+                        .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+                    self.service
+                        .inventory_session
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|(session, _)| session.clone())
+                        .ok_or_else(|| OrchestratorError::Api("getConversations minted no inventory session".into()))?
+                }
+            }
+        };
+        let resp: serde_json::Value = self
+            .service
+            .xrpc_query(
+                "blue.catbird.chat.getPendingWelcomes",
+                &[
+                    ("actorDeviceId", &device_id),
+                    ("inventorySessionId", &session_id),
+                    ("limit", "100"),
+                ],
+            )
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let bytes_of = |v: Option<&serde_json::Value>| -> Option<Vec<u8>> {
+            let v = v?;
+            let s = v.as_str().or_else(|| v.get("$bytes").and_then(|b| b.as_str()))?;
+            BASE64.decode(s).ok()
+        };
+        let welcome = resp
+            .get("items")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                item.get("conversationId").and_then(|v| v.as_str()) == Some(convo_id)
+                    && item.get("status").and_then(|v| v.as_str()) == Some("pending")
+                    && item.get("recipientDeviceId").and_then(|v| v.as_str()) == Some(device_id.as_str())
+            })
+            .max_by_key(|item| item.get("transitionSeq").and_then(|v| v.as_i64()).unwrap_or(0));
+        let Some(welcome) = welcome else {
+            return Err(OrchestratorError::ServerError {
+                status: 404,
+                body: "Welcome not found".into(),
+            });
+        };
+        let opaque = bytes_of(welcome.get("opaqueWelcome"))
+            .ok_or_else(|| OrchestratorError::Api("pending Welcome has no opaqueWelcome".into()))?;
+        let expected = bytes_of(welcome.get("sha256"))
+            .ok_or_else(|| OrchestratorError::Api("pending Welcome has no sha256".into()))?;
+        if sha2::Sha256::digest(&opaque).as_slice() != expected.as_slice() {
+            return Err(OrchestratorError::Api("Welcome digest mismatch".into()));
+        }
+        Ok(opaque)
     }
 
     async fn get_group_metadata_blob(

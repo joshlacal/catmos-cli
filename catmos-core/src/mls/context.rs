@@ -145,17 +145,27 @@ pub fn get_or_create_db_key(did: &str) -> Result<String> {
                     info!("Generated and stored new MLS DB key in system keychain");
                     Ok(key)
                 }
-                Err(_) => {
-                    // Keychain read failed — derive from DID
-                    warn!("System keychain unavailable, deriving MLS DB key from DID");
-                    Ok(derive_key_from_did(did))
+                Err(err) => {
+                    if std::env::var_os("CATMOS_TEST_KEYCHAIN_FALLBACK").is_some() {
+                        warn!("System keychain unavailable, falling back to test DID-derived key");
+                        Ok(derive_key_from_did(did))
+                    } else {
+                        Err(CatmosError::Storage(format!(
+                            "System keychain unavailable for MLS DB key: {err}"
+                        )))
+                    }
                 }
             }
         }
-        Err(_) => {
-            // Keychain completely unavailable
-            warn!("System keychain unavailable, deriving MLS DB key from DID");
-            Ok(derive_key_from_did(did))
+        Err(err) => {
+            if std::env::var_os("CATMOS_TEST_KEYCHAIN_FALLBACK").is_some() {
+                warn!("System keychain unavailable, falling back to test DID-derived key");
+                Ok(derive_key_from_did(did))
+            } else {
+                Err(CatmosError::Storage(format!(
+                    "System keychain entry failed for MLS DB key: {err}"
+                )))
+            }
         }
     }
 }
