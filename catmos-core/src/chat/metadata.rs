@@ -36,7 +36,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::HeaderValue;
 use reqwest::StatusCode;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
@@ -48,8 +48,7 @@ fn derive_key_id(public_key: &[u8]) -> String {
 }
 use catbird_mls::metadata::{self as mls_metadata, GroupMetadataV1, MetadataReference};
 
-use super::service::ChatService;
-use crate::auth::AuthMethod;
+use super::service::{validate_group_id_hex, ChatService};
 use crate::error::{CatmosError, Result};
 use crate::types::Conversation;
 
@@ -99,7 +98,26 @@ impl ChatService {
         convo_id: &str,
         group_id_hex: &str,
     ) -> Result<Option<DecryptedMetadata>> {
-        let group_id_bytes = hex::decode(group_id_hex)
+        let (stable_convo_id, resolved_group_id) = self.resolve_conversation_ids(convo_id).await?;
+        validate_group_id_hex(group_id_hex)?;
+        let group_id_hex = if group_id_hex == resolved_group_id {
+            resolved_group_id
+        } else if self
+            .db
+            .get_recovery_flags(&stable_convo_id)
+            .await?
+            .reset
+            .is_some_and(|reset| reset.new_group_id == group_id_hex)
+        {
+            // A Welcome/bootstrap target is authoritative before the durable
+            // current-group projection completes; it remains MLS-only.
+            group_id_hex.to_string()
+        } else {
+            return Err(CatmosError::Other(format!(
+                "stale group mapping for stable conversation {stable_convo_id}"
+            )));
+        };
+        let group_id_bytes = hex::decode(&group_id_hex)
             .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
 
         let info = match self
@@ -109,7 +127,7 @@ impl ChatService {
             Some(i) => i,
             None => {
                 debug!(
-                    convo = %&convo_id[..12.min(convo_id.len())],
+                    convo = %&stable_convo_id[..12.min(stable_convo_id.len())],
                     "bootstrap_group_metadata: no current metadata for group (group missing locally?)"
                 );
                 return Ok(None);
@@ -123,7 +141,7 @@ impl ChatService {
             Some(b) => b,
             None => {
                 debug!(
-                    convo = %&convo_id[..12.min(convo_id.len())],
+                    convo = %&stable_convo_id[..12.min(stable_convo_id.len())],
                     epoch = info.epoch,
                     "bootstrap_group_metadata: AppDataDictionary[0x8001] absent — no metadata to fetch"
                 );
@@ -140,10 +158,10 @@ impl ChatService {
 
         // Skip if we already hold this version. Saves a round-trip on the
         // common case of `fetch_conversations` repeatedly calling bootstrap.
-        if let Some(existing) = self.cached_metadata_version(convo_id).await {
+        if let Some(existing) = self.cached_metadata_version(&stable_convo_id).await {
             if existing >= reference.metadata_version as i64 {
                 debug!(
-                    convo = %&convo_id[..12.min(convo_id.len())],
+                    convo = %&stable_convo_id[..12.min(stable_convo_id.len())],
                     cached = existing,
                     fetched = reference.metadata_version,
                     "bootstrap_group_metadata: already at-or-ahead of fetched version, skipping"
@@ -162,7 +180,7 @@ impl ChatService {
             .get_group_metadata_blob(
                 Some(&reference.blob_locator),
                 None,
-                Some(group_id_hex),
+                Some(&group_id_hex),
                 None,
                 None,
                 Some(KIND_METADATA),
@@ -172,7 +190,7 @@ impl ChatService {
             Ok(Some(b)) => b,
             Ok(None) => {
                 debug!(
-                    convo = %&convo_id[..12.min(convo_id.len())],
+                    convo = %&stable_convo_id[..12.min(stable_convo_id.len())],
                     locator = %reference.blob_locator,
                     "bootstrap_group_metadata: server returned BlobNotFound for metadata locator (transient)"
                 );
@@ -202,7 +220,7 @@ impl ChatService {
                 .get_group_metadata_blob(
                     Some(loc),
                     None,
-                    Some(group_id_hex),
+                    Some(&group_id_hex),
                     None,
                     None,
                     Some(KIND_AVATAR),
@@ -223,7 +241,7 @@ impl ChatService {
                     ),
                     Err(e) => {
                         warn!(
-                            convo = %&convo_id[..12.min(convo_id.len())],
+                            convo = %&stable_convo_id[..12.min(stable_convo_id.len())],
                             locator = %loc,
                             error = %e,
                             "bootstrap_group_metadata: decrypt_avatar_blob failed (non-fatal)"
@@ -234,7 +252,7 @@ impl ChatService {
                 Ok(None) => (None, Some(loc.clone()), payload.avatar_content_type.clone()),
                 Err(e) => {
                     warn!(
-                        convo = %&convo_id[..12.min(convo_id.len())],
+                        convo = %&stable_convo_id[..12.min(stable_convo_id.len())],
                         locator = %loc,
                         error = %e,
                         "bootstrap_group_metadata: avatar fetch failed (non-fatal)"
@@ -259,7 +277,7 @@ impl ChatService {
         if let Err(e) = self
             .db
             .update_decrypted_metadata(
-                convo_id,
+                &stable_convo_id,
                 title.as_deref(),
                 description.as_deref(),
                 Some(reference.metadata_version as i64),
@@ -271,7 +289,7 @@ impl ChatService {
             .await
         {
             warn!(
-                convo = %&convo_id[..12.min(convo_id.len())],
+                convo = %&stable_convo_id[..12.min(stable_convo_id.len())],
                 error = %e,
                 "bootstrap_group_metadata: update_decrypted_metadata failed"
             );
@@ -281,7 +299,7 @@ impl ChatService {
         // Write through to the in-memory cache so the next render sees the
         // change without waiting for the next `fetch_conversations` cycle.
         self.merge_decrypted_metadata_into_cache(
-            convo_id,
+            &stable_convo_id,
             title.clone(),
             description.clone(),
             Some(reference.metadata_version as i64),
@@ -293,7 +311,7 @@ impl ChatService {
         .await;
 
         info!(
-            convo = %&convo_id[..12.min(convo_id.len())],
+            convo = %&stable_convo_id[..12.min(stable_convo_id.len())],
             version = reference.metadata_version,
             has_avatar = avatar_bytes.is_some(),
             "bootstrap_group_metadata: persisted decrypted metadata"
@@ -325,11 +343,17 @@ impl ChatService {
         new_group_id_bytes: &[u8],
         reset_generation: i64,
     ) -> Result<(Option<String>, Option<i64>)> {
+        let (stable_convo_id, _) = self.resolve_conversation_ids(convo_id).await?;
+        if new_group_id_bytes.is_empty() {
+            return Err(CatmosError::Other(
+                "republish_metadata_after_reset: new group ID is empty".to_string(),
+            ));
+        }
         // Read pre-reset metadata from local cache (or DB fallback). After
         // the reset, this is the only authoritative source — the server's
         // pre-reset blob lives in the old group's epoch and key, useless to
         // joiners of the new group.
-        let convo = match self.find_local_conversation(convo_id).await {
+        let convo = match self.find_local_conversation(&stable_convo_id).await {
             Some(c) => c,
             None => {
                 debug!(
@@ -354,6 +378,7 @@ impl ChatService {
         }
 
         let group_id_hex = hex::encode(new_group_id_bytes);
+        validate_group_id_hex(&group_id_hex)?;
 
         // Derive the metadata key against the NEW group at its current
         // epoch. The new group must already exist locally — caller is
@@ -424,7 +449,7 @@ impl ChatService {
 
         self.put_group_metadata_blob(
             &metadata_locator,
-            Some(convo_id),
+            Some(&stable_convo_id),
             &group_id_hex,
             Some(KIND_METADATA),
             Some(next_version),
@@ -456,7 +481,7 @@ impl ChatService {
             } else if let Err(e) = self
                 .put_group_metadata_blob(
                     locator,
-                    Some(convo_id),
+                    Some(&stable_convo_id),
                     &group_id_hex,
                     Some(KIND_AVATAR),
                     Some(next_version),
@@ -477,7 +502,7 @@ impl ChatService {
         if let Err(e) = self
             .db
             .update_decrypted_metadata(
-                convo_id,
+                &stable_convo_id,
                 if title.is_empty() { None } else { Some(&title) },
                 if description.is_empty() {
                     None
@@ -613,8 +638,9 @@ impl ChatService {
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
         let body_bytes = if self.should_retry_after_refresh(status, &body_bytes) {
-            let new_bearer = self.refresh_bearer().await?;
-            let (url, headers) = self.metadata_blob_request(NSID, &new_bearer)?;
+            self.refresh_bearer().await?;
+            let new_bearer = self.get_service_token(NSID).await?;
+            let (url, headers) = self.build_request(NSID, &new_bearer)?;
             let retry_resp = self
                 .http
                 .get(&url)
@@ -674,6 +700,7 @@ impl ChatService {
         body: Vec<u8>,
     ) -> Result<String> {
         let _ = (metadata_version, reset_generation);
+        validate_group_id_hex(group_id)?;
         let actor_device_id = self.actor_device_id().await?;
         let user_did = self.did().to_string();
         let mls_did = format!("{user_did}#{actor_device_id}");
@@ -692,7 +719,8 @@ impl ChatService {
         let ciphertext_sha256 = Sha256::digest(&body);
         let ciphertext_size = body.len() as i64;
 
-        let group_id_bytes = hex::decode(group_id).unwrap_or_default();
+        let group_id_bytes = hex::decode(group_id)
+            .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
         let current_epoch = self
             .mls
             .with_context(|ctx| ctx.get_epoch(group_id_bytes.clone()))
@@ -768,18 +796,22 @@ impl ChatService {
         let prepared = catbird_mls::orchestrator::canonical_transport::prepare_signed_request_with(
             &binding,
             catbird_mls::orchestrator::CanonicalOperation::PrepareBlobUpload,
-            serde_json::to_vec(&prep_body).map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?,
+            serde_json::to_vec(&prep_body)
+                .map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?,
             |transcript| {
-                self.mls.with_context(|ctx| {
-                    ctx.sign_with_identity_key(mls_did.clone(), transcript.to_vec())
-                })
-                .map_err(|_| catbird_mls::orchestrator::TransportError::Signing)
+                self.mls
+                    .with_context(|ctx| {
+                        ctx.sign_with_identity_key(mls_did.clone(), transcript.to_vec())
+                    })
+                    .map_err(|_| catbird_mls::orchestrator::TransportError::Signing)
             },
         )
         .map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?;
 
         let prepared_bytes = prepared.body.ok_or_else(|| {
-            CatmosError::Mls(catbird_mls::MLSError::Internal("prepared blob body missing".into()))
+            CatmosError::Mls(catbird_mls::MLSError::Internal(
+                "prepared blob body missing".into(),
+            ))
         })?;
 
         let prep_resp: serde_json::Value = self
@@ -828,8 +860,10 @@ impl ChatService {
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
         if self.should_retry_after_refresh(status, &body_bytes) {
-            let new_bearer = self.refresh_bearer().await?;
-            let fresh_bearer = self.get_service_token(UPLOAD_NSID).await.unwrap_or(new_bearer);
+            self.refresh_bearer().await?;
+            let fresh_bearer = self
+                .get_service_token(UPLOAD_NSID)
+                .await?;
             let (url, mut headers) = self.build_request(UPLOAD_NSID, &fresh_bearer)?;
             headers.insert(
                 reqwest::header::CONTENT_TYPE,
@@ -861,31 +895,4 @@ impl ChatService {
         Ok(returned_blob_id)
     }
 
-    /// Build URL + auth headers for the metadata-blob endpoints.
-    fn metadata_blob_request(&self, nsid: &str, bearer: &str) -> Result<(String, HeaderMap)> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {bearer}"))
-                .map_err(|e| CatmosError::AuthFailed(e.to_string()))?,
-        );
-
-        let url = match &self.auth {
-            AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
-            AuthMethod::AppPassword { pds_url, .. } => {
-                if nsid.starts_with("blue.catbird.chat.") || nsid.starts_with("blue.catbird.mlsChat.") {
-                    let proxy_val = crate::mls::atproto_proxy_header_value();
-                    if let Ok(hv) = HeaderValue::from_str(&proxy_val) {
-                        headers.insert(
-                            reqwest::header::HeaderName::from_static("atproto-proxy"),
-                            hv,
-                        );
-                    }
-                }
-                format!("{}/xrpc/{nsid}", pds_url.trim_end_matches('/'))
-            }
-        };
-
-        Ok((url, headers))
-    }
 }

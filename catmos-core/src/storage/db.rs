@@ -204,6 +204,20 @@ impl Database {
                 "CREATE INDEX IF NOT EXISTS idx_messages_convo_seq ON messages(convo_id, seq)",
             ),
             (
+                "conversation_group_aliases",
+                "CREATE TABLE IF NOT EXISTS conversation_group_aliases (
+                conversation_id TEXT NOT NULL,
+                group_id       TEXT NOT NULL,
+                first_seen_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                PRIMARY KEY (conversation_id, group_id)
+            )",
+            ),
+            (
+                "idx_conversation_group_aliases_group",
+                "CREATE INDEX IF NOT EXISTS idx_conversation_group_aliases_group
+                 ON conversation_group_aliases(group_id)",
+            ),
+            (
                 "session",
                 "CREATE TABLE IF NOT EXISTS session (
                 key   TEXT PRIMARY KEY,
@@ -213,7 +227,7 @@ impl Database {
         ];
 
         for (name, sql) in &statements {
-            sqlx::query(sql)
+            sqlx::query(sqlx::AssertSqlSafe(*sql))
                 .execute(&self.pool)
                 .await
                 .map_err(|e| CatmosError::Storage(format!("Migration '{name}' failed: {e}")))?;
@@ -266,7 +280,7 @@ impl Database {
                 continue;
             }
             let stmt = format!("ALTER TABLE conversations ADD COLUMN {col} {decl}");
-            sqlx::query(&stmt)
+            sqlx::query(sqlx::AssertSqlSafe(stmt))
                 .execute(&self.pool)
                 .await
                 .map_err(|e| CatmosError::Storage(format!("Add column '{col}' failed: {e}")))?;
@@ -309,7 +323,7 @@ impl Database {
                 continue;
             }
             let stmt = format!("ALTER TABLE messages ADD COLUMN {col} {decl}");
-            sqlx::query(&stmt).execute(&self.pool).await.map_err(|e| {
+            sqlx::query(sqlx::AssertSqlSafe(stmt)).execute(&self.pool).await.map_err(|e| {
                 CatmosError::Storage(format!("Add messages column '{col}' failed: {e}"))
             })?;
         }
@@ -372,6 +386,57 @@ impl Database {
         Ok(())
     }
 
+    /// Commit related credentials together so interruption cannot split a
+    /// rotated access/refresh pair. Unrelated session/device rows are retained.
+    pub(crate) async fn store_session_values(&self, values: &[(&str, &str)]) -> Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        for (key, value) in values {
+            sqlx::query("INSERT OR REPLACE INTO session (key, value) VALUES (?1, ?2)")
+                .bind(key).bind(value).execute(&mut *transaction).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// A completed refresh may race a newer login or another process. Compare
+    /// the complete auth snapshot under a short writer transaction before
+    /// publishing the new pair. No network work occurs while this lock is held.
+    pub(crate) async fn compare_and_store_session_values(
+        &self,
+        expected: &std::collections::HashMap<String, String>,
+        values: &[(&str, &str)],
+    ) -> Result<bool> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        for (key, _) in values {
+            let current: Option<String> = sqlx::query_scalar("SELECT value FROM session WHERE key = ?1")
+                .bind(key).fetch_optional(&mut *transaction).await?;
+            if current.as_ref() != expected.get(*key) {
+                transaction.rollback().await?;
+                return Ok(false);
+            }
+        }
+        for (key, value) in values {
+            sqlx::query("INSERT OR REPLACE INTO session (key, value) VALUES (?1, ?2)")
+                .bind(key).bind(value).execute(&mut *transaction).await?;
+        }
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    /// Read a consistent snapshot even if another process replaces auth while
+    /// this process is restoring its session.
+    pub(crate) async fn get_session_values(&self, keys: &[&str]) -> Result<std::collections::HashMap<String, String>> {
+        let mut transaction = self.pool.begin().await?;
+        let mut values = std::collections::HashMap::new();
+        for key in keys {
+            let value: Option<String> = sqlx::query_scalar("SELECT value FROM session WHERE key = ?1")
+                .bind(key).fetch_optional(&mut *transaction).await?;
+            if let Some(value) = value { values.insert((*key).to_string(), value); }
+        }
+        transaction.commit().await?;
+        Ok(values)
+    }
+
     pub async fn get_session_value(&self, key: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM session WHERE key = ?1")
             .bind(key)
@@ -407,6 +472,93 @@ impl Database {
 
     // ── Conversations ────────────────────────────────────────────────────
 
+    /// Remember a group ID under its stable conversation owner. Historical
+    /// message rows remain keyed by this source group because field-level
+    /// encryption/HMAC bind the exact stored conversation ID.
+    pub async fn record_conversation_group_alias(
+        &self,
+        conversation_id: &str,
+        group_id: &str,
+    ) -> Result<()> {
+        if conversation_id.is_empty() || group_id.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO conversation_group_aliases
+             (conversation_id, group_id) VALUES (?1, ?2)",
+        )
+        .bind(conversation_id)
+        .bind(group_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return every current and historical group source owned by a stable
+    /// conversation, in no particular order. Callers must decrypt each
+    /// bucket using its returned source ID before normalizing for display.
+    pub async fn list_conversation_group_ids(&self, conversation_id: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT group_id FROM conversations WHERE conversation_id = ?1
+             UNION
+             SELECT group_id FROM conversation_group_aliases WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let group_ids: Vec<String> = rows.iter().map(|row| row.get("group_id")).collect();
+        for group_id in &group_ids {
+            let owners = self.find_conversation_ids_by_group_id(group_id).await?;
+            let owner_ids: std::collections::HashSet<&str> =
+                owners.iter().map(|(owner, _)| owner.as_str()).collect();
+            if owner_ids.len() > 1
+                || owner_ids
+                    .iter()
+                    .next()
+                    .is_some_and(|owner| *owner != conversation_id)
+            {
+                return Err(CatmosError::Storage(format!(
+                    "historical MLS group {group_id} has ambiguous ownership"
+                )));
+            }
+        }
+        Ok(group_ids)
+    }
+
+    /// Find stable owners for a legacy/current group source. The caller must
+    /// reject more than one owner as an ambiguity rather than guessing.
+    pub async fn find_conversation_ids_by_group_id(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT conversation_id, group_id FROM conversations WHERE group_id = ?1
+             UNION
+             SELECT conversation_id, group_id FROM conversation_group_aliases WHERE group_id = ?1",
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let all: std::collections::HashSet<(String, String)> = rows
+            .iter()
+            .map(|row| (row.get("conversation_id"), row.get("group_id")))
+            .collect();
+        // Legacy source rows can use the group ID as their conversation ID.
+        // If a stable owner also claims that source, expose the non-self
+        // owner(s) for ambiguity checking instead of counting the spelling
+        // twice as two conversations.
+        let canonical: std::collections::HashSet<(String, String)> = all
+            .iter()
+            .filter(|(conversation_id, _)| conversation_id != group_id)
+            .cloned()
+            .collect();
+        Ok(if canonical.is_empty() {
+            all.into_iter().collect()
+        } else {
+            canonical.into_iter().collect()
+        })
+    }
+
     pub async fn store_conversation(&self, convo: &Conversation) -> Result<()> {
         // Hydration-order safety (post-MLS-metadata-cutover):
         // After the cutover the server returns no plaintext title/description,
@@ -419,9 +571,21 @@ impl Database {
         // metadata_version, metadata_blob_locator, avatar_*) so that
         // server-driven refreshes never overwrite local-only state with NULL.
         //
-        // Server-authoritative columns (group_id, creator, epoch, members
+        // Server-authoritative columns (group_id, epoch, members
         // table, etc.) still take the new value unconditionally — those move
         // forward on every refresh and must reflect the server's view.
+        let previous_group_id: Option<String> =
+            sqlx::query_scalar("SELECT group_id FROM conversations WHERE conversation_id = ?1")
+                .bind(&convo.conversation_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        if let Some(previous_group_id) = previous_group_id {
+            self.record_conversation_group_alias(&convo.conversation_id, &previous_group_id)
+                .await?;
+        }
+        self.record_conversation_group_alias(&convo.conversation_id, &convo.group_id)
+            .await?;
+
         sqlx::query(
             "INSERT INTO conversations
              (conversation_id, group_id, name, description, creator, epoch,
@@ -434,10 +598,10 @@ impl Database {
                  group_id        = excluded.group_id,
                  name            = COALESCE(excluded.name,            conversations.name),
                  description     = COALESCE(excluded.description,     conversations.description),
-                 creator         = excluded.creator,
+                 creator         = COALESCE(NULLIF(excluded.creator, ''), conversations.creator),
                  epoch           = excluded.epoch,
                  cipher_suite    = excluded.cipher_suite,
-                 created_at      = excluded.created_at,
+                 created_at      = COALESCE(NULLIF(excluded.created_at, ''), conversations.created_at),
                  last_message_at = excluded.last_message_at,
                  unread_count    = excluded.unread_count,
                  alias           = COALESCE(excluded.alias,           conversations.alias),
@@ -451,10 +615,10 @@ impl Database {
         .bind(&convo.group_id)
         .bind(&convo.name)
         .bind(&convo.description)
-        .bind(&convo.creator)
+        .bind(convo.creator.as_deref().unwrap_or_default())
         .bind(convo.epoch as i64)
         .bind(&convo.cipher_suite)
-        .bind(convo.created_at.to_rfc3339())
+        .bind(convo.created_at.map(|value| value.to_rfc3339()).unwrap_or_default())
         .bind(convo.last_message_at.map(|t| t.to_rfc3339()))
         .bind(convo.unread_count as i32)
         .bind(&convo.alias)
@@ -502,20 +666,19 @@ impl Database {
         let convos = rows
             .iter()
             .map(|row| {
-                let created_str: String = row.get("created_at");
                 let last_msg_str: Option<String> = row.get("last_message_at");
                 Conversation {
                     conversation_id: row.get("conversation_id"),
                     group_id: row.get("group_id"),
                     name: row.get("name"),
                     description: row.get("description"),
-                    creator: row.get("creator"),
+                    // Historical rows may contain inventory-generated guesses.
+                    // Keep their bytes, but do not promote them as evidence.
+                    creator: None,
                     epoch: row.get::<i64, _>("epoch") as u64,
                     cipher_suite: row.get("cipher_suite"),
                     members: vec![], // loaded separately
-                    created_at: DateTime::parse_from_rfc3339(&created_str)
-                        .unwrap_or_default()
-                        .with_timezone(&Utc),
+                    created_at: None,
                     last_message_at: last_msg_str.and_then(|s| {
                         DateTime::parse_from_rfc3339(&s)
                             .ok()
@@ -729,39 +892,29 @@ impl Database {
         limit: u32,
         before_seq: Option<u64>,
     ) -> Result<Vec<Message>> {
-        let rows = if let Some(seq) = before_seq {
-            sqlx::query(
-                "SELECT id, convo_id, sender_did, content_type, content_json, epoch, seq, created_at,
-                        payload_encrypted
-                 FROM messages WHERE convo_id = ?1 AND seq < ?2
-                   AND COALESCE(is_tombstone, 0) = 0
-                 ORDER BY seq DESC LIMIT ?3",
-            )
-            .bind(convo_id)
-            .bind(seq as i64)
-            .bind(limit as i32)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query(
-                "SELECT id, convo_id, sender_did, content_type, content_json, epoch, seq, created_at,
-                        payload_encrypted
-                 FROM messages WHERE convo_id = ?1
-                   AND COALESCE(is_tombstone, 0) = 0
-                 ORDER BY seq DESC LIMIT ?2",
-            )
-            .bind(convo_id)
-            .bind(limit as i32)
-            .fetch_all(&self.pool)
-            .await?
-        };
-
+        // Fetch the complete source bucket before applying the page boundary:
+        // entry HMACs chain across rows, so verifying a suffix as if it were a
+        // new chain would reject a valid page or miss a tampered predecessor.
+        let rows = sqlx::query(
+            "SELECT id, convo_id, sender_did, content_type, content_json, epoch, seq, created_at,
+                    payload_encrypted, entry_hmac, is_tombstone
+             FROM messages WHERE convo_id = ?1
+             ORDER BY seq ASC",
+        )
+        .bind(convo_id)
+        .fetch_all(&self.pool)
+        .await?;
         let root = self.content_root_key_snapshot();
+        verify_message_bucket(&rows, root.as_deref(), convo_id)?;
         let mut messages: Vec<Message> = rows
             .iter()
+            .filter(|row| before_seq.map_or(true, |seq| row.get::<i64, _>("seq") < seq as i64))
+            .filter(|row| row.get::<i64, _>("is_tombstone") == 0)
             .map(|r| map_message_row(r, root.as_deref()))
             .collect();
-        messages.reverse(); // return in chronological order
+        if messages.len() > limit as usize {
+            messages.drain(..messages.len() - limit as usize);
+        }
         Ok(messages)
     }
 
@@ -1066,6 +1219,12 @@ impl Database {
     ) -> Result<bool> {
         let landed_epoch = i64::try_from(landed_epoch)
             .map_err(|_| CatmosError::Storage("landed reset epoch exceeds SQLite range".into()))?;
+        let mut tx = self.pool.begin().await?;
+        let previous_group_id: Option<String> =
+            sqlx::query_scalar("SELECT group_id FROM conversations WHERE conversation_id = ?1")
+                .bind(convo_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let result = sqlx::query(
             "UPDATE conversations
              SET group_id = ?1,
@@ -1084,8 +1243,29 @@ impl Database {
         .bind(convo_id)
         .bind(expected_generation)
         .bind(landed_epoch)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if result.rows_affected() == 1 {
+            if let Some(previous_group_id) = previous_group_id {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO conversation_group_aliases
+                     (conversation_id, group_id) VALUES (?1, ?2)",
+                )
+                .bind(convo_id)
+                .bind(previous_group_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT OR IGNORE INTO conversation_group_aliases
+                 (conversation_id, group_id) VALUES (?1, ?2)",
+            )
+            .bind(convo_id)
+            .bind(expected_new_target)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1131,11 +1311,11 @@ mod reset_pending_tests {
             group_id: group_id.to_string(),
             name: None,
             description: None,
-            creator: String::new(),
+            creator: Some(String::new()),
             epoch: 0,
             cipher_suite: String::new(),
             members: vec![],
-            created_at: Utc::now(),
+            created_at: Some(Utc::now()),
             last_message_at: None,
             unread_count: 0,
             alias: None,
@@ -1197,12 +1377,38 @@ mod reset_pending_tests {
             post, new_group_id,
             "exact completion must project the verified reset target"
         );
+        let mut sources = db.list_conversation_group_ids(convo_id).await.unwrap();
+        sources.sort();
+        let mut expected_sources = vec![old_group_id.to_string(), new_group_id.to_string()];
+        expected_sources.sort();
+        assert_eq!(sources, expected_sources);
         assert!(db
             .get_recovery_flags(convo_id)
             .await
             .unwrap()
             .reset
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn stable_group_source_reads_reject_multiple_historical_owners() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("aliases-ownership.db");
+        let db = Database::open_unencrypted(&path).await.unwrap();
+        db.store_conversation(&fixture_convo("owner-a", "group-a"))
+            .await
+            .unwrap();
+        db.store_conversation(&fixture_convo("owner-b", "group-b"))
+            .await
+            .unwrap();
+        db.record_conversation_group_alias("owner-b", "group-a")
+            .await
+            .unwrap();
+
+        assert!(
+            db.list_conversation_group_ids("owner-a").await.is_err(),
+            "stable source reads must fail closed on historical ownership collision"
+        );
     }
 
     #[tokio::test]
@@ -1753,6 +1959,57 @@ fn deserialize_content(content_type: &str, content_json: &str) -> MessageContent
         "system" => MessageContent::System(content_json.to_string()),
         _ => MessageContent::Unknown,
     }
+}
+
+/// Verify one source bucket using its original stored conversation ID. The
+/// HMAC chain is intentionally walked before any UI-facing normalization, so
+/// a stable-ID projection cannot make an old group-keyed row unverifiable.
+fn verify_message_bucket(
+    rows: &[sqlx::sqlite::SqliteRow],
+    root_key: Option<&[u8]>,
+    convo_id: &str,
+) -> Result<()> {
+    let Some(root_key) = root_key else {
+        return Ok(());
+    };
+
+    let mut previous_hmac: Option<Vec<u8>> = None;
+    for row in rows {
+        let payload: Option<Vec<u8>> = row.get("payload_encrypted");
+        let stored_hmac: Option<Vec<u8>> = row.get("entry_hmac");
+        let Some(payload) = payload.filter(|payload| !payload.is_empty()) else {
+            if stored_hmac.is_some() {
+                return Err(CatmosError::Storage(format!(
+                    "message HMAC exists without encrypted payload in bucket {convo_id}"
+                )));
+            }
+            continue;
+        };
+        let Some(stored_hmac) = stored_hmac else {
+            return Err(CatmosError::Storage(format!(
+                "encrypted message is missing HMAC in bucket {convo_id}"
+            )));
+        };
+        let message_id: String = row.get("id");
+        let valid = catbird_mls::field_encryption::verify_entry_hmac(
+            root_key,
+            convo_id,
+            previous_hmac.as_deref(),
+            &message_id,
+            &payload,
+            &stored_hmac,
+        )
+        .map_err(|error| {
+            CatmosError::Storage(format!("message HMAC verification failed: {error}"))
+        })?;
+        if !valid {
+            return Err(CatmosError::Storage(format!(
+                "message HMAC mismatch in bucket {convo_id} for {message_id}"
+            )));
+        }
+        previous_hmac = Some(stored_hmac);
+    }
+    Ok(())
 }
 
 fn map_message_row(row: &sqlx::sqlite::SqliteRow, root_key: Option<&[u8]>) -> Message {

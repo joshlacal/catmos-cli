@@ -1,6 +1,8 @@
 pub mod blocks;
 pub mod canonical;
 pub mod canonical_adapter;
+pub(crate) mod entries;
+mod device_records;
 pub mod messages;
 pub mod metadata;
 pub mod recovery_ops;

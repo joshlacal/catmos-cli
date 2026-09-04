@@ -123,8 +123,8 @@ pub fn get_or_create_db_key(did: &str) -> Result<String> {
     if std::env::var_os("CATMOS_TEST_KEYCHAIN_FALLBACK").is_some() {
         return Ok(derive_key_from_did(did));
     }
-    let service = "catmos-mls-db";
-    let entry = keyring::Entry::new(service, did);
+    let service = crate::storage::config::Config::keychain_service("catmos-mls-db");
+    let entry = keyring::Entry::new(&service, did);
 
     match entry {
         Ok(e) => {
@@ -213,7 +213,9 @@ impl MlsManager {
 
         let encryption_key = get_or_create_db_key(did)?;
 
-        let keychain = Box::new(SystemKeychain::new(format!("catmos-mls-{did_hash}")));
+        let keychain = Box::new(SystemKeychain::new(
+            crate::storage::config::Config::keychain_service(&format!("catmos-mls-{did_hash}")),
+        ));
 
         let storage_path = db_path
             .to_str()

@@ -8,7 +8,7 @@ catbird-mls = { workspace = true }
 catbird-atproto = { workspace = true }
 jacquard = { workspace = true }
 jacquard-common = { workspace = true }
-jacquard-identity = "0.9"
+jacquard-identity = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
 url = "2"
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -17,8 +17,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
-libsqlite3-sys = { version = "0.30", features = ["bundled-sqlcipher"], default-features = false }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate"] }
+libsqlite3-sys = { version = "0.35", features = ["bundled-sqlcipher"], default-features = false }
 keyring = { version = "3", features = ["apple-native", "linux-native"] }
 toml = "0.8"
 dirs = "6"
@@ -30,7 +30,7 @@ serde_ipld_dagcbor = "0.6"
 ulid = { workspace = true }
 sha2 = "0.10"
 reqwest = { version = "0.12", features = ["json"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 axum = "0.8"
 open = "5"
 async-trait = "0.1"

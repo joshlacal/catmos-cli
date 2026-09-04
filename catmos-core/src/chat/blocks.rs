@@ -47,7 +47,7 @@ struct ListRecordEntry {
 impl ChatService {
     /// Base URL for `com.atproto.repo.*` calls (user's PDS for AppPassword,
     /// nest proxy for OAuth).
-    fn atproto_repo_base(&self) -> Result<String> {
+    pub(crate) fn atproto_repo_base(&self) -> Result<String> {
         match &self.auth {
             AuthMethod::OAuth { nest_url, .. } => Ok(nest_url.trim_end_matches('/').to_string()),
             AuthMethod::AppPassword { pds_url, .. } => {
@@ -56,7 +56,7 @@ impl ChatService {
         }
     }
 
-    fn bearer_headers(&self, bearer: &str) -> Result<HeaderMap> {
+    pub(crate) fn bearer_headers(&self, bearer: &str) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
@@ -136,6 +136,113 @@ impl ChatService {
         let parsed: CreateRecordResp = serde_json::from_slice(&body_bytes)
             .map_err(|e| CatmosError::Xrpc(format!("createRecord parse: {e}")))?;
         Ok(parsed.uri)
+    }
+
+    /// Verify account routing before creating a conversation. Device enrollment
+    /// alone does not make the account discoverable to other participants.
+    pub async fn require_chat_declaration(&self, delivery_service: &str) -> Result<()> {
+        let declaration = self.read_chat_declaration().await?.ok_or_else(|| {
+            CatmosError::Other(
+                "Secure chat setup is incomplete. Run `catmos device register` with this profile to publish your delivery service before creating a conversation.".into(),
+            )
+        })?;
+        validate_chat_declaration(&declaration, delivery_service)
+    }
+
+    /// Finish explicit enrollment without changing an existing incoming-message
+    /// policy or moving the account away from its configured delivery service.
+    pub async fn ensure_chat_declaration(&self, delivery_service: &str) -> Result<()> {
+        match self.read_chat_declaration().await? {
+            Some(declaration) => {
+                validate_chat_declaration(&declaration, delivery_service)?;
+                if declaration.get("allowIncoming").and_then(|value| value.as_str()) == Some("none") {
+                    return Err(CatmosError::Other(
+                        "This account has incoming secure chats disabled. Your preference was preserved; enable incoming chats in account settings when you want to receive invitations.".into(),
+                    ));
+                }
+                Ok(())
+            },
+            None => self.publish_chat_declaration(delivery_service).await,
+        }
+    }
+
+    async fn read_chat_declaration(&self) -> Result<Option<serde_json::Value>> {
+        let base = self.atproto_repo_base()?;
+        let url = format!("{base}/xrpc/com.atproto.repo.getRecord");
+        let response = self.http.get(url)
+            .headers(self.bearer_headers(&self.current_bearer().await?)?)
+            .query(&[("repo", self.did()), ("collection", "blue.catbird.chat.declaration"), ("rkey", "self")])
+            .send().await.map_err(|error| CatmosError::Network(error.to_string()))?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await
+            .map_err(|error| CatmosError::Xrpc(format!("Could not read secure chat declaration: {error}")))?;
+        if !status.is_success() {
+            if body.get("error").and_then(|value| value.as_str()) == Some("RecordNotFound") {
+                return Ok(None);
+            }
+            return Err(CatmosError::Xrpc(format!("Could not verify secure chat setup ({status}); please retry or log in again")));
+        }
+        body.get("value").cloned().map(Some)
+            .ok_or_else(|| CatmosError::Xrpc("Secure chat declaration response omitted its record".into()))
+    }
+
+    /// Publish (or overwrite) the `blue.catbird.chat.declaration` `self`
+    /// record naming `delivery_service` as this actor's chat DS. Without it,
+    /// other participants' `createConversation` cannot route to us and the
+    /// server rejects them.
+    pub async fn publish_chat_declaration(&self, delivery_service: &str) -> Result<()> {
+        const COLLECTION: &str = "blue.catbird.chat.declaration";
+        let base = self.atproto_repo_base()?;
+        let url = format!("{base}/xrpc/com.atproto.repo.putRecord");
+        let body = serde_json::json!({
+            "repo": self.did(),
+            "collection": COLLECTION,
+            "rkey": "self",
+            "record": {
+                "$type": COLLECTION,
+                "allowIncoming": "all",
+                "deliveryService": delivery_service,
+                "protocolVersion": "1",
+                "createdAt": chrono::Utc::now().to_rfc3339(),
+            }
+        });
+        let send = |bearer: String| {
+            let http = self.http.clone();
+            let url = url.clone();
+            let body = body.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {bearer}"))
+                        .map_err(|e| CatmosError::AuthFailed(e.to_string()))?,
+                );
+                let resp = http
+                    .post(&url)
+                    .headers(headers)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| CatmosError::Network(e.to_string()))?;
+                let status = resp.status();
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| CatmosError::Network(e.to_string()))?;
+                Ok::<_, CatmosError>((status, bytes))
+            }
+        };
+        let (mut status, mut bytes) = send(self.current_bearer().await?).await?;
+        if self.should_retry_after_refresh(status, &bytes) {
+            (status, bytes) = send(self.refresh_bearer().await?).await?;
+        }
+        if !status.is_success() {
+            return Err(CatmosError::Xrpc(format!(
+                "putRecord({COLLECTION}) returned {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        Ok(())
     }
 
     /// Delete all `app.bsky.graph.block` records whose subject is `subject_did`.
@@ -325,5 +432,34 @@ impl ChatService {
             )));
         }
         Ok(())
+    }
+}
+
+fn validate_chat_declaration(record: &serde_json::Value, expected_service: &str) -> Result<()> {
+    if record.get("deliveryService").and_then(|value| value.as_str()) != Some(expected_service) {
+        return Err(CatmosError::Other(
+            "This account uses a different secure chat delivery service. Update this profile's server configuration to match your existing account.".into(),
+        ));
+    }
+    if record.get("protocolVersion").and_then(|value| value.as_str()) != Some("1") {
+        return Err(CatmosError::Other("This account's secure chat protocol version is unsupported. Update the client before enrolling.".into()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod chat_declaration_tests {
+    use super::*;
+
+    #[test]
+    fn enrollment_preserves_incoming_consent_and_rejects_implicit_service_moves() {
+        for policy in ["all", "none", "following"] {
+            let declaration = serde_json::json!({
+                "deliveryService": "did:web:chat.catbird.blue", "protocolVersion": "1", "allowIncoming": policy,
+            });
+            assert!(validate_chat_declaration(&declaration, "did:web:chat.catbird.blue").is_ok());
+            assert!(validate_chat_declaration(&declaration, "did:web:another.example").is_err());
+            assert_eq!(declaration["allowIncoming"], policy);
+        }
     }
 }

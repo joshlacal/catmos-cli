@@ -1,4 +1,7 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static SKIP_STARTUP_SYNC: AtomicBool = AtomicBool::new(false);
 
 use clap::Parser;
 use tokio::sync::RwLock;
@@ -21,6 +24,12 @@ use catmos_core::types::MessageContent;
 #[derive(Parser)]
 #[command(name = "catmos", about = "MLS group chat in your terminal")]
 struct Cli {
+    /// Isolated local device profile (also CATMOS_PROFILE); never reuses another profile's keys
+    #[arg(long, global = true)]
+    profile: Option<String>,
+    /// Skip automatic recovery of unrelated conversations before a CLI command
+    #[arg(long, global = true)]
+    no_startup_sync: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -138,6 +147,8 @@ enum ConvoCommands {
         #[arg(long)]
         group_context_hash: Option<String>,
     },
+    /// Fulfill a pending device admission or recovery for one conversation
+    #[command(alias = "fulfill-recovery")]
     Fulfill {
         convo: String,
         #[arg(long)]
@@ -151,23 +162,21 @@ enum ConvoCommands {
         #[arg(long)]
         key_package_ref_base64: Option<String>,
     },
+    /// Finish one member's pending group leave using this device's MLS state
+    FulfillLeave {
+        convo: String,
+    },
+    /// Verify terminal access for one exact conversation ID and show durable state
+    ReconcileAccess {
+        convo_id: String,
+    },
     JoinWelcome {
         convo: String,
     },
+    /// Re-admit this device after losing its MLS group: asks a live leaf to
+    /// re-add us, or resets the conversation when nobody can (admin only).
     RequestRecovery {
         convo: String,
-        #[arg(long)]
-        group_id: String,
-        #[arg(long)]
-        confirmation_tag: String,
-        #[arg(long)]
-        group_context_hash: String,
-        #[arg(long, default_value = "0")]
-        epoch: u64,
-        #[arg(long, default_value = "1")]
-        state_version: i64,
-        #[arg(long)]
-        kind: Option<String>,
     },
     Leave {
         convo: String,
@@ -223,6 +232,9 @@ enum DebugCommands {
     Epoch { convo: String },
     GroupState { convo: String },
     TreeHash { convo: String },
+    /// Fault injection: drop the local MLS group (simulates a reinstall) and
+    /// mark the conversation for rejoin.
+    WipeGroup { convo: String },
 }
 
 #[derive(clap::Subcommand)]
@@ -259,7 +271,7 @@ async fn init_service() -> anyhow::Result<Arc<ChatService>> {
     let restored = restore_saved_auth(&db, &did)
         .await?
         .ok_or_else(|| anyhow::anyhow!("No saved session found. Run `catmos login` first."))?;
-    info!("Restored validated session for {did}");
+    info!("Restored saved session for {did}");
     let auth = restored.auth;
     let token_session = restored.token_session;
 
@@ -308,16 +320,24 @@ async fn init_service() -> anyhow::Result<Arc<ChatService>> {
         catbird_mls::orchestrator::OrchestratorConfig::default(),
     ));
     service.set_orchestrator(orchestrator.clone()).await;
-    if let Err(e) = orchestrator.initialize(&did).await {
-        tracing::warn!("orchestrator initialization failed: {e}");
-    }
-    if let Err(e) = orchestrator.ensure_device_registered().await {
-        tracing::warn!("orchestrator ensure_device_registered failed: {e}");
+    orchestrator.initialize(&did).await
+        .map_err(|error| anyhow::anyhow!("MLS initialization failed: {error}"))?;
+    orchestrator.ensure_device_registered().await
+        .map_err(|error| anyhow::anyhow!("Device registration failed: {error}"))?;
+    service.ensure_device_record_published().await
+        .map_err(|error| anyhow::anyhow!("Device identity publication failed: {error}"))?;
+    // Canonical sync also handles invitation acceptance, device recovery, and
+    // fulfillment for other devices. Keep explicit recovery commands usable
+    // when one conversation needs further repair.
+    if !SKIP_STARTUP_SYNC.load(Ordering::Relaxed) {
+        if let Err(error) = orchestrator.sync_with_server(false).await {
+            tracing::warn!("Conversation synchronization incomplete: {error}");
+        }
     }
 
     // Fetch conversations and join any that lack local MLS state
     match service.fetch_conversations().await {
-        Ok(_convos) => {
+        Ok(_convos) if !SKIP_STARTUP_SYNC.load(Ordering::Relaxed) => {
             // Block reconciliation: leave any MLS group containing a
             // user from this account's own block list. Catches up on
             // blocks made from other clients (iOS, web, etc.) before
@@ -354,6 +374,7 @@ async fn init_service() -> anyhow::Result<Arc<ChatService>> {
                 }
             }
         }
+        Ok(_) => {}
         Err(e) => {
             tracing::warn!("Failed to fetch conversations: {e}");
         }
@@ -370,6 +391,12 @@ async fn open_account_db(did: &str) -> anyhow::Result<Database> {
     let db_key = catmos_core::mls::context::get_or_create_db_key(did)?;
     let db = Database::open(&db_path, &db_key).await?;
     Ok(db)
+}
+
+fn configured_delivery_service() -> anyhow::Result<String> {
+    let config = Config::load()?;
+    Ok(format!("did:web:{}", config.server.mls_url.trim_start_matches("https://")
+        .trim_start_matches("http://").trim_end_matches('/')))
 }
 
 // ── Command dispatch ────────────────────────────────────────────────────────
@@ -473,7 +500,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     "  {name}  members={} epoch={} id={}",
                     c.members.len(),
                     c.epoch,
-                    &c.group_id[..12.min(c.group_id.len())]
+                    &c.conversation_id
                 );
             }
         }
@@ -482,25 +509,23 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             let svc = init_service().await?;
             svc.fetch_conversations().await?;
             let convo_id = svc.resolve_convo(&convo).await?;
-            let messages: Vec<catmos_core::types::Message> = if let Some(orch) = svc.orchestrator().await {
-                if let Ok((orch_msgs, _)) = orch.fetch_messages(&convo_id, None, 50, None, None, None).await {
-                    orch_msgs.into_iter().map(|om| {
-                        catmos_core::types::Message {
-                            id: om.id,
-                            convo_id: om.conversation_id,
-                            sender_did: Some(om.sender_did),
-                            content: MessageContent::Text(om.text),
-                            epoch: om.epoch,
-                            seq: om.sequence_number,
-                            created_at: om.timestamp,
-                        }
-                    }).collect()
-                } else {
-                    svc.fetch_messages(&convo_id, 50).await.unwrap_or_default()
+            let orch_messages = svc.load_canonical_message_history(&convo_id, 50).await
+                .map_err(|error| anyhow::anyhow!("Could not load messages: {error}"))?;
+            use catbird_mls::orchestrator::types::ConversationState;
+            let terminal = matches!(svc.canonical_conversation_state(&convo_id).await?, Some(ConversationState::DeviceRemoved | ConversationState::Closed));
+            let own_device_id = svc.actor_device_id().await?;
+            let messages: Vec<catmos_core::types::Message> = orch_messages.into_iter().map(|message| {
+                let content = canonical_message_content(&message, svc.did(), &own_device_id, terminal);
+                catmos_core::types::Message {
+                    id: message.id,
+                    convo_id: message.conversation_id,
+                    sender_did: Some(message.sender_did),
+                    content,
+                    epoch: message.epoch,
+                    seq: message.sequence_number,
+                    created_at: message.timestamp,
                 }
-            } else {
-                svc.fetch_messages(&convo_id, 50).await?
-            };
+            }).collect();
             let handle_cache = svc.handle_cache().await;
             let my_did = svc.did().to_string();
 
@@ -540,6 +565,10 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                         .to_string()
                 };
                 let ts = m.created_at.format("%H:%M");
+                if let MessageContent::System(label) = &m.content {
+                    println!("[{ts}] ── {label} ──");
+                    continue;
+                }
                 let body = match &m.content {
                     MessageContent::Text(t) => t.clone(),
                     MessageContent::Reaction { emoji, .. } => format!("[reaction: {emoji}]"),
@@ -572,7 +601,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             let convos = svc.conversations().await;
             let convo_data = convos
                 .iter()
-                .find(|c| c.group_id == convo_id)
+                .find(|c| c.conversation_id == convo_id)
                 .ok_or_else(|| anyhow::anyhow!("Conversation not found after fetch"))?;
 
             if convo_data.members.is_empty() {
@@ -610,11 +639,12 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             } => {
                 let svc = init_service().await?;
                 let member_list = members.unwrap_or_default();
-                let orch = svc.orchestrator().await
-                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                let convo = orch.create_group(&name, Some(&member_list), description.as_deref()).await
+                let delivery_service = configured_delivery_service()?;
+                svc.require_chat_declaration(&delivery_service).await?;
+                anyhow::ensure!(svc.orchestrator().await.is_some(), "MLS orchestrator unavailable");
+                let convo = svc.create_conversation(&name, &member_list, description.as_deref()).await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                println!("Created conversation: {}", convo.group_id);
+                println!("Created conversation: {}", convo.conversation_id);
             }
 
             ConvoCommands::Leave { convo } => {
@@ -623,9 +653,15 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let convo_id = svc.resolve_convo(&convo).await?;
                 let orch = svc.orchestrator().await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                orch.leave_via_self_remove(&convo_id).await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                println!("Left conversation {convo}");
+                use catbird_mls::orchestrator::lifecycle::LeaveOutcome;
+                match orch.leave_conversation(&convo_id).await
+                    .map_err(|error| anyhow::anyhow!("Could not leave conversation: {error}"))?
+                {
+                    LeaveOutcome::Left => println!("Left conversation {convo_id}"),
+                    LeaveOutcome::Pending { leave_request_id } => println!(
+                        "Leave requested for {convo_id}. Waiting for another member's device to finish removing you (request={leave_request_id})."
+                    ),
+                }
             }
 
             ConvoCommands::Info { convo } => {
@@ -636,16 +672,17 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let convos = svc.conversations().await;
                 let c = convos
                     .iter()
-                    .find(|c| c.group_id == convo_id)
+                    .find(|c| c.conversation_id == convo_id)
                     .ok_or_else(|| anyhow::anyhow!("Conversation not found"))?;
 
+                let (creator, created) = creation_info_values(c);
                 println!("Name:         {}", c.name.as_deref().unwrap_or("<unnamed>"));
                 println!("Group ID:     {}", c.group_id);
-                println!("Creator:      {}", c.creator);
+                println!("Creator:      {creator}");
                 println!("Epoch:        {}", c.epoch);
                 println!("Cipher suite: {}", c.cipher_suite);
                 println!("Members:      {}", c.members.len());
-                println!("Created:      {}", c.created_at);
+                println!("Created:      {created}");
                 if let Some(ref desc) = c.description {
                     println!("Description:  {desc}");
                 }
@@ -657,18 +694,12 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
 
             ConvoCommands::Join { convo_id } => {
                 let svc = init_service().await?;
-                // Route to the real external-commit join flow (fetch GroupInfo
-                // → create_external_commit → POST commitGroupChange → merge
-                // locally) in `MlsManager::join_via_external_commit`. The
-                // former `ChatService::join_conversation` was a broken
-                // placeholder (see service.rs task #65 note); removed.
-                svc.mls
-                    .join_via_external_commit(&svc, &convo_id, svc.did())
-                    .await?;
-                println!(
-                    "Joined conversation {}",
-                    &convo_id[..12.min(convo_id.len())]
-                );
+                let convo_id = svc.resolve_convo(&convo_id).await?;
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                let epoch = orch.join_or_rejoin(&convo_id).await
+                    .map_err(|error| anyhow::anyhow!("Could not join conversation: {error}"))?;
+                println!("Joined conversation {convo_id} (epoch={epoch})");
             }
             ConvoCommands::Accept {
                 convo,
@@ -738,29 +769,57 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 println!("Fulfilled leaf recovery for {convo}: {}", serde_json::to_string(&res)?);
             }
 
+            ConvoCommands::FulfillLeave { convo } => {
+                let svc = init_service().await?;
+                let convo_id = svc.resolve_convo(&convo).await?;
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                let fulfilled = orch.fulfill_pending_group_leave(&convo_id).await
+                    .map_err(|error| anyhow::anyhow!("Could not fulfill group leave: {error}"))?;
+                if fulfilled {
+                    println!("Finished pending group leave for {convo_id}");
+                } else {
+                    println!("No pending group leave was completed for {convo_id}");
+                }
+            }
+
+            ConvoCommands::ReconcileAccess { convo_id } => {
+                use catbird_mls::orchestrator::storage::MLSStorageBackend;
+                catbird_mls::chat_v2::ids::ConversationId::parse(&convo_id)
+                    .map_err(|error| anyhow::anyhow!("Use the exact conversation UUID: {error}"))?;
+                let svc = init_service().await?;
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                let reconciled = orch.reconcile_terminal_conversation(&convo_id).await
+                    .map_err(|error| anyhow::anyhow!("Could not verify conversation access: {error}"))?;
+                let state = orch.storage().get_conversation_state(&convo_id).await
+                    .map_err(|error| anyhow::anyhow!("Could not read persisted access state: {error}"))?;
+                println!("{}", serde_json::json!({
+                    "conversationId": convo_id, "terminalProofApplied": reconciled,
+                    "persistedState": state,
+                }));
+            }
+
             ConvoCommands::JoinWelcome { convo } => {
                 let svc = init_service().await?;
                 let orch = svc.orchestrator().await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                let view = orch.join_conversation_from_entries(&convo).await
+                // Welcome-first join (pending-welcome inventory → process →
+                // acknowledgeWelcome), the same path iOS takes; entries never
+                // carry a Welcome for a device that is not yet a leaf.
+                let convo_id = svc.resolve_convo(&convo).await?;
+                let epoch = orch.join_or_rejoin(&convo_id).await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                println!("Joined conversation via Welcome: {} (epoch={})", view.group_id, view.epoch);
+                println!("Joined conversation via Welcome: {convo} (epoch={epoch})");
             }
-            ConvoCommands::RequestRecovery {
-                convo,
-                group_id,
-                confirmation_tag,
-                group_context_hash,
-                epoch,
-                state_version,
-                kind,
-            } => {
+            ConvoCommands::RequestRecovery { convo } => {
                 let svc = init_service().await?;
                 let orch = svc.orchestrator().await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                let res = orch.request_leaf_recovery(&convo, kind.as_deref(), &group_id, &group_context_hash, &confirmation_tag, epoch, state_version).await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                println!("Requested leaf recovery for {convo}: {}", serde_json::to_string(&res)?);
+                let convo_id = svc.resolve_convo(&convo).await?;
+                let epoch = orch.join_or_rejoin(&convo_id).await
+                    .map_err(|error| anyhow::anyhow!("Recovery has not completed for {convo_id}: {error}"))?;
+                println!("Rejoined {convo_id} (epoch={epoch})");
             }
 
             ConvoCommands::Update {
@@ -795,7 +854,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let convo_id = svc.resolve_convo(&convo).await?;
                 let orch = svc.orchestrator().await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                orch.remove_members(&convo_id, &[did.clone()]).await
+                orch.remove_accounts(&convo_id, &[did.clone()]).await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Removed {did} from {convo}");
             }
@@ -838,13 +897,18 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     }
                 }
             }
-            DeviceCommands::Register { name } => {
+            DeviceCommands::Register { name: _ } => {
                 let svc = init_service().await?;
                 let orch = svc.orchestrator().await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
                 let device_id = orch.ensure_device_registered().await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Registered device: id={device_id}");
+                // A registered device is invisible to other users until the
+                // account's repo declares which DS serves it.
+                let ds_did = configured_delivery_service()?;
+                svc.ensure_chat_declaration(&ds_did).await?;
+                println!("Secure chat ready: deliveryService={ds_did}");
             }
             DeviceCommands::Remove { device_id } => {
                 let svc = init_service().await?;
@@ -929,29 +993,13 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
         // ── Reset group ──────────────────────────────────────────────────
         Commands::ResetGroup { convo, reason } => {
             let svc = init_service().await?;
-            svc.fetch_conversations().await?;
-            let convo_id = svc.resolve_convo(&convo).await?;
-
-            // Generate a new random group ID
-            let new_group_id = hex::encode(rand::random::<[u8; 16]>());
-
-            let req = serde_json::json!({
-                "convoId": convo_id,
-                "newGroupId": new_group_id,
-                "cipherSuite": MLS_CIPHER_SUITE,
-                "reason": reason,
-            });
-
-            let resp: serde_json::Value = svc
-                .xrpc_procedure("blue.catbird.chat.requestReset", &req)
-                .await?;
-
-            println!(
-                "Group reset: {} -> {} (generation {})",
-                &convo_id[..12.min(convo_id.len())],
-                &new_group_id[..12.min(new_group_id.len())],
-                resp["resetGeneration"]
-            );
+            let orch = svc.orchestrator().await
+                .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+            let outcome = orch
+                .reset_conversation(&convo, reason.as_deref().unwrap_or("manualRecovery"))
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            println!("Reset {convo}: {outcome:?}");
         }
 
         // ── Debug ────────────────────────────────────────────────────────
@@ -959,8 +1007,8 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             DebugCommands::Epoch { convo } => {
                 let svc = init_service().await?;
                 svc.fetch_conversations().await?;
-                let convo_id = svc.resolve_convo(&convo).await?;
-                match svc.get_epoch(&convo_id) {
+                let group_id = svc.resolve_mls_group_id(&convo).await?;
+                match svc.get_epoch(&group_id) {
                     Ok(epoch) => println!("Local MLS epoch: {epoch}"),
                     Err(e) => println!("Failed to read local epoch: {e}"),
                 }
@@ -975,11 +1023,20 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             DebugCommands::TreeHash { convo } => {
                 let svc = init_service().await?;
                 svc.fetch_conversations().await?;
-                let convo_id = svc.resolve_convo(&convo).await?;
-                match svc.get_tree_hash(&convo_id) {
+                let group_id = svc.resolve_mls_group_id(&convo).await?;
+                match svc.get_tree_hash(&group_id) {
                     Ok(hash) => println!("Tree hash: {}", hex::encode(&hash)),
                     Err(e) => println!("Failed to read tree hash: {e}"),
                 }
+            }
+            DebugCommands::WipeGroup { convo } => {
+                let svc = init_service().await?;
+                let convo_id = convo;
+                let orch = svc.orchestrator().await
+                    .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
+                let res = orch.debug_wipe_local_group_for_recovery(&convo_id).await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("Wiped local group for {convo_id}: {res:?}");
             }
         },
 
@@ -1091,10 +1148,50 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn canonical_message_content(
+    message: &catbird_mls::orchestrator::types::Message,
+    own_did: &str,
+    own_device_id: &str,
+    has_durable_terminal_state: bool,
+) -> MessageContent {
+    use catbird_mls::orchestrator::types::MLSMessageType;
+    if let Some(payload) = message.payload() {
+        if payload.version == 1 && payload.message_type == MLSMessageType::System {
+            let label = match payload.text.as_deref() {
+                Some("history_boundary.new_member") => Some("You joined this conversation. Earlier messages are not available on this device."),
+                Some("history_boundary.device_rejoined") => Some("This device rejoined the conversation. Earlier messages may not be available."),
+                Some("conversation.closed") => Some("Conversation status changed."),
+                Some("membership.left") => Some(if catmos_core::types::is_local_membership_left_marker(message, own_did, own_device_id, has_durable_terminal_state) {
+                    "You left this conversation."
+                } else {
+                    "Membership update"
+                }),
+                _ => None,
+            };
+            if let Some(label) = label {
+                return MessageContent::System(label.to_owned());
+            }
+        }
+    }
+    // Literal marker keys and JSON in ordinary text are still user messages.
+    MessageContent::Text(message.text.clone())
+}
+
+fn creation_info_values(conversation: &catmos_core::types::Conversation) -> (String, String) {
+    (
+        conversation.creator.as_deref().filter(|value| !value.trim().is_empty()).unwrap_or("<unknown>").to_owned(),
+        conversation.created_at.map(|value| value.to_string()).unwrap_or_else(|| "<unknown>".to_owned()),
+    )
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let environment_profile = std::env::var("CATMOS_PROFILE").ok();
+    Config::initialize_profile(cli.profile.as_deref().or(environment_profile.as_deref()))?;
     let is_tui = matches!(cli.command, None | Some(Commands::Chat));
+    anyhow::ensure!(!is_tui || !cli.no_startup_sync, "--no-startup-sync requires a CLI command");
+    SKIP_STARTUP_SYNC.store(cli.no_startup_sync, Ordering::Relaxed);
 
     // Default filter: suppress noisy openmls internals
     let default_filter = "warn,catmos=info,catmos_core=info,catmos_core::chat=debug,catmos_tui=info,openmls=off,openmls_rust_crypto=off,openmls_memory_storage=off";
@@ -1134,4 +1231,96 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn history_boundary_labels_require_a_supported_structured_system_payload() {
+        use catbird_mls::orchestrator::types::{MLSMessagePayload, Message};
+        let own_device = "11111111-1111-4111-8111-111111111111";
+        let render = |message: &Message| canonical_message_content(message, "did:plc:test", own_device, true);
+        let make = |text: &str, payload: Option<String>| -> Message {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("membership-left:22222222-2222-4222-8222-222222222222:{own_device}"),
+                "conversation_id": "conversation", "sender_did": "did:plc:test",
+                "text": text, "timestamp": "2026-09-05T02:34:00Z", "epoch": 1,
+                "sequence_number": 0, "is_own": true, "payload_json": payload,
+            })).unwrap()
+        };
+        for (key, expected) in [
+            ("history_boundary.new_member", "You joined this conversation. Earlier messages are not available on this device."),
+            ("history_boundary.device_rejoined", "This device rejoined the conversation. Earlier messages may not be available."),
+            ("membership.left", "You left this conversation."),
+            ("conversation.closed", "Conversation status changed."),
+        ] {
+            let payload = serde_json::to_string(&MLSMessagePayload::system(key)).unwrap();
+            assert!(matches!(render(&make(key, Some(payload))), MessageContent::System(label) if label == expected));
+            assert!(matches!(render(&make(key, None)), MessageContent::Text(text) if text == key));
+            let text_payload = serde_json::to_string(&MLSMessagePayload::text(key)).unwrap();
+            assert!(matches!(render(&make(key, Some(text_payload))), MessageContent::Text(text) if text == key));
+            let mut future = MLSMessagePayload::system(key);
+            future.version = 2;
+            assert!(matches!(render(&make(key, Some(serde_json::to_string(&future).unwrap()))), MessageContent::Text(text) if text == key));
+        }
+        let membership = make("You left this conversation.", Some(serde_json::to_string(&MLSMessagePayload::system("membership.left")).unwrap()));
+        for (wrong_id, wrong_sender, own_flag, terminal) in [
+            ("peer-chosen-id", "did:plc:test", true, true),
+            ("membership-left:22222222-2222-1222-8222-222222222222:11111111-1111-4111-8111-111111111111", "did:plc:test", true, true),
+            ("membership-left:22222222-2222-4222-8222-222222222222:33333333-3333-4333-8333-333333333333", "did:plc:test", true, true),
+            (membership.id.as_str(), "did:plc:peer", true, true),
+            (membership.id.as_str(), "did:plc:test", false, true),
+            (membership.id.as_str(), "did:plc:test", true, false),
+        ] {
+            let mut unverified = membership.clone();
+            unverified.id = wrong_id.into();
+            unverified.sender_did = wrong_sender.into();
+            unverified.is_own = own_flag;
+            assert!(matches!(canonical_message_content(&unverified, "did:plc:test", own_device, terminal), MessageContent::System(label) if label == "Membership update"));
+        }
+        let literal_json = r#"{"version":1,"messageType":"system","text":"history_boundary.new_member"}"#;
+        assert!(matches!(render(&make(literal_json, None)), MessageContent::Text(text) if text == literal_json));
+        let closed = make("Conversation closed.", Some(serde_json::to_string(&MLSMessagePayload::system("conversation.closed")).unwrap()));
+        assert!(matches!(canonical_message_content(&closed, "did:plc:other", own_device, false), MessageContent::System(label) if label == "Conversation status changed."));
+    }
+
+    #[test]
+    fn creation_info_renders_unknown_without_inventing_a_member_or_timestamp() {
+        let mut value = serde_json::json!({
+            "conversation_id": "conversation", "group_id": "group", "epoch": 0,
+            "cipher_suite": "suite", "members": [], "unread_count": 0,
+        });
+        let unknown = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(creation_info_values(&unknown), ("<unknown>".into(), "<unknown>".into()));
+        value["creator"] = serde_json::json!("did:plc:creator");
+        value["created_at"] = serde_json::json!("2026-09-05T02:34:00Z");
+        let explicit = serde_json::from_value(value).unwrap();
+        assert_eq!(creation_info_values(&explicit), (
+            "did:plc:creator".into(), "2026-09-05 02:34:00 UTC".into(),
+        ));
+    }
+
+    #[test]
+    fn scoped_profile_flags_work_after_subcommands() {
+        let cli = Cli::try_parse_from(["catmos", "convo", "fulfill-leave", "conversation", "--profile", "device-b", "--no-startup-sync"]).unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("device-b"));
+        assert!(cli.no_startup_sync);
+        assert!(matches!(cli.command, Some(Commands::Convo(ConvoCommands::FulfillLeave { .. }))));
+    }
+
+    #[test]
+    fn explicit_recovery_alias_targets_the_same_command() {
+        let cli = Cli::try_parse_from(["catmos", "convo", "fulfill-recovery", "conversation"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Convo(ConvoCommands::Fulfill { .. }))));
+    }
+
+    #[test]
+    fn scoped_terminal_reconciliation_keeps_exact_conversation_id() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let cli = Cli::try_parse_from(["catmos", "--profile", "device-a2", "--no-startup-sync", "convo", "reconcile-access", id]).unwrap();
+        assert!(cli.no_startup_sync);
+        assert!(matches!(cli.command, Some(Commands::Convo(ConvoCommands::ReconcileAccess { convo_id })) if convo_id == id));
+    }
 }

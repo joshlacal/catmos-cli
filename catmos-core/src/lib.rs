@@ -8,6 +8,7 @@ pub mod types;
 pub mod orchestrator_api;
 pub mod orchestrator_credentials;
 pub mod orchestrator_storage;
+pub(crate) mod device_records;
 pub type CliOrchestrator = catbird_mls::orchestrator::MLSOrchestrator<
     orchestrator_storage::SqliteStorage,
     orchestrator_api::CliApiClient,
