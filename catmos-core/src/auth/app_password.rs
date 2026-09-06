@@ -39,16 +39,17 @@ impl AppPasswordAuth {
     /// Load previously-saved app password auth from the session store and
     /// rebuild a live `TokenSession` from the stored tokens.
     pub async fn load(db: &Database) -> Result<Option<Self>> {
-        let method = db.get_session_value("auth_method").await?;
+        let mut snapshot = db.get_session_values(super::session::APP_PASSWORD_SESSION_KEYS).await?;
+        let method = snapshot.remove("auth_method");
         if method.as_deref() != Some("app_password") {
             return Ok(None);
         }
 
-        let handle = db.get_session_value("handle").await?;
-        let did = db.get_session_value("did").await?;
-        let access_jwt = db.get_session_value("access_jwt").await?;
-        let refresh_jwt = db.get_session_value("refresh_jwt").await?;
-        let pds_url = db.get_session_value("pds_url").await?;
+        let handle = snapshot.remove("handle");
+        let did = snapshot.remove("did");
+        let access_jwt = snapshot.remove("access_jwt");
+        let refresh_jwt = snapshot.remove("refresh_jwt");
+        let pds_url = snapshot.remove("pds_url");
 
         match (handle, did, access_jwt, refresh_jwt, pds_url) {
             (Some(handle), Some(did), Some(access_jwt), Some(refresh_jwt), Some(pds_url)) => {

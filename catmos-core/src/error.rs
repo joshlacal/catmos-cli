@@ -6,6 +6,10 @@ pub enum CatmosError {
     NotAuthenticated,
     #[error("Authentication failed: {0}")]
     AuthFailed(String),
+    #[error("Authentication changed in another process. Retry this command; the newer session and device keys were preserved.")]
+    AuthSessionChanged,
+    #[error("PDS session renewal failed: {0}. Device keys were preserved.")]
+    AuthRenewal(#[from] AuthRenewalFailure),
     #[error("Conversation not found: {0}")]
     ConvoNotFound(String),
     #[error("Not a member of conversation: {0}")]
@@ -49,5 +53,64 @@ impl From<serde_json::Error> for CatmosError {
 impl From<std::io::Error> for CatmosError {
     fn from(e: std::io::Error) -> Self {
         CatmosError::Other(format!("IO error: {e}"))
+    }
+}
+
+/// Closed classifications only: these errors cannot contain a response body,
+/// bearer, URL, database error text or arbitrary server-provided string.
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthRenewalFailure {
+    #[error("network transport failed while renewing the PDS session")]
+    Transport,
+    #[error("PDS rejected session renewal: HTTP {status} ({code})")]
+    Rejected { status: u16, code: RenewalRejection },
+    #[error("PDS returned an invalid refresh response")]
+    Decode,
+    #[error("could not read saved session")]
+    ReadSnapshot,
+    #[error("could not save renewed session")]
+    PersistSnapshot,
+    #[error("saved session is incomplete or invalid")]
+    InvalidSnapshot,
+    #[error("session was invalidated; restart the command or log in again")]
+    Invalidated,
+    #[error("PDS refresh returned a different account identity")]
+    IdentityMismatch,
+    #[error("could not retain renewed session in memory")]
+    MemoryState,
+}
+
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenewalRejection {
+    #[error("InvalidToken")]
+    InvalidToken,
+    #[error("ExpiredToken")]
+    ExpiredToken,
+    #[error("AuthenticationRequired")]
+    AuthenticationRequired,
+    #[error("AccountTakedown")]
+    AccountTakedown,
+    #[error("AccountDeactivated")]
+    AccountDeactivated,
+    #[error("InvalidRequest")]
+    InvalidRequest,
+    #[error("RateLimitExceeded")]
+    RateLimitExceeded,
+    #[error("UnknownError")]
+    UnknownError,
+}
+
+impl RenewalRejection {
+    pub(crate) fn from_code(code: Option<&str>) -> Self {
+        match code {
+            Some("InvalidToken") => Self::InvalidToken,
+            Some("ExpiredToken") => Self::ExpiredToken,
+            Some("AuthenticationRequired") => Self::AuthenticationRequired,
+            Some("AccountTakedown") => Self::AccountTakedown,
+            Some("AccountDeactivated") => Self::AccountDeactivated,
+            Some("InvalidRequest") => Self::InvalidRequest,
+            Some("RateLimitExceeded") => Self::RateLimitExceeded,
+            _ => Self::UnknownError,
+        }
     }
 }

@@ -127,16 +127,19 @@ pub async fn run() -> anyhow::Result<()> {
 
             // Pre-fetch messages for ALL conversations in background (populates SQLCipher cache).
             // Don't block startup — TUI renders immediately with cached messages.
-            let group_ids: Vec<String> = app
+            let conversation_ids: Vec<String> = app
                 .conversations
                 .iter()
-                .map(|c| c.group_id.clone())
+                .map(|c| c.conversation_id.clone())
                 .collect();
-            for gid in group_ids {
+            for convo_id in conversation_ids {
                 let svc = Arc::clone(&service);
                 tokio::spawn(async move {
-                    if let Err(e) = svc.fetch_messages(&gid, 50).await {
-                        debug!("Pre-fetch failed for {}: {e}", &gid[..12.min(gid.len())]);
+                    if let Err(e) = svc.fetch_messages(&convo_id, 50).await {
+                        debug!(
+                            "Pre-fetch failed for {}: {e}",
+                            &convo_id[..12.min(convo_id.len())]
+                        );
                     }
                 });
             }

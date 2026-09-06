@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static PROFILE: OnceLock<Option<String>> = OnceLock::new();
 
 use crate::error::{CatmosError, Result};
 
@@ -44,20 +47,50 @@ impl Default for Config {
 }
 
 impl Config {
-    /// XDG config directory: ~/.config/catmos/
+    /// Select a separate local device before opening any configuration or keys.
+    /// Omitting the profile preserves existing storage and keychain names.
+    pub fn initialize_profile(profile: Option<&str>) -> Result<()> {
+        let profile = profile
+            .map(validate_profile)
+            .transpose()?
+            .map(str::to_owned);
+        if let Some(existing) = PROFILE.get() {
+            return if existing == &profile {
+                Ok(())
+            } else {
+                Err(CatmosError::Config(
+                    "Cannot change profile after initialization".into(),
+                ))
+            };
+        }
+        PROFILE
+            .set(profile)
+            .map_err(|_| CatmosError::Config("Profile was initialized concurrently".into()))
+    }
+
+    fn profile() -> Option<&'static str> {
+        PROFILE.get_or_init(|| None).as_deref()
+    }
+
+    /// Preserve default keychain services; profiles always use independent entries.
+    pub fn keychain_service(base: &str) -> String {
+        profile_keychain_service(base, Self::profile())
+    }
+
     pub fn config_dir() -> Result<PathBuf> {
-        let dir = dirs::config_dir()
+        let base = dirs::config_dir()
             .ok_or_else(|| CatmosError::Config("Cannot determine config directory".into()))?
             .join("catmos-cli");
+        let dir = profile_directory(base, Self::profile());
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }
 
-    /// XDG data directory: ~/.local/share/catmos/
     pub fn data_dir() -> Result<PathBuf> {
-        let dir = dirs::data_dir()
+        let base = dirs::data_dir()
             .ok_or_else(|| CatmosError::Config("Cannot determine data directory".into()))?
             .join("catmos-cli");
+        let dir = profile_directory(base, Self::profile());
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }
@@ -92,5 +125,73 @@ impl Config {
             toml::to_string_pretty(self).map_err(|e| CatmosError::Config(e.to_string()))?;
         std::fs::write(&path, contents)?;
         Ok(())
+    }
+}
+
+fn validate_profile(profile: &str) -> Result<&str> {
+    if profile.is_empty()
+        || profile.len() > 64
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(CatmosError::Config(
+            "Profile must contain 1-64 ASCII letters, numbers, hyphens, or underscores".into(),
+        ));
+    }
+    Ok(profile)
+}
+
+fn profile_directory(base: PathBuf, profile: Option<&str>) -> PathBuf {
+    match profile {
+        Some(profile) => base.join("profiles").join(profile),
+        None => base,
+    }
+}
+
+fn profile_keychain_service(base: &str, profile: Option<&str>) -> String {
+    match profile {
+        Some(profile) => format!("{base}.profile.{profile}"),
+        None => base.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn profile_names_cannot_escape_their_storage_directory() {
+        for name in ["", ".", "..", "../device", "a/b", "a\\b", "a b", "é"] {
+            assert!(validate_profile(name).is_err(), "accepted {name:?}");
+        }
+        assert!(validate_profile(&"a".repeat(65)).is_err());
+        assert!(validate_profile("mlsv2-alice_phone-2").is_ok());
+    }
+
+    #[test]
+    fn default_storage_and_credentials_keep_compatibility() {
+        let base = PathBuf::from("/tmp/catmos-cli");
+        assert_eq!(profile_directory(base.clone(), None), base);
+        assert_eq!(
+            profile_keychain_service("blue.catbird.catmos", None),
+            "blue.catbird.catmos"
+        );
+    }
+
+    #[test]
+    fn same_account_on_two_profiles_has_independent_files_and_keychain_services() {
+        let base = PathBuf::from("/tmp/catmos-cli");
+        let first = profile_directory(base.clone(), Some("device-a"));
+        let second = profile_directory(base, Some("device-b"));
+        assert_ne!(first, second);
+        assert_eq!(first, PathBuf::from("/tmp/catmos-cli/profiles/device-a"));
+        for service in ["blue.catbird.catmos", "catmos-mls-db", "catmos-mls-didhash"] {
+            assert_ne!(profile_keychain_service(service, Some("device-a")), service);
+            assert_ne!(
+                profile_keychain_service(service, Some("device-a")),
+                profile_keychain_service(service, Some("device-b"))
+            );
+        }
     }
 }

@@ -10,23 +10,42 @@ use crate::types::Conversation;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AliasStore {
     aliases: HashMap<String, String>,
+    /// Optional persistence override used by isolated fixtures. `None` keeps
+    /// the normal per-user config path.
+    #[serde(skip)]
+    path: Option<PathBuf>,
 }
 
 impl AliasStore {
+    /// Construct an alias store backed by an explicit path. This keeps tests
+    /// and embedded callers away from the user's real `aliases.json`.
+    pub fn with_path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            aliases: HashMap::new(),
+            path: Some(path.into()),
+        }
+    }
+
     /// Load aliases from disk. Returns empty store if file doesn't exist.
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         if path.exists() {
             let contents = std::fs::read_to_string(&path)?;
-            serde_json::from_str(&contents).map_err(|e| CatmosError::Config(e.to_string()))
+            let mut store: Self =
+                serde_json::from_str(&contents).map_err(|e| CatmosError::Config(e.to_string()))?;
+            store.path = Some(path);
+            Ok(store)
         } else {
-            Ok(Self::default())
+            Ok(Self {
+                aliases: HashMap::new(),
+                path: Some(path),
+            })
         }
     }
 
     /// Persist aliases to disk.
     pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
+        let path = self.persistence_path()?;
         let contents = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, contents)?;
         Ok(())
@@ -59,47 +78,37 @@ impl AliasStore {
     /// Resolution order:
     /// 1. Exact alias match
     /// 2. Exact conversation title match (case-insensitive)
-    /// 3. Exact ID match (conversation_id or group_id)
-    /// 4. Conversation ID or group ID prefix match
+    /// 3. Conversation ID prefix match
     pub fn resolve(&self, input: &str, conversations: &[Conversation]) -> Option<String> {
         // 1. Alias
         if let Some(id) = self.aliases.get(input) {
-            if let Some(convo) = conversations
-                .iter()
-                .find(|c| &c.conversation_id == id || &c.group_id == id)
-            {
-                return Some(convo.conversation_id.clone());
-            }
             return Some(id.clone());
         }
 
         // 2. Title match (case-insensitive)
         let input_lower = input.to_lowercase();
         for convo in conversations {
-            if let Some(name) = &convo.name {
+            if let Some(ref name) = convo.name {
                 if name.to_lowercase() == input_lower {
-                    return Some(convo.conversation_id.clone());
+                    return Some(convo.group_id.clone());
                 }
             }
         }
 
-        // 3. Exact ID match
-        for convo in conversations {
-            if convo.conversation_id == input || convo.group_id == input {
-                return Some(convo.conversation_id.clone());
-            }
-        }
-
-        // 4. ID prefix match
+        // 3. ID prefix match
         let mut matches: Vec<_> = conversations
             .iter()
-            .filter(|c| c.conversation_id.starts_with(input) || c.group_id.starts_with(input))
+            .filter(|c| c.group_id.starts_with(input))
             .collect();
         if matches.len() == 1 {
-            return Some(matches.remove(0).conversation_id.clone());
+            return Some(matches.remove(0).group_id.clone());
         }
 
         None
+    }
+
+    fn persistence_path(&self) -> Result<PathBuf> {
+        self.path.clone().map_or_else(Self::path, Ok)
     }
 
     fn path() -> Result<PathBuf> {

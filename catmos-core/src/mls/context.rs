@@ -123,8 +123,8 @@ pub fn get_or_create_db_key(did: &str) -> Result<String> {
     if std::env::var_os("CATMOS_TEST_KEYCHAIN_FALLBACK").is_some() {
         return Ok(derive_key_from_did(did));
     }
-    let service = "catmos-mls-db";
-    let entry = keyring::Entry::new(service, did);
+    let service = crate::storage::config::Config::keychain_service("catmos-mls-db");
+    let entry = keyring::Entry::new(&service, did);
 
     match entry {
         Ok(e) => {
@@ -145,17 +145,27 @@ pub fn get_or_create_db_key(did: &str) -> Result<String> {
                     info!("Generated and stored new MLS DB key in system keychain");
                     Ok(key)
                 }
-                Err(_) => {
-                    // Keychain read failed — derive from DID
-                    warn!("System keychain unavailable, deriving MLS DB key from DID");
-                    Ok(derive_key_from_did(did))
+                Err(err) => {
+                    if std::env::var_os("CATMOS_TEST_KEYCHAIN_FALLBACK").is_some() {
+                        warn!("System keychain unavailable, falling back to test DID-derived key");
+                        Ok(derive_key_from_did(did))
+                    } else {
+                        Err(CatmosError::Storage(format!(
+                            "System keychain unavailable for MLS DB key: {err}"
+                        )))
+                    }
                 }
             }
         }
-        Err(_) => {
-            // Keychain completely unavailable
-            warn!("System keychain unavailable, deriving MLS DB key from DID");
-            Ok(derive_key_from_did(did))
+        Err(err) => {
+            if std::env::var_os("CATMOS_TEST_KEYCHAIN_FALLBACK").is_some() {
+                warn!("System keychain unavailable, falling back to test DID-derived key");
+                Ok(derive_key_from_did(did))
+            } else {
+                Err(CatmosError::Storage(format!(
+                    "System keychain entry failed for MLS DB key: {err}"
+                )))
+            }
         }
     }
 }
@@ -203,7 +213,9 @@ impl MlsManager {
 
         let encryption_key = get_or_create_db_key(did)?;
 
-        let keychain = Box::new(SystemKeychain::new(format!("catmos-mls-{did_hash}")));
+        let keychain = Box::new(SystemKeychain::new(
+            crate::storage::config::Config::keychain_service(&format!("catmos-mls-{did_hash}")),
+        ));
 
         let storage_path = db_path
             .to_str()

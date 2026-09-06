@@ -414,10 +414,7 @@ impl ChatService {
             epoch_authenticator: authenticator,
         };
         match self
-            .xrpc_procedure::<_, serde_json::Value>(
-                "blue.catbird.chat.requestLeafRecovery",
-                &req,
-            )
+            .xrpc_procedure::<_, serde_json::Value>("blue.catbird.chat.requestLeafRecovery", &req)
             .await
         {
             Ok(_) => info!(convo = %convo_label, "requestLeafRecovery accepted"),
@@ -460,6 +457,13 @@ impl ChatService {
         convo_id: &str,
         clear_needs_rejoin_on_success: bool,
     ) -> Result<()> {
+        // Recovery callers historically passed the MLS group ID here, while
+        // the transition/getGroupState APIs are keyed by the stable
+        // conversation ID. Keep the two identities separate for the entire
+        // mixed path: stable ID for server/tracker/storage routing, current
+        // group ID only for local MLS deletion.
+        let (stable_convo_id, _) = self.resolve_conversation_ids(convo_id).await?;
+        let convo_id = stable_convo_id.as_str();
         let convo_label = &convo_id[..12.min(convo_id.len())];
 
         // 1. Gate on tracker (max-attempts / per-convo cooldown / global floor)
@@ -607,7 +611,11 @@ impl ChatService {
         //    local group state (spec §8.4 step 2) and create the External
         //    Commit. `external_commit_with_group_info` handles
         //    `discard_pending_external_join` on failure (spec §8.4.1).
-        let gid = hex::decode(convo_id)
+        // The GroupInfo fetch crossed a network boundary, so a reset may have
+        // advanced the durable projection while it was in flight. Re-resolve
+        // immediately before touching MLS rather than deleting a stale group.
+        let (_, current_group_id) = self.resolve_conversation_ids(convo_id).await?;
+        let gid = hex::decode(&current_group_id)
             .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
         let _ = self.mls.with_context(|ctx| {
             let _ = ctx.delete_group(gid.clone());
@@ -1508,9 +1516,9 @@ impl ChatService {
     /// Ambiguous duplicate rows fail closed.
     async fn fetch_authoritative_group_id(&self, convo_id: &str) -> Result<Option<String>> {
         let convos = self.fetch_conversations().await?;
-        let mut matches = convos.into_iter().filter(|c| {
-            c.conversation_id == convo_id || c.group_id == convo_id
-        });
+        let mut matches = convos
+            .into_iter()
+            .filter(|c| c.conversation_id == convo_id || c.group_id == convo_id);
         let Some(first) = matches.next() else {
             return Ok(None);
         };

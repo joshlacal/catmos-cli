@@ -33,7 +33,7 @@ impl KeyringCredentialStore {
     }
 
     fn entry(key: &str) -> std::result::Result<Entry, keyring::Error> {
-        Entry::new(SERVICE_NAME, key)
+        Entry::new(&crate::storage::config::Config::keychain_service(SERVICE_NAME), key)
     }
 
     fn key_signing(user_did: &str) -> String {
@@ -124,7 +124,25 @@ impl KeyringCredentialStore {
             ));
         }
         if let Some(path) = Self::file_fallback_path(&key) {
-            let _ = std::fs::write(&path, value);
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&path)
+                .map_err(|error| OrchestratorError::Credential(error.to_string()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|error| OrchestratorError::Credential(error.to_string()))?;
+            }
+            file.write_all(value.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|error| OrchestratorError::Credential(error.to_string()))?;
         }
         match Self::entry(&key) {
             Ok(entry) => match entry.set_password(value) {
@@ -190,6 +208,12 @@ impl KeyringCredentialStore {
 
 #[async_trait]
 impl CredentialStore for KeyringCredentialStore {
+    async fn get_authorized_device_keys(&self, root_did: &str) -> Result<Option<Vec<Vec<u8>>>> {
+        crate::device_records::authorized_keys(root_did).await
+            .map(Some)
+            .map_err(|error| OrchestratorError::Credential(error.to_string()))
+    }
+
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()> {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(key_data);
@@ -257,6 +281,14 @@ impl CredentialStore for KeyringCredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_repository_identity_returns_error_not_unsupported_or_empty() {
+        let result = KeyringCredentialStore::new()
+            .get_authorized_device_keys("did:plc:invalid#device")
+            .await;
+        assert!(result.is_err());
+    }
 
     #[test]
     fn local_uuid_and_server_device_id_use_distinct_keychain_slots() {

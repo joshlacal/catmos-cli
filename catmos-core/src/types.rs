@@ -1,6 +1,16 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Canonical sequence owns confirmed display order. Zero represents an
+/// unconfirmed or legacy row, retained at the end in timestamp/ID order.
+pub(crate) fn message_order_key<'a>(
+    sequence: u64,
+    timestamp: &'a DateTime<Utc>,
+    id: &'a str,
+) -> (bool, u64, &'a DateTime<Utc>, &'a str) {
+    (sequence == 0, sequence, timestamp, id)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub conversation_id: String,
@@ -12,11 +22,15 @@ pub struct Conversation {
     pub name: Option<String>,
     /// Decrypted group description. Same provenance rules as `name`.
     pub description: Option<String>,
-    pub creator: String,
+    /// Present only when an explicit conversation response provides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<String>,
     pub epoch: u64,
     pub cipher_suite: String,
     pub members: Vec<Member>,
-    pub created_at: DateTime<Utc>,
+    /// Canonical inventory does not supply a creation timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
     pub last_message_at: Option<DateTime<Utc>>,
     pub unread_count: u32,
     pub alias: Option<String>,
@@ -96,4 +110,26 @@ pub struct BlobUsage {
     pub used_bytes: i64,
     pub quota_bytes: i64,
     pub blob_count: i64,
+}
+
+/// The local native terminal pipeline reserves this deterministic receipt ID.
+/// A peer-supplied System payload alone is not evidence that our account left.
+pub fn is_local_membership_left_marker(
+    message: &catbird_mls::orchestrator::types::Message,
+    own_did: &str,
+    own_device_id: &str,
+    has_durable_terminal_state: bool,
+) -> bool {
+    use catbird_mls::orchestrator::types::MLSMessageType;
+    if !has_durable_terminal_state || !message.is_own || message.sender_did != own_did {
+        return false;
+    }
+    let Some((entry_id, device_id)) = message.id.strip_prefix("membership-left:").and_then(|value| value.split_once(':')) else {
+        return false;
+    };
+    let canonical_uuid = |value: &str| uuid::Uuid::parse_str(value).is_ok_and(|id| id.get_version_num() == 4 && id.hyphenated().to_string() == value);
+    device_id == own_device_id && canonical_uuid(entry_id) && canonical_uuid(device_id)
+        && message.payload().is_some_and(|payload| payload.version == 1
+            && payload.message_type == MLSMessageType::System
+            && payload.text.as_deref() == Some("membership.left"))
 }
