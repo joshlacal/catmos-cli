@@ -118,7 +118,7 @@ fn build_login_url(
 }
 
 fn build_oauth_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::http_client::builder()
         .timeout(tokio::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .build()

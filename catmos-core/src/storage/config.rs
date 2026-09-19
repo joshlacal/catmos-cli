@@ -72,6 +72,11 @@ impl Config {
         PROFILE.get_or_init(|| None).as_deref()
     }
 
+    #[cfg(feature = "local-runtime-fixture")]
+    pub(crate) fn fixture_profile() -> Option<&'static str> {
+        Self::profile()
+    }
+
     /// Preserve default keychain services; profiles always use independent entries.
     pub fn keychain_service(base: &str) -> String {
         profile_keychain_service(base, Self::profile())

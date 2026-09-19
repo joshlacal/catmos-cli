@@ -40,7 +40,11 @@ enum Commands {
         /// Conversation name, alias, or ID
         convo: String,
         /// Message text
-        message: String,
+        #[arg(required_unless_present = "file", conflicts_with = "file")]
+        message: Option<String>,
+        /// Read text from a UTF-8 file, or - for stdin, without placing it in process arguments.
+        #[arg(long, conflicts_with = "message")]
+        file: Option<String>,
     },
     /// List conversations
     Convos,
@@ -502,7 +506,27 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             }
         }
 
-        Commands::Send { convo, message } => {
+        Commands::Send {
+            convo,
+            message,
+            file,
+        } => {
+            let message = match (message, file) {
+                (Some(message), None) => message,
+                (None, Some(path)) => {
+                    use std::io::Read;
+                    let mut bytes = Vec::new();
+                    let reader: Box<dyn Read> = if path == "-" {
+                        Box::new(std::io::stdin())
+                    } else {
+                        Box::new(std::fs::File::open(path)?)
+                    };
+                    reader.take(1_048_577).read_to_end(&mut bytes)?;
+                    anyhow::ensure!(bytes.len() <= 1_048_576, "Message input exceeds 1 MiB");
+                    String::from_utf8(bytes)?
+                }
+                _ => anyhow::bail!("Provide exactly one message text or --file source"),
+            };
             let svc = init_service().await?;
             svc.fetch_conversations().await?;
             let convo_id = svc.resolve_convo(&convo).await?;

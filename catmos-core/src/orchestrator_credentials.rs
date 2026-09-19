@@ -6,10 +6,75 @@ use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 
 const SERVICE_NAME: &str = "blue.catbird.catmos";
 
+/// A legacy plaintext file is evidence of old custody, never authority for a
+/// new identity. Migration must verify it against the existing native identity
+/// and explicitly commit OS-keychain custody before ordinary startup resumes.
+#[derive(Debug, thiserror::Error)]
+pub enum PrivateSigningKeyError {
+    #[error("LegacySigningKeyMigrationRequired: signing identity exists only in a legacy file; verified migration to the OS keychain is required; the file was preserved")]
+    LegacyMigrationRequired,
+    #[error("SigningKeychainUnavailable: protected signing-key custody is unavailable")]
+    KeychainUnavailable(#[source] keyring::Error),
+    #[error("InvalidProtectedSigningKey: protected signing-key encoding is invalid")]
+    InvalidEncoding,
+}
+
+fn write_private_signing_key(
+    entry: &Entry,
+    key_data: &[u8],
+) -> std::result::Result<(), PrivateSigningKeyError> {
+    use base64::Engine;
+    if key_data.is_empty() {
+        return Err(PrivateSigningKeyError::InvalidEncoding);
+    }
+    entry
+        .set_password(&base64::engine::general_purpose::STANDARD.encode(key_data))
+        .map_err(PrivateSigningKeyError::KeychainUnavailable)
+}
+
+fn read_private_signing_key(
+    entry: &Entry,
+    legacy_path: &std::path::Path,
+) -> std::result::Result<Option<Vec<u8>>, PrivateSigningKeyError> {
+    use base64::Engine;
+    match entry.get_password() {
+        Ok(encoded) => {
+            let key = base64::engine::general_purpose::STANDARD
+                .decode(&encoded)
+                .map_err(|_| PrivateSigningKeyError::InvalidEncoding)?;
+            if key.is_empty() || base64::engine::general_purpose::STANDARD.encode(&key) != encoded {
+                return Err(PrivateSigningKeyError::InvalidEncoding);
+            }
+            Ok(Some(key))
+        }
+        Err(keyring::Error::NoEntry) if legacy_path.exists() => {
+            Err(PrivateSigningKeyError::LegacyMigrationRequired)
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(PrivateSigningKeyError::KeychainUnavailable(error)),
+    }
+}
+
 /// OS keychain-backed credential store using the `keyring` crate.
 pub struct KeyringCredentialStore;
 
 impl KeyringCredentialStore {
+    /// Typed startup preflight. This does not read or modify a legacy file.
+    pub async fn private_signing_key(
+        &self,
+        user_did: &str,
+    ) -> std::result::Result<Option<Vec<u8>>, PrivateSigningKeyError> {
+        use sha2::Digest;
+        let key = Self::key_signing(user_did);
+        let directory = crate::storage::config::Config::data_dir()
+            .map_err(|_| PrivateSigningKeyError::InvalidEncoding)?;
+        let legacy_path = directory.join("credentials").join(format!(
+            "{}.key",
+            hex::encode(sha2::Sha256::digest(key.as_bytes()))
+        ));
+        let entry = Self::entry(&key).map_err(PrivateSigningKeyError::KeychainUnavailable)?;
+        read_private_signing_key(&entry, &legacy_path)
+    }
     pub fn new() -> Self {
         match Self::try_new() {
             Ok(store) => store,
@@ -250,7 +315,7 @@ impl CredentialStore for KeyringCredentialStore {
         Ok(value["generation"].as_i64().filter(|g| *g > 0))
     }
     async fn direct_request_receipt_authority_document(&self) -> Result<Option<Vec<u8>>> {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(15))
             .build()
@@ -291,27 +356,28 @@ impl CredentialStore for KeyringCredentialStore {
     }
 
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()> {
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(key_data);
-        Self::store_string(Self::key_signing(user_did), &encoded).await
+        let entry = Self::entry(&Self::key_signing(user_did)).map_err(|e| {
+            OrchestratorError::Credential(
+                PrivateSigningKeyError::KeychainUnavailable(e).to_string(),
+            )
+        })?;
+        write_private_signing_key(&entry, key_data)
+            .map_err(|e| OrchestratorError::Credential(e.to_string()))
     }
 
     async fn get_signing_key(&self, user_did: &str) -> Result<Option<Vec<u8>>> {
-        use base64::Engine;
-        match Self::get_string(Self::key_signing(user_did)).await? {
-            Some(encoded) => {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&encoded)
-                    .map_err(|e| OrchestratorError::Credential(e.to_string()))?;
-                Ok(Some(bytes))
-            }
-            None => Ok(None),
-        }
+        self.private_signing_key(user_did)
+            .await
+            .map_err(|e| OrchestratorError::Credential(e.to_string()))
     }
 
     async fn delete_signing_key(&self, user_did: &str) -> Result<()> {
-        Self::delete_key(Self::key_signing(user_did));
-        Ok(())
+        let entry = Self::entry(&Self::key_signing(user_did))
+            .map_err(|e| OrchestratorError::Credential(e.to_string()))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(OrchestratorError::Credential(error.to_string())),
+        }
     }
 
     async fn store_mls_did(&self, user_did: &str, mls_did: &str) -> Result<()> {
@@ -402,5 +468,75 @@ mod tests {
     fn non_android_credential_store_constructor_succeeds() {
         let _ =
             KeyringCredentialStore::try_new().expect("desktop credential constructor should work");
+    }
+}
+
+#[cfg(test)]
+mod private_custody_tests {
+    use super::*;
+
+    #[test]
+    fn private_key_write_and_keychain_failure_never_write_a_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = directory.path().join("legacy.key");
+        let entry = Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
+        write_private_signing_key(&entry, &[7; 32]).unwrap();
+        assert_eq!(
+            read_private_signing_key(&entry, &legacy).unwrap(),
+            Some(vec![7; 32])
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        entry
+            .get_credential()
+            .downcast_ref::<keyring::mock::MockCredential>()
+            .unwrap()
+            .set_error(keyring::Error::Invalid("synthetic".into(), "denied".into()));
+        assert!(matches!(
+            write_private_signing_key(&entry, &[8; 32]),
+            Err(PrivateSigningKeyError::KeychainUnavailable(_))
+        ));
+        assert_eq!(
+            read_private_signing_key(&entry, &legacy).unwrap(),
+            Some(vec![7; 32])
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn legacy_only_identity_fails_closed_and_preserves_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = directory.path().join("legacy.key");
+        std::fs::write(&legacy, b"synthetic legacy sentinel").unwrap();
+        let entry = Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
+        assert!(matches!(
+            read_private_signing_key(&entry, &legacy),
+            Err(PrivateSigningKeyError::LegacyMigrationRequired)
+        ));
+        assert_eq!(
+            std::fs::read(&legacy).unwrap(),
+            b"synthetic legacy sentinel"
+        );
+        write_private_signing_key(&entry, &[9; 32]).unwrap();
+        assert_eq!(
+            read_private_signing_key(&entry, &legacy).unwrap(),
+            Some(vec![9; 32])
+        );
+        assert_eq!(
+            std::fs::read(&legacy).unwrap(),
+            b"synthetic legacy sentinel"
+        );
+        entry
+            .get_credential()
+            .downcast_ref::<keyring::mock::MockCredential>()
+            .unwrap()
+            .set_error(keyring::Error::Invalid("synthetic".into(), "denied".into()));
+        assert!(matches!(
+            read_private_signing_key(&entry, &legacy),
+            Err(PrivateSigningKeyError::KeychainUnavailable(_))
+        ));
+        assert_eq!(
+            std::fs::read(&legacy).unwrap(),
+            b"synthetic legacy sentinel"
+        );
     }
 }

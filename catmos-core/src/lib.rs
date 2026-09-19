@@ -2,6 +2,7 @@ pub mod auth;
 pub mod chat;
 pub(crate) mod device_records;
 pub mod error;
+mod http_client;
 pub mod mls;
 pub mod orchestrator_api;
 pub mod orchestrator_credentials;

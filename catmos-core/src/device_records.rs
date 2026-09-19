@@ -24,7 +24,7 @@ fn invalid(detail: &str) -> CatmosError {
 }
 
 pub(crate) fn public_client() -> Result<Client> {
-    Client::builder()
+    crate::http_client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
         .build()

@@ -489,7 +489,12 @@ impl MLSAPIClient for CliApiClient {
                     .service
                     .xrpc_query(
                         "blue.catbird.chat.getConversations",
-                        &[("actorDeviceId", device_id.as_str()), ("limit", "100")],
+                        &[
+                            ("actorDeviceId", device_id.as_str()),
+                            ("limit", "100"),
+                            ("supportedProtocolVersions", "1"),
+                            ("supportedProtocolVersions", "2"),
+                        ],
                     )
                     .await
                     .map_err(|error| OrchestratorError::Api(error.to_string()))?;
@@ -518,6 +523,8 @@ impl MLSAPIClient for CliApiClient {
                 ("actorDeviceId", device_id.as_str()),
                 ("inventorySessionId", session_id.as_str()),
                 ("limit", "100"),
+                ("supportedProtocolVersions", "1"),
+                ("supportedProtocolVersions", "2"),
             ];
             if let Some(cursor) = cursor.as_deref() {
                 parameters.push(("pageCursor", cursor));
@@ -698,7 +705,12 @@ mod welcome_inventory_tests {
         }
         async fn inventory(
             axum::extract::State(calls): axum::extract::State<Calls>,
+            axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
         ) -> axum::Json<serde_json::Value> {
+            assert!(uri
+                .query()
+                .unwrap()
+                .contains("supportedProtocolVersions=1&supportedProtocolVersions=2"));
             calls.inventory.fetch_add(1, Ordering::Relaxed);
             axum::Json(
                 serde_json::json!({"inventorySessionId": "fresh", "snapshotEventCursor": "fence", "items": [], "hasMore": false}),
@@ -706,10 +718,15 @@ mod welcome_inventory_tests {
         }
         async fn welcomes(
             axum::extract::State(calls): axum::extract::State<Calls>,
+            axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
             axum::extract::Query(query): axum::extract::Query<
                 std::collections::HashMap<String, String>,
             >,
         ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+            assert!(uri
+                .query()
+                .unwrap()
+                .contains("supportedProtocolVersions=1&supportedProtocolVersions=2"));
             calls.welcomes.fetch_add(1, Ordering::Relaxed);
             if query.get("inventorySessionId").map(String::as_str) == Some("stale") {
                 return (

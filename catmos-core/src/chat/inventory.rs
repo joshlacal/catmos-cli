@@ -21,6 +21,36 @@ fn text(page: &Value, field: &str) -> Result<String> {
         .map(str::to_owned)
         .ok_or_else(|| invalid(format!("missing {field}")))
 }
+/// Every domain and continuation page is bound to the same explicit scope.
+/// A retained session alone is not a declaration of supported wire versions.
+fn inventory_query(
+    operation: CanonicalOperation,
+    actor: &str,
+    session: Option<&str>,
+    cursor: Option<&str>,
+) -> Result<String> {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query
+        .append_pair("actorDeviceId", actor)
+        .append_pair("limit", "100")
+        .append_pair("supportedProtocolVersions", "1")
+        .append_pair("supportedProtocolVersions", "2");
+    match operation {
+        CanonicalOperation::GetConversations => {}
+        CanonicalOperation::GetPendingWelcomes | CanonicalOperation::GetLeafRecoveryInbox => {
+            query.append_pair(
+                "inventorySessionId",
+                session.ok_or_else(|| invalid("missing session"))?,
+            );
+        }
+        _ => return Err(invalid("unsupported inventory domain")),
+    }
+    if let Some(cursor) = cursor {
+        query.append_pair("pageCursor", cursor);
+    }
+    Ok(query.finish())
+}
+
 impl ChatService {
     pub async fn refresh_authenticated_inventory(&self) -> Result<AppliedInventoryFence> {
         let authority = self.request_authority().await?;
@@ -48,29 +78,12 @@ impl ChatService {
                 if pages.len() >= 100 {
                     return Err(invalid("page bound exceeded"));
                 }
-                let query_string = {
-                    let mut query = url::form_urlencoded::Serializer::new(String::new());
-                    query
-                        .append_pair("actorDeviceId", &actor)
-                        .append_pair("limit", "100");
-                    if operation == CanonicalOperation::GetConversations {
-                        query
-                            .append_pair("supportedProtocolVersions", "1")
-                            .append_pair("supportedProtocolVersions", "2");
-                    } else {
-                        query.append_pair(
-                            "inventorySessionId",
-                            &snapshot
-                                .as_ref()
-                                .ok_or_else(|| invalid("missing session"))?
-                                .inventory_session_id,
-                        );
-                    }
-                    if let Some(value) = &cursor {
-                        query.append_pair("pageCursor", value);
-                    }
-                    query.finish()
-                };
+                let query_string = inventory_query(
+                    operation,
+                    &actor,
+                    snapshot.as_ref().map(|s| s.inventory_session_id.as_str()),
+                    cursor.as_deref(),
+                )?;
                 let response = authority
                     .api_client()
                     .submit_prepared_request(PreparedRequest {
@@ -152,5 +165,47 @@ impl ChatService {
             fence.event_cursor().into(),
         ));
         Ok(fence)
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    #[test]
+    fn all_three_domains_and_continuations_repeat_the_exact_scope() {
+        for operation in [
+            CanonicalOperation::GetConversations,
+            CanonicalOperation::GetPendingWelcomes,
+            CanonicalOperation::GetLeafRecoveryInbox,
+        ] {
+            for cursor in [None, Some("opaque+cursor/=")] {
+                let query = inventory_query(operation, "actor", Some("retained+session/="), cursor)
+                    .unwrap();
+                let pairs = url::form_urlencoded::parse(query.as_bytes())
+                    .into_owned()
+                    .collect::<Vec<_>>();
+                let values = |name: &str| {
+                    pairs
+                        .iter()
+                        .filter(|(k, _)| k == name)
+                        .map(|(_, v)| v.as_str())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(values("supportedProtocolVersions"), vec!["1", "2"]);
+                assert_eq!(values("actorDeviceId"), vec!["actor"]);
+                assert_eq!(values("pageCursor"), cursor.into_iter().collect::<Vec<_>>());
+                assert_eq!(
+                    values("inventorySessionId"),
+                    if operation == CanonicalOperation::GetConversations {
+                        vec![]
+                    } else {
+                        vec!["retained+session/="]
+                    }
+                );
+            }
+        }
+        assert!(
+            inventory_query(CanonicalOperation::GetPendingWelcomes, "actor", None, None).is_err()
+        );
     }
 }

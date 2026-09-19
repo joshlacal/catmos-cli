@@ -144,6 +144,25 @@ async fn send(service: &ChatService, id: &str) -> serde_json::Value {
 mod tests {
     use clap::Parser;
     #[test]
+    fn ordinary_reply_accepts_stdin_without_plaintext_arguments() {
+        assert!(
+            crate::Cli::try_parse_from(["catmos", "send", "conversation", "--file", "-"]).is_ok()
+        );
+        assert!(
+            crate::Cli::try_parse_from(["catmos", "send", "conversation", "legacy text"]).is_ok()
+        );
+        assert!(crate::Cli::try_parse_from(["catmos", "send", "conversation"]).is_err());
+        assert!(crate::Cli::try_parse_from([
+            "catmos",
+            "send",
+            "conversation",
+            "text",
+            "--file",
+            "-"
+        ])
+        .is_err());
+    }
+    #[test]
     fn request_cli_requires_explicit_content_source_and_never_positional_plaintext() {
         assert!(crate::Cli::try_parse_from([
             "catmos",

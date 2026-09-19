@@ -3,6 +3,9 @@ name = "catmos"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+local-runtime-fixture = ["catmos-core/local-runtime-fixture"]
+
 [[bin]]
 name = "catmos"
 path = "src/main.rs"

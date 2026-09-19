@@ -154,7 +154,9 @@ impl ChatService {
         aliases: Arc<RwLock<AliasStore>>,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::builder()
+                .build()
+                .expect("HTTP client initialization failed"),
             auth,
             token_session,
             mls,

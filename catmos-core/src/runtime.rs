@@ -284,6 +284,9 @@ async fn assemble_local_runtime(input: LocalRuntimeInput) -> anyhow::Result<Runt
     let credentials = Arc::new(
         KeyringCredentialStore::try_new().map_err(|error| anyhow::anyhow!(error.to_string()))?,
     );
+    // Preserve a typed compatibility error before shared startup can interpret
+    // missing private custody as permission to establish a new identity.
+    credentials.private_signing_key(&input.did).await?;
     let orchestrator: Arc<CliOrchestrator> =
         Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
             mls.context().clone(),

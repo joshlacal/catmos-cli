@@ -65,9 +65,9 @@ async fn inventory(
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
 ) -> Json<serde_json::Value> {
+    assert!(uri.query().unwrap().contains("supportedProtocolVersions=1"));
+    assert!(uri.query().unwrap().contains("supportedProtocolVersions=2"));
     if uri.path().ends_with("getConversations") {
-        assert!(uri.query().unwrap().contains("supportedProtocolVersions=1"));
-        assert!(uri.query().unwrap().contains("supportedProtocolVersions=2"));
         let page = serde_json::json!({"inventorySessionId":uuid::Uuid::new_v4().to_string(),"snapshotEventCursor":uuid::Uuid::new_v4().to_string(),"snapshotExpiresAt":(chrono::Utc::now()+chrono::Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Millis,true),"hasMore":false,"items":[],"inventoryScope":{"supportedProtocolVersions":["1","2"],"scopeDigest":{"$bytes":base64::engine::general_purpose::STANDARD.encode([3u8;32])}}});
         *state.inventory.write().unwrap() = page;
     }

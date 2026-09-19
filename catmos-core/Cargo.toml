@@ -3,7 +3,16 @@ name = "catmos-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Explicit local runtime qualification only. Never enabled by the shipping CLI.
+local-runtime-fixture = ["dep:mls-e2e-tests"]
+
+[[example]]
+name = "seed_local_request_profile"
+required-features = ["local-runtime-fixture"]
+
 [dependencies]
+mls-e2e-tests = { path = "../../mls-ds/e2e-tests", features = ["local-runtime-fixture"], optional = true }
 catbird-mls = { workspace = true }
 catbird-atproto = { workspace = true }
 jacquard = { workspace = true }
