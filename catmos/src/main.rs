@@ -1,24 +1,17 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 static SKIP_STARTUP_SYNC: AtomicBool = AtomicBool::new(false);
 
 use clap::Parser;
-use tokio::sync::RwLock;
-use tracing::info;
 
 use catmos_core::auth::app_password::AppPasswordAuth;
 use catmos_core::auth::oauth::OAuthAuth;
-use catmos_core::auth::restore_saved_auth;
 use catmos_core::chat::ChatService;
-use catmos_core::mls::{MlsManager, MLS_CIPHER_SUITE};
+use catmos_core::runtime::{Runtime, RuntimeStartup};
 use catmos_core::storage::aliases::AliasStore;
 use catmos_core::storage::config::Config;
 use catmos_core::storage::db::Database;
-use catmos_core::orchestrator_api::CliApiClient;
-use catmos_core::orchestrator_credentials::KeyringCredentialStore;
-use catmos_core::orchestrator_storage::SqliteStorage;
-use catmos_core::CliOrchestrator;
 use catmos_core::types::MessageContent;
 
 #[derive(Parser)]
@@ -252,135 +245,17 @@ enum AliasCommands {
 }
 // ── Service initialization ──────────────────────────────────────────────────
 
-/// Load config, open the per-account database, restore auth, and build a ChatService.
+/// Build the shared per-account MLS runtime used by CLI and TUI entry points.
 async fn init_service() -> anyhow::Result<Arc<ChatService>> {
-    let config = Config::load()?;
-
-    let did = config
-        .default_account
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("No account configured. Run `catmos login` first."))?
-        .to_string();
-
-    let account_dir = Config::account_data_dir(&did)?;
-    let db_path = account_dir.join("catmos.db");
-
-    let db_key = catmos_core::mls::context::get_or_create_db_key(&did)?;
-    let db = Database::open(&db_path, &db_key).await?;
-
-    let restored = restore_saved_auth(&db, &did)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("No saved session found. Run `catmos login` first."))?;
-    info!("Restored saved session for {did}");
-    let auth = restored.auth;
-    let token_session = restored.token_session;
-
-    let mls_dir = Config::data_dir()?.join("mls");
-    let mls = Arc::new(MlsManager::new(&mls_dir, &did)?);
-
-    // Install the per-DID content-root key for the MLS field-level
-    // encryption layer (`catbird_mls::field_encryption`). Materialized to
-    // `{config_dir}/mls-content-root/{sha256(did)}.key` on first call;
-    // shared between the orchestrator's `MLSContext` and the `Database`
-    // write/read paths so encrypted rows round-trip.
-    let content_root_key =
-        catmos_core::storage::keys::load_or_create_content_root_key(&Config::config_dir()?, &did)?;
-    mls.context()
-        .set_content_root_key(content_root_key.clone())?;
-    db.set_content_root_key(content_root_key);
-
-    let aliases = Arc::new(RwLock::new(AliasStore::load()?));
-
-    let db = Arc::new(db);
-    let service = Arc::new(ChatService::new(
-        auth,
-        token_session,
-        mls.clone(),
-        db.clone(),
-        config,
-        aliases,
-    ));
-
-    let orchestrator_db = account_dir.join("orchestrator.db");
-    let orchestrator_storage = Arc::new(
-        SqliteStorage::new(
-            orchestrator_db.to_string_lossy().as_ref(),
-            &db_key,
-        )?,
-    );
-    orchestrator_storage.set_mls_context(mls.context().clone());
-    let orchestrator_api = Arc::new(CliApiClient::new(service.clone()));
-    let credentials = Arc::new(KeyringCredentialStore::try_new()
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?);
-    let orchestrator: Arc<CliOrchestrator> = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
-        mls.context().clone(),
-        orchestrator_storage,
-        orchestrator_api,
-        credentials,
-        catbird_mls::orchestrator::OrchestratorConfig::default(),
-    ));
-    service.set_orchestrator(orchestrator.clone()).await;
-    orchestrator.initialize(&did).await
-        .map_err(|error| anyhow::anyhow!("MLS initialization failed: {error}"))?;
-    orchestrator.ensure_device_registered().await
-        .map_err(|error| anyhow::anyhow!("Device registration failed: {error}"))?;
-    service.ensure_device_record_published().await
-        .map_err(|error| anyhow::anyhow!("Device identity publication failed: {error}"))?;
-    // Canonical sync also handles invitation acceptance, device recovery, and
-    // fulfillment for other devices. Keep explicit recovery commands usable
-    // when one conversation needs further repair.
-    if !SKIP_STARTUP_SYNC.load(Ordering::Relaxed) {
-        if let Err(error) = orchestrator.sync_with_server(false).await {
-            tracing::warn!("Conversation synchronization incomplete: {error}");
-        }
+    let runtime = Runtime::initialize(RuntimeStartup::command(
+        !SKIP_STARTUP_SYNC.load(Ordering::Relaxed),
+    ))
+    .await?;
+    let reconciled = runtime.startup_report().reconciled_blocked_groups;
+    if reconciled > 0 {
+        println!("Reconciled: left {reconciled} group(s) containing blocked users.");
     }
-
-    // Fetch conversations and join any that lack local MLS state
-    match service.fetch_conversations().await {
-        Ok(_convos) if !SKIP_STARTUP_SYNC.load(Ordering::Relaxed) => {
-            // Block reconciliation: leave any MLS group containing a
-            // user from this account's own block list. Catches up on
-            // blocks made from other clients (iOS, web, etc.) before
-            // catmos-cli last ran.
-            match service.list_own_blocks().await {
-                Ok(blocks) if !blocks.is_empty() => {
-                    let blocked: std::collections::HashSet<String> =
-                        blocks.into_iter().collect();
-                    let convos_to_leave: Vec<String> = service
-                        .conversations()
-                        .await
-                        .into_iter()
-                        .filter(|c| c.members.iter().any(|m| blocked.contains(&m.user_did)))
-                        .map(|c| c.group_id)
-                        .collect();
-
-                    let mut left = 0usize;
-                    for id in &convos_to_leave {
-                        if let Err(e) = service.leave_conversation(id).await {
-                            tracing::warn!("reconcile leave {id}: {e}");
-                        } else {
-                            left += 1;
-                        }
-                    }
-                    if left > 0 {
-                        println!(
-                            "Reconciled: left {left} group(s) containing blocked users."
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!("Failed to fetch own block list: {e}");
-                }
-            }
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!("Failed to fetch conversations: {e}");
-        }
-    }
-
-    Ok(service)
+    Ok(Arc::clone(runtime.service()))
 }
 
 /// Open (or create) a per-account database for a login flow where we don't yet

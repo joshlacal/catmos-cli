@@ -13,15 +13,9 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use catmos_core::auth::restore_saved_auth;
-use catmos_core::chat::service::ChatService;
-use catmos_core::mls::context::MlsManager;
-use catmos_core::storage::aliases::AliasStore;
-use catmos_core::storage::config::Config;
-use catmos_core::storage::db::Database;
+use catmos_core::runtime::{Runtime, RuntimeStartup};
 
 use app::{App, Screen};
 use event::{AppEvent, EventLoop};
@@ -29,76 +23,12 @@ use keybinds::{map_key, Action};
 
 /// Run the interactive TUI.
 pub async fn run() -> anyhow::Result<()> {
-    // ── 1. Load config ─────────────────────────────────────────────────
-    let config = Config::load()?;
-
-    let did = config
-        .default_account
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("No account configured. Run `catmos login` first."))?
-        .to_string();
-
-    // ── 2. Open DB and load auth ───────────────────────────────────────
-    let account_dir = Config::account_data_dir(&did)?;
-    let db_path = account_dir.join("catmos.db");
-    let db_key = catmos_core::mls::context::get_or_create_db_key(&did)?;
-    let db = Arc::new(Database::open(&db_path, &db_key).await?);
-
-    let restored = restore_saved_auth(&db, &did)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("No saved session found. Run `catmos login` first."))?;
-    info!("Restored validated session for {did}");
-    let auth = restored.auth;
-    let token_session = restored.token_session;
-
-    // ── 3. Initialize MLS ──────────────────────────────────────────────
-    let mls_dir = Config::data_dir()?.join("mls");
-    let mls = Arc::new(MlsManager::new(&mls_dir, &did)?);
-
-    // Install the per-DID content-root key for the field-level encryption
-    // layer. Same key file as the main binary (`{config_dir}/mls-content-
-    // root/{sha256(did)}.key`), so opening the TUI and the CLI back-to-back
-    // sees the same HMAC chain seed and decrypts each other's writes.
-    let content_root_key =
-        catmos_core::storage::keys::load_or_create_content_root_key(&Config::config_dir()?, &did)?;
-    mls.context()
-        .set_content_root_key(content_root_key.clone())?;
-    db.set_content_root_key(content_root_key);
-
-    // ── 4. Create ChatService ──────────────────────────────────────────
-    let aliases = Arc::new(RwLock::new(AliasStore::load()?));
-    let service = Arc::new(ChatService::new(
-        auth,
-        token_session,
-        mls.clone(),
-        db.clone(),
-        config.clone(),
-        aliases,
-    ));
-
-    // ── 4a. MLS device registration + join missing conversations ──────
-    // Timeout the entire registration/join phase so a slow server can't block startup
-    let reg_result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        let device_info = mls.ensure_registered(&service, &did, &db).await?;
-        info!("MLS device ready: {}", device_info.device_id);
-        // Fetch conversations first so join_missing knows what groups exist
-        service.fetch_conversations().await?;
-        info!("Joining missing conversations (10s timeout)...");
-        let did_clone = did.clone();
-        let svc = Arc::clone(&service);
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            svc.join_missing_conversations(&did_clone),
-        )
-        .await;
-        Ok::<_, catmos_core::error::CatmosError>(())
-    })
-    .await;
-    match reg_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("MLS setup failed: {e}"),
-        Err(_) => info!("MLS setup timed out — will continue with background sync"),
-    }
+    // Load the same initialized per-account authority and protected operation
+    // storage as non-interactive commands. Interactive startup keeps its
+    // historical bounded, best-effort network behavior.
+    let runtime = Runtime::initialize(RuntimeStartup::interactive()).await?;
+    let config = runtime.config().clone();
+    let service = Arc::clone(runtime.service());
 
     // ── 5. Initial sync ────────────────────────────────────────────────
     let mut app = App::new(

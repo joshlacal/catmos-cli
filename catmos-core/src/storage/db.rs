@@ -111,10 +111,10 @@ impl Database {
 
     /// Install the per-DID content-root key for the field-level encryption
     /// layer. Called once from the session bootstrap path
-    /// (`catmos/src/main.rs::init_service` and
-    /// `catmos-tui/src/lib.rs::run`) after the key file is materialized via
-    /// `crate::storage::keys::load_or_create_content_root_key`. Idempotent;
-    /// later calls replace the binding. Sync (RwLock write, no await needed).
+    /// (`crate::runtime::Runtime::initialize`) after the key file is
+    /// materialized via `crate::storage::keys::load_or_create_content_root_key`.
+    /// Idempotent; later calls replace the binding. Sync (RwLock write, no
+    /// await needed).
     pub fn set_content_root_key(&self, key: Vec<u8>) {
         if let Ok(mut guard) = self.content_root_key.write() {
             *guard = Some(key);
