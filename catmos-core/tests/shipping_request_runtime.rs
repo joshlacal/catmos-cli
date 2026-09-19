@@ -334,13 +334,12 @@ async fn shipping_cli_scenario(lose_publication_response: bool) -> anyhow::Resul
         evidence.join("result.json"),
         br#"{"status":"started","fixtureOnly":true}"#,
     )?;
-    use sha2::{Digest, Sha256};
     let test_runner = std::env::current_exe()?;
     let service_binary = PathBuf::from(std::env::var("REQUEST_SERVER_FIXTURE_BINARY")?);
     let binaries = [&binary, &seeder, &test_runner, &service_binary]
         .into_iter()
         .map(|path| -> anyhow::Result<Value> {
-            Ok(json!({"path":path,"sha256":hex::encode(Sha256::digest(std::fs::read(path)?))}))
+            Ok(json!({"path":path,"sha256":artifact_sha256(path)?}))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     std::fs::write(
@@ -720,4 +719,40 @@ fn publication_graph(request: uuid::Uuid) -> anyhow::Result<Value> {
         "publication did not create exactly one canonical entry/transition/push event"
     );
     Ok(value)
+}
+
+/// File provenance only: use optimized system hashing so debug-build SHA256
+/// does not dominate the runtime fixture. Protocol transcript hashing stays in
+/// the production Rust implementation.
+fn artifact_sha256(path: &Path) -> anyhow::Result<String> {
+    ensure!(path.is_absolute(), "artifact path must be absolute");
+    let output = Command::new("openssl")
+        .args(["dgst", "-sha256"])
+        .arg(path)
+        .output()?;
+    ensure!(output.status.success(), "artifact SHA256 command failed");
+    let text = std::str::from_utf8(&output.stdout)?;
+    let hash = text
+        .split_whitespace()
+        .last()
+        .context("artifact SHA256 missing")?;
+    ensure!(
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "artifact SHA256 format invalid"
+    );
+    Ok(hash.to_owned())
+}
+
+#[test]
+fn artifact_provenance_hash_matches_known_sha256_vector() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("known-vector");
+    std::fs::write(&file, b"abc").unwrap();
+    assert_eq!(
+        artifact_sha256(&file).unwrap(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
 }
