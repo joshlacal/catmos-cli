@@ -702,7 +702,12 @@ fn publication_graph(request: uuid::Uuid) -> anyhow::Result<Value> {
       'members',(SELECT count(*) FROM chat.member_devices m WHERE m.conversation_id=p.conversation_id),
       'deliveries',(SELECT count(*) FROM chat.direct_request_device_deliveries d WHERE d.request_id=p.request_id),
       'pushEvents',(SELECT count(*) FROM chat.direct_request_push_events e WHERE e.request_id=p.request_id),
-      'pushRecipients',(SELECT count(*) FROM chat.direct_request_push_event_recipients r WHERE r.request_id=p.request_id)
+      'pushRecipients',(SELECT count(*) FROM chat.direct_request_push_event_recipients r WHERE r.request_id=p.request_id),
+      'entryIdentity',(SELECT json_agg(json_build_array(e.seq,e.entry_id,encode(e.accepted_payload_sha256,'hex')) ORDER BY e.seq) FROM chat.entries e WHERE e.conversation_id=p.conversation_id),
+      'transitionIdentity',(SELECT json_agg(json_build_array(t.transition_id,encode(t.request_digest,'hex')) ORDER BY t.transition_id) FROM chat.transitions t WHERE t.conversation_id=p.conversation_id),
+      'memberIdentity',(SELECT json_agg(json_build_array(m.leaf_period_id,m.participant_period_id,m.user_did,m.device_id,m.leaf_index) ORDER BY m.leaf_period_id) FROM chat.member_devices m WHERE m.conversation_id=p.conversation_id),
+      'deliveryIdentity',(SELECT json_agg(json_build_array(d.owner_did,d.owner_device_id,encode(d.key_package_ref,'hex'),d.grant_id,d.leaf_index) ORDER BY d.owner_did,d.owner_device_id) FROM chat.direct_request_device_deliveries d WHERE d.request_id=p.request_id),
+      'pushIdentity',(SELECT json_agg(json_build_array(e.event_id,e.event_position,e.outbox_id,encode(e.payload_digest,'hex')) ORDER BY e.event_id) FROM chat.direct_request_push_events e WHERE e.request_id=p.request_id)
     ) FROM chat.direct_request_publications p WHERE p.request_id='{request}'::uuid"#
     );
     let output = Command::new("psql")
