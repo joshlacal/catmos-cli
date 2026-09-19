@@ -87,6 +87,10 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         };
 
         let content_text = match &msg.content {
+            MessageContent::GroupInvitation { text, reference } => format!(
+                "{text}\n[Group invitation: {} — acceptance is separate]",
+                reference.conversation_id
+            ),
             MessageContent::Text(text) => text.clone(),
             MessageContent::Reaction { emoji, .. } => format!("[reaction: {emoji}]"),
             MessageContent::System(text) => text.clone(),

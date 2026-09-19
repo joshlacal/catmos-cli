@@ -1,8 +1,8 @@
 pub mod app_password;
 pub mod oauth;
-pub mod session;
 mod renewal;
 pub(crate) mod service_auth;
+pub mod session;
 
 use crate::auth::app_password::AppPasswordAuth;
 use crate::auth::oauth::OAuthAuth;

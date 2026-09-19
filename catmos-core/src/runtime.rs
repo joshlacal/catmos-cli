@@ -83,10 +83,14 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    pub async fn initialize_offline() -> anyhow::Result<Self> {
+        load_local_runtime(false).await
+    }
+
     /// Restore the selected account and initialize its local authority before
     /// applying the entry point's network startup policy.
     pub async fn initialize(startup: RuntimeStartup) -> anyhow::Result<Self> {
-        let mut runtime = load_local_runtime().await?;
+        let mut runtime = load_local_runtime(startup.network_failures_are_fatal()).await?;
 
         if startup.network_failures_are_fatal() {
             runtime.start_network(startup.run_startup_sync()).await?;
@@ -135,6 +139,15 @@ impl Runtime {
             .ensure_device_registered()
             .await
             .map_err(|error| anyhow::anyhow!("Device registration failed: {error}"))?;
+        // Refresh the exact authenticated device generation after enrollment;
+        // a default generation is not sufficient request authority.
+        let device = self
+            .orchestrator
+            .credentials()
+            .get_device_uuid(&self.did)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Missing enrolled device"))?;
+        self.orchestrator.api_client().list_devices(&device).await?;
         self.service
             .ensure_device_record_published()
             .await
@@ -159,7 +172,45 @@ impl Runtime {
     }
 }
 
-async fn load_local_runtime() -> anyhow::Result<Runtime> {
+/// Local display can use the account-bound saved metadata while offline. This
+/// does not validate a remote session or authorize a network mutation.
+async fn restore_local_auth(
+    database: &Database,
+    did: &str,
+) -> anyhow::Result<Option<RestoredAuth>> {
+    use crate::auth::{app_password::AppPasswordAuth, oauth::OAuthAuth, AuthMethod};
+    if let Some(oauth) = OAuthAuth::load(database).await? {
+        anyhow::ensure!(
+            oauth.did == did,
+            "Saved OAuth account does not match the local store"
+        );
+        return Ok(Some(RestoredAuth {
+            auth: AuthMethod::OAuth {
+                session_cookie: oauth.session_cookie,
+                did: oauth.did,
+                nest_url: oauth.nest_url,
+            },
+            token_session: None,
+        }));
+    }
+    if let Some(ap) = AppPasswordAuth::load(database).await? {
+        anyhow::ensure!(
+            ap.did == did,
+            "Saved app-password account does not match the local store"
+        );
+        return Ok(Some(RestoredAuth {
+            auth: AuthMethod::AppPassword {
+                handle: ap.handle,
+                did: ap.did,
+                pds_url: ap.pds_url,
+            },
+            token_session: Some(ap.session),
+        }));
+    }
+    Ok(None)
+}
+
+async fn load_local_runtime(validate_auth_online: bool) -> anyhow::Result<Runtime> {
     let config = Config::load()?;
     let did = config
         .default_account
@@ -169,9 +220,12 @@ async fn load_local_runtime() -> anyhow::Result<Runtime> {
     let account_dir = Config::account_data_dir(&did)?;
     let database_key = crate::mls::context::get_or_create_db_key(&did)?;
     let database = Arc::new(Database::open(&account_dir.join("catmos.db"), &database_key).await?);
-    let restored_auth = restore_saved_auth(&database, &did)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("No saved session found. Run `catmos login` first."))?;
+    let restored_auth = if validate_auth_online {
+        restore_saved_auth(&database, &did).await?
+    } else {
+        restore_local_auth(&database, &did).await?
+    }
+    .ok_or_else(|| anyhow::anyhow!("No saved session found. Run `catmos login` first."))?;
     tracing::info!("Restored saved session for {did}");
 
     assemble_local_runtime(LocalRuntimeInput {
@@ -225,6 +279,7 @@ async fn assemble_local_runtime(input: LocalRuntimeInput) -> anyhow::Result<Runt
         &input.database_key,
     )?);
     orchestrator_storage.set_mls_context(mls.context().clone());
+    orchestrator_storage.bind_request_owner(Some(&input.did));
     let orchestrator_api = Arc::new(CliApiClient::new(Arc::clone(&service)));
     let credentials = Arc::new(
         KeyringCredentialStore::try_new().map_err(|error| anyhow::anyhow!(error.to_string()))?,
@@ -625,5 +680,36 @@ mod tests {
             Some(ConversationState::Active)
         );
         drop(root);
+    }
+    #[tokio::test]
+    async fn local_auth_restore_never_contacts_unreachable_nest_or_erases_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open_unencrypted(&temp.path().join("offline.db"))
+            .await
+            .unwrap();
+        crate::auth::oauth::OAuthAuth {
+            session_cookie: "offline-only-cookie".into(),
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            handle: "offline.invalid".into(),
+            nest_url: "http://127.0.0.1:1".into(),
+        }
+        .save(&db)
+        .await
+        .unwrap();
+        assert!(
+            super::restore_local_auth(&db, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            super::restore_local_auth(&db, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+                .await
+                .is_err()
+        );
+        assert!(crate::auth::oauth::OAuthAuth::load(&db)
+            .await
+            .unwrap()
+            .is_some());
     }
 }

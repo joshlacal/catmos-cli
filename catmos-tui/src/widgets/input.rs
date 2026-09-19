@@ -8,7 +8,7 @@ use crate::app::App;
 
 /// Render the input bar at the bottom of the screen.
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let hints = "^Q quit  ^S sidebar  ^M members  Tab next  Enter send";
+    let hints = "^Q quit  ^R requests  ^N draft  Tab next  Enter send";
 
     let block = Block::default()
         .borders(Borders::TOP)
@@ -23,7 +23,11 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.input.is_empty() {
         let placeholder = Paragraph::new(Span::styled(
-            "Type a message...",
+            if app.send_allowed {
+                "Type a message..."
+            } else {
+                "Replies require verified acceptance and device readiness"
+            },
             Style::default().fg(Color::DarkGray),
         ));
         frame.render_widget(placeholder, inner);

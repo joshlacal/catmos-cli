@@ -110,7 +110,9 @@ where
     {
         let refreshed = match refresh().await {
             Ok(bearer) => bearer,
-            Err(error @ (CatmosError::AuthSessionChanged | CatmosError::AuthRenewal(_))) => return Err(error),
+            Err(error @ (CatmosError::AuthSessionChanged | CatmosError::AuthRenewal(_))) => {
+                return Err(error)
+            }
             Err(_) => return Err(failure("PDS session renewal and persistence failed")),
         };
         (status, body) = send(refreshed).await?;

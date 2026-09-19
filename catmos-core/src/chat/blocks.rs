@@ -155,13 +155,17 @@ impl ChatService {
         match self.read_chat_declaration().await? {
             Some(declaration) => {
                 validate_chat_declaration(&declaration, delivery_service)?;
-                if declaration.get("allowIncoming").and_then(|value| value.as_str()) == Some("none") {
+                if declaration
+                    .get("allowIncoming")
+                    .and_then(|value| value.as_str())
+                    == Some("none")
+                {
                     return Err(CatmosError::Other(
                         "This account has incoming secure chats disabled. Your preference was preserved; enable incoming chats in account settings when you want to receive invitations.".into(),
                     ));
                 }
                 Ok(())
-            },
+            }
             None => self.publish_chat_declaration(delivery_service).await,
         }
     }
@@ -169,21 +173,33 @@ impl ChatService {
     async fn read_chat_declaration(&self) -> Result<Option<serde_json::Value>> {
         let base = self.atproto_repo_base()?;
         let url = format!("{base}/xrpc/com.atproto.repo.getRecord");
-        let response = self.http.get(url)
+        let response = self
+            .http
+            .get(url)
             .headers(self.bearer_headers(&self.current_bearer().await?)?)
-            .query(&[("repo", self.did()), ("collection", "blue.catbird.chat.declaration"), ("rkey", "self")])
-            .send().await.map_err(|error| CatmosError::Network(error.to_string()))?;
+            .query(&[
+                ("repo", self.did()),
+                ("collection", "blue.catbird.chat.declaration"),
+                ("rkey", "self"),
+            ])
+            .send()
+            .await
+            .map_err(|error| CatmosError::Network(error.to_string()))?;
         let status = response.status();
-        let body: serde_json::Value = response.json().await
-            .map_err(|error| CatmosError::Xrpc(format!("Could not read secure chat declaration: {error}")))?;
+        let body: serde_json::Value = response.json().await.map_err(|error| {
+            CatmosError::Xrpc(format!("Could not read secure chat declaration: {error}"))
+        })?;
         if !status.is_success() {
             if body.get("error").and_then(|value| value.as_str()) == Some("RecordNotFound") {
                 return Ok(None);
             }
-            return Err(CatmosError::Xrpc(format!("Could not verify secure chat setup ({status}); please retry or log in again")));
+            return Err(CatmosError::Xrpc(format!(
+                "Could not verify secure chat setup ({status}); please retry or log in again"
+            )));
         }
-        body.get("value").cloned().map(Some)
-            .ok_or_else(|| CatmosError::Xrpc("Secure chat declaration response omitted its record".into()))
+        body.get("value").cloned().map(Some).ok_or_else(|| {
+            CatmosError::Xrpc("Secure chat declaration response omitted its record".into())
+        })
     }
 
     /// Publish (or overwrite) the `blue.catbird.chat.declaration` `self`
@@ -436,12 +452,20 @@ impl ChatService {
 }
 
 fn validate_chat_declaration(record: &serde_json::Value, expected_service: &str) -> Result<()> {
-    if record.get("deliveryService").and_then(|value| value.as_str()) != Some(expected_service) {
+    if record
+        .get("deliveryService")
+        .and_then(|value| value.as_str())
+        != Some(expected_service)
+    {
         return Err(CatmosError::Other(
             "This account uses a different secure chat delivery service. Update this profile's server configuration to match your existing account.".into(),
         ));
     }
-    if record.get("protocolVersion").and_then(|value| value.as_str()) != Some("1") {
+    if record
+        .get("protocolVersion")
+        .and_then(|value| value.as_str())
+        != Some("1")
+    {
         return Err(CatmosError::Other("This account's secure chat protocol version is unsupported. Update the client before enrolling.".into()));
     }
     Ok(())

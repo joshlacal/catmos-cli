@@ -136,7 +136,10 @@ async fn expired_session_refreshes_once_and_only_scoped_token_reaches_ds() {
 #[tokio::test]
 async fn failed_exchange_never_falls_back_to_session_or_exposes_response_secrets() {
     for response in [
-        (StatusCode::BAD_REQUEST, json!({"error": "DO_NOT_EXPOSE_SESSION"})),
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"error": "DO_NOT_EXPOSE_SESSION"}),
+        ),
         (
             StatusCode::BAD_REQUEST,
             json!({"error": "InvalidRequest", "message": "DO_NOT_EXPOSE_SESSION", "token": "DO_NOT_EXPOSE_SESSION"}),
@@ -229,9 +232,22 @@ fn returned_service_token_requires_exact_did_audience_method_and_live_expiry() {
 
 #[tokio::test]
 async fn concurrent_session_change_remains_a_typed_retry_without_second_mint() {
-    let (pds, state, handle) = server(vec![(StatusCode::UNAUTHORIZED, json!({"error": "ExpiredToken"}))]).await;
-    let error = acquire(&crate::device_records::public_client().unwrap(), &pds, DID, AUD, NSID,
-        "old-session".into(), || async { Err(CatmosError::AuthSessionChanged) }).await.unwrap_err();
+    let (pds, state, handle) = server(vec![(
+        StatusCode::UNAUTHORIZED,
+        json!({"error": "ExpiredToken"}),
+    )])
+    .await;
+    let error = acquire(
+        &crate::device_records::public_client().unwrap(),
+        &pds,
+        DID,
+        AUD,
+        NSID,
+        "old-session".into(),
+        || async { Err(CatmosError::AuthSessionChanged) },
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(error, CatmosError::AuthSessionChanged));
     assert_eq!(state.lock().unwrap().pds_bearers.len(), 1);
     assert!(state.lock().unwrap().ds_bearers.is_empty());

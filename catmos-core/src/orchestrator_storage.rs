@@ -1,3 +1,5 @@
+#[path = "request_projection.rs"]
+mod request_projection;
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
@@ -43,6 +45,7 @@ const PAYLOAD_KEY_VERSION_V1: i64 = 1;
 
 /// SQLite-backed storage for Catmos desktop.
 pub struct SqliteStorage {
+    request_owner: RwLock<Option<String>>,
     conn: Mutex<Connection>,
     /// Shared MLS context used for the field-level (envelope) encryption layer.
     /// Set via [`SqliteStorage::set_mls_context`] after the context is built
@@ -70,11 +73,32 @@ impl SqliteStorage {
         }
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")?;
         let storage = Self {
+            request_owner: RwLock::new(None),
             conn: Mutex::new(conn),
             mls_context: RwLock::new(None),
         };
         storage.create_tables()?;
+        storage.create_request_tables()?;
         Ok(storage)
+    }
+
+    pub(crate) fn bind_request_owner(&self, owner: Option<&str>) {
+        if let Ok(mut scope) = self.request_owner.write() {
+            *scope = owner.map(str::to_owned);
+        }
+    }
+    fn request_owner_guard(
+        &self,
+        owner: &str,
+    ) -> std::result::Result<std::sync::RwLockReadGuard<'_, Option<String>>, String> {
+        let scope = self
+            .request_owner
+            .read()
+            .map_err(|_| "Account storage scope unavailable")?;
+        if scope.as_deref() != Some(owner) {
+            return Err("Account storage scope changed".into());
+        }
+        Ok(scope)
     }
 
     /// Bind the per-process MLS context for the field-level encryption layer.
@@ -808,6 +832,14 @@ fn historical_group_owners(conn: &Connection, group_id: &str) -> Result<HashSet<
 
 #[async_trait]
 impl MLSStorageBackend for SqliteStorage {
+    async fn commit_conversation_projection(
+        &self,
+        request: &ConversationProjectionCommitRequest,
+    ) -> Result<ConversationProjectionCommitOutcome> {
+        self.commit_live_projection(request)
+            .map_err(OrchestratorError::Storage)
+    }
+
     async fn ensure_conversation_exists(
         &self,
         user_did: &str,
@@ -854,6 +886,18 @@ impl MLSStorageBackend for SqliteStorage {
         user_did: &str,
         conversation_id: &str,
     ) -> Result<Option<ConversationView>> {
+        // A retired alias remains on disk for authenticated history/replay, but
+        // never becomes a fresh retirement claim on each subsequent sync epoch.
+        let retired:bool=self.conn.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM conversation_projection_aliases WHERE owner_did=?1 AND alias_id=?2)",rusqlite::params![user_did,conversation_id],|r|r.get(0)).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
+        if retired {
+            return Ok(None);
+        }
+        if let Some(canonical) = self
+            .canonical_projection(user_did, conversation_id)
+            .map_err(OrchestratorError::Storage)?
+        {
+            return Ok(Some(canonical));
+        }
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
@@ -902,7 +946,7 @@ impl MLSStorageBackend for SqliteStorage {
         let mut stmt = conn
             .prepare(
                 "SELECT conversation_id, group_id, epoch, members_json, metadata_json, created_at, updated_at, sequencer_did
-                 FROM conversations WHERE user_did = ?1",
+                 FROM conversations WHERE user_did = ?1 AND NOT EXISTS(SELECT 1 FROM conversation_projection_aliases a WHERE a.owner_did=conversations.user_did AND a.alias_id=conversations.conversation_id)",
             )
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
@@ -940,6 +984,16 @@ impl MLSStorageBackend for SqliteStorage {
         let mut result = Vec::new();
         for row in rows {
             result.push(row.map_err(|e| OrchestratorError::Storage(e.to_string()))?);
+        }
+        drop(stmt);
+        drop(conn);
+        for view in &mut result {
+            if let Some(canonical) = self
+                .canonical_projection(user_did, &view.conversation_id)
+                .map_err(OrchestratorError::Storage)?
+            {
+                *view = canonical;
+            }
         }
         Ok(result)
     }
@@ -1047,31 +1101,44 @@ impl MLSStorageBackend for SqliteStorage {
         reset_generation: i32,
         notified_at_ms: i64,
     ) -> Result<()> {
-        if conversation_id.is_empty() || !valid_reset_target(new_group_id_hex) || reset_generation < 0 {
+        if conversation_id.is_empty()
+            || !valid_reset_target(new_group_id_hex)
+            || reset_generation < 0
+        {
             return Err(storage_error("invalid reset authority shape"));
         }
+        let scope = self.request_owner.read().map_err(storage_error)?;
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(storage_error)?;
-        let row = read_reset_projection(&tx, conversation_id)?
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let row = read_reset_projection(&tx, conversation_id, scope.as_deref())?
             .ok_or_else(|| storage_error("reset authority has no unique conversation owner"))?;
-        let state = row.valid_state().ok_or_else(|| storage_error("inconsistent persisted reset authority"))?;
+        let state = row
+            .valid_state()
+            .ok_or_else(|| storage_error("inconsistent persisted reset authority"))?;
         if state == ConversationState::Closed {
             return Err(storage_error("closed conversation cannot be reset"));
         }
         let replay = match state {
             ConversationState::ResetPending { .. } => {
-                let (target, generation, notified) = row.pending_tuple(false)
+                let (target, generation, notified) = row
+                    .pending_tuple(false)
                     .ok_or_else(|| storage_error("incomplete persisted reset authority"))?;
                 if reset_generation < generation
-                    || (reset_generation == generation && (target != new_group_id_hex || notified != notified_at_ms))
+                    || (reset_generation == generation
+                        && (target != new_group_id_hex || notified != notified_at_ms))
                 {
                     return Err(storage_error("stale or conflicting reset authority"));
                 }
                 reset_generation == generation
             }
             _ => {
-                if row.target.is_some() || row.notified.is_some()
-                    || row.generation.is_some_and(|generation| i64::from(reset_generation) <= generation)
+                if row.target.is_some()
+                    || row.notified.is_some()
+                    || row
+                        .generation
+                        .is_some_and(|generation| i64::from(reset_generation) <= generation)
                 {
                     return Err(storage_error("stale or incomplete reset authority"));
                 }
@@ -1079,21 +1146,43 @@ impl MLSStorageBackend for SqliteStorage {
             }
         };
         let reset_state = serde_json::to_string(&ConversationState::ResetPending {
-            new_group_id: new_group_id_hex.into(), reset_generation, notified_at_ms,
-        }).map_err(storage_error)?;
+            new_group_id: new_group_id_hex.into(),
+            reset_generation,
+            notified_at_ms,
+        })
+        .map_err(storage_error)?;
         // Exact replay is a no-op unless a later route/quarantine writer needs
         // reconciliation. All quarantine representations clear in this commit.
-        if !replay || row.needs_rejoin != 1 || row.quarantine_reason.is_some() || row.quarantine_since.is_some() {
-            let changed = tx.execute(
-                "UPDATE conversations SET state=?1, reset_new_group_id=?2, reset_generation=?3,
+        if !replay
+            || row.needs_rejoin != 1
+            || row.quarantine_reason.is_some()
+            || row.quarantine_since.is_some()
+        {
+            let changed = tx
+                .execute(
+                    "UPDATE conversations SET state=?1, reset_new_group_id=?2, reset_generation=?3,
                     reset_notified_at_ms=?4, needs_rejoin=1,
                     quarantine_reason_tag=NULL, quarantine_since_ms=NULL
                  WHERE conversation_id=?5 AND user_did=?6",
-                rusqlite::params![reset_state,new_group_id_hex,reset_generation,notified_at_ms,conversation_id,row.user_did],
-            ).map_err(storage_error)?;
-            if changed != 1 { return Err(storage_error("reset publication did not update its owner")); }
+                    rusqlite::params![
+                        reset_state,
+                        new_group_id_hex,
+                        reset_generation,
+                        notified_at_ms,
+                        conversation_id,
+                        row.user_did
+                    ],
+                )
+                .map_err(storage_error)?;
+            if changed != 1 {
+                return Err(storage_error("reset publication did not update its owner"));
+            }
         }
-        tx.execute("DELETE FROM recovery_backoffs WHERE conversation_id=?1", [conversation_id]).map_err(storage_error)?;
+        tx.execute(
+            "DELETE FROM recovery_backoffs WHERE conversation_id=?1",
+            [conversation_id],
+        )
+        .map_err(storage_error)?;
         tx.commit().map_err(storage_error)?;
         Ok(())
     }
@@ -1106,26 +1195,54 @@ impl MLSStorageBackend for SqliteStorage {
         expected_old_target: &str,
         authoritative_new_target: &str,
     ) -> Result<bool> {
-        if conversation_id.is_empty() || expected_generation < 0
-            || !valid_reset_target(expected_old_target) || !valid_reset_target(authoritative_new_target)
-        { return Ok(false); }
+        if conversation_id.is_empty()
+            || expected_generation < 0
+            || !valid_reset_target(expected_old_target)
+            || !valid_reset_target(authoritative_new_target)
+        {
+            return Ok(false);
+        }
+        let scope = self.request_owner.read().map_err(storage_error)?;
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(storage_error)?;
-        let Some(row) = read_reset_projection(&tx, conversation_id)? else { return Ok(false) };
-        let Some((target,generation,notified)) = row.pending_tuple(true) else { return Ok(false) };
-        if target != expected_old_target || generation != expected_generation
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let Some(row) = read_reset_projection(&tx, conversation_id, scope.as_deref())? else {
+            return Ok(false);
+        };
+        let Some((target, generation, notified)) = row.pending_tuple(true) else {
+            return Ok(false);
+        };
+        if target != expected_old_target
+            || generation != expected_generation
             || persisted_reset_quarantine(&tx, conversation_id)?
-        { return Ok(false); }
-        if target == authoritative_new_target { return Ok(true); }
+        {
+            return Ok(false);
+        }
+        if target == authoritative_new_target {
+            return Ok(true);
+        }
         let state = serde_json::to_string(&ConversationState::ResetPending {
-            new_group_id: authoritative_new_target.into(), reset_generation: generation, notified_at_ms: notified,
-        }).map_err(storage_error)?;
-        let changed = tx.execute(
-            "UPDATE conversations SET state=?1, reset_new_group_id=?2, needs_rejoin=1
+            new_group_id: authoritative_new_target.into(),
+            reset_generation: generation,
+            notified_at_ms: notified,
+        })
+        .map_err(storage_error)?;
+        let changed = tx
+            .execute(
+                "UPDATE conversations SET state=?1, reset_new_group_id=?2, needs_rejoin=1
              WHERE conversation_id=?3 AND user_did=?4",
-            rusqlite::params![state,authoritative_new_target,conversation_id,row.user_did],
-        ).map_err(storage_error)?;
-        if changed != 1 { return Ok(false); }
+                rusqlite::params![
+                    state,
+                    authoritative_new_target,
+                    conversation_id,
+                    row.user_did
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Ok(false);
+        }
         tx.commit().map_err(storage_error)?;
         Ok(true)
     }
@@ -1139,41 +1256,70 @@ impl MLSStorageBackend for SqliteStorage {
         expected_new_group_id_hex: &str,
         landed_epoch: u64,
     ) -> Result<bool> {
-        if conversation_id.is_empty() || expected_generation < 0 || !valid_reset_target(expected_new_group_id_hex) {
+        if conversation_id.is_empty()
+            || expected_generation < 0
+            || !valid_reset_target(expected_new_group_id_hex)
+        {
             return Ok(false);
         }
         let landed_epoch = i64::try_from(landed_epoch).map_err(storage_error)?;
+        let scope = self.request_owner.read().map_err(storage_error)?;
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(storage_error)?;
-        let Some(row) = read_reset_projection(&tx, conversation_id)? else { return Ok(false) };
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let Some(row) = read_reset_projection(&tx, conversation_id, scope.as_deref())? else {
+            return Ok(false);
+        };
         // Exact post-commit retry reads the durable completion without changing
         // aliases, timestamps or any message/crypto row.
         if row.valid_state() == Some(ConversationState::Active)
-            && row.target.is_none() && row.notified.is_none()
+            && row.target.is_none()
+            && row.notified.is_none()
             && row.generation == Some(i64::from(expected_generation))
             && row.group_id == expected_new_group_id_hex
-            && row.epoch == landed_epoch && row.join_epoch == Some(landed_epoch)
-            && row.needs_rejoin == 0 && row.quarantine_reason.is_none() && row.quarantine_since.is_none()
+            && row.epoch == landed_epoch
+            && row.join_epoch == Some(landed_epoch)
+            && row.needs_rejoin == 0
+            && row.quarantine_reason.is_none()
+            && row.quarantine_since.is_none()
             && !persisted_reset_quarantine(&tx, conversation_id)?
-        { return Ok(true); }
-        let Some((target,generation,_)) = row.pending_tuple(true) else { return Ok(false) };
-        if target != expected_new_group_id_hex || generation != expected_generation
+        {
+            return Ok(true);
+        }
+        let Some((target, generation, _)) = row.pending_tuple(true) else {
+            return Ok(false);
+        };
+        if target != expected_new_group_id_hex
+            || generation != expected_generation
             || (row.group_id == expected_new_group_id_hex && row.epoch > landed_epoch)
             || persisted_reset_quarantine(&tx, conversation_id)?
-        { return Ok(false); }
+        {
+            return Ok(false);
+        }
+        tx.execute("INSERT OR IGNORE INTO conversation_projection_group_history(owner_did,conversation_id,group_id,epoch) VALUES(?1,?2,?3,?4)",rusqlite::params![row.user_did,conversation_id,row.group_id,row.epoch]).map_err(storage_error)?;
         for group_id in [row.group_id.as_str(), expected_new_group_id_hex] {
             tx.execute(
                 "INSERT OR IGNORE INTO conversation_group_aliases (conversation_id,user_did,group_id) VALUES (?1,?2,?3)",
                 rusqlite::params![conversation_id,row.user_did,group_id],
             ).map_err(storage_error)?;
         }
-        let changed = tx.execute(
-            "UPDATE conversations SET group_id=?1,epoch=?2,join_epoch=?2,state='Active',
+        let changed = tx
+            .execute(
+                "UPDATE conversations SET group_id=?1,epoch=?2,join_epoch=?2,state='Active',
                 reset_new_group_id=NULL,reset_notified_at_ms=NULL,needs_rejoin=0
              WHERE conversation_id=?3 AND user_did=?4",
-            rusqlite::params![expected_new_group_id_hex,landed_epoch,conversation_id,row.user_did],
-        ).map_err(storage_error)?;
-        if changed != 1 { return Ok(false); }
+                rusqlite::params![
+                    expected_new_group_id_hex,
+                    landed_epoch,
+                    conversation_id,
+                    row.user_did
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Ok(false);
+        }
         tx.commit().map_err(storage_error)?;
         Ok(true)
     }
@@ -1188,42 +1334,68 @@ impl MLSStorageBackend for SqliteStorage {
         terminal_epoch: u64,
         terminal_state: ConversationState,
     ) -> Result<bool> {
-        let canonical_id = uuid::Uuid::parse_str(conversation_id).is_ok_and(|id|
-            id.get_version_num() == 4 && id.get_variant() == uuid::Variant::RFC4122
-                && id.to_string() == conversation_id);
+        let canonical_id = uuid::Uuid::parse_str(conversation_id).is_ok_and(|id| {
+            id.get_version_num() == 4
+                && id.get_variant() == uuid::Variant::RFC4122
+                && id.to_string() == conversation_id
+        });
         if !canonical_id
             || expected_group_id_hex.len() != 64
-            || !expected_group_id_hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !expected_group_id_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || expected_reset_generation.is_some_and(|generation| generation <= 0)
-            || !matches!(terminal_state, ConversationState::Closed | ConversationState::DeviceRemoved)
+            || !matches!(
+                terminal_state,
+                ConversationState::Closed | ConversationState::DeviceRemoved
+            )
         {
             return Ok(false);
         }
         if terminal_epoch > 9_007_199_254_740_991 {
-            return Err(storage_error("account exit epoch exceeds canonical integer range"));
+            return Err(storage_error(
+                "account exit epoch exceeds canonical integer range",
+            ));
         }
         let terminal_epoch = i64::try_from(terminal_epoch).map_err(storage_error)?;
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(storage_error)?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
         let rows = {
-            let mut statement = tx.prepare(
-                "SELECT user_did, group_id, epoch, state, reset_new_group_id,
+            let mut statement = tx
+                .prepare(
+                    "SELECT user_did, group_id, epoch, state, reset_new_group_id,
                         reset_generation, reset_notified_at_ms
                  FROM conversations WHERE conversation_id = ?1",
-            ).map_err(storage_error)?;
-            let rows = statement.query_map([conversation_id], |row| Ok((
-                row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<i64>>(5)?, row.get::<_, Option<i64>>(6)?,
-            ))).map_err(storage_error)?;
-            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(storage_error)?
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map([conversation_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                    ))
+                })
+                .map_err(storage_error)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(storage_error)?
         };
         // The callback has no user-DID parameter; an ambiguous shared bucket
         // must never update more than one account's projection.
-        let [(user_did, group_id, epoch, state_json, target, generation, notified)] = rows.as_slice() else {
+        let [(user_did, group_id, epoch, state_json, target, generation, notified)] =
+            rows.as_slice()
+        else {
             return Ok(false);
         };
-        let state = if state_json == "Active" { ConversationState::Active } else {
+        let state = if state_json == "Active" {
+            ConversationState::Active
+        } else {
             match serde_json::from_str::<ConversationState>(state_json) {
                 Ok(state) => state,
                 Err(_) => return Ok(false),
@@ -1234,33 +1406,64 @@ impl MLSStorageBackend for SqliteStorage {
         }
         let pending = match (target.as_deref(), *generation, *notified) {
             (None, _, None) => None,
-            (Some(target), Some(generation), Some(notified)) if !target.is_empty() => Some((target, generation, notified)),
+            (Some(target), Some(generation), Some(notified)) if !target.is_empty() => {
+                Some((target, generation, notified))
+            }
             _ => return Ok(false),
         };
-        if let ConversationState::ResetPending { new_group_id, reset_generation, notified_at_ms } = &state {
-            if pending != Some((new_group_id.as_str(), i64::from(*reset_generation), *notified_at_ms)) {
+        if let ConversationState::ResetPending {
+            new_group_id,
+            reset_generation,
+            notified_at_ms,
+        } = &state
+        {
+            if pending
+                != Some((
+                    new_group_id.as_str(),
+                    i64::from(*reset_generation),
+                    *notified_at_ms,
+                ))
+            {
                 return Ok(false);
             }
         }
-        let was_terminal = matches!(state, ConversationState::Closed | ConversationState::DeviceRemoved);
+        let was_terminal = matches!(
+            state,
+            ConversationState::Closed | ConversationState::DeviceRemoved
+        );
         let was_closed = state == ConversationState::Closed;
         if was_closed && (state != terminal_state || pending.is_some()) {
             return Ok(false);
         }
         let matches = match expected_reset_generation {
             Some(expected) => match pending {
-                Some((target, generation, _)) => target == expected_group_id_hex
-                    && generation == i64::from(expected)
-                    && (group_id != expected_group_id_hex || *epoch <= terminal_epoch),
-                None => was_terminal && group_id == expected_group_id_hex
-                    && *generation == Some(i64::from(expected))
-                    && state == terminal_state && *epoch == terminal_epoch,
+                Some((target, generation, _)) => {
+                    target == expected_group_id_hex
+                        && generation == i64::from(expected)
+                        && (group_id != expected_group_id_hex || *epoch <= terminal_epoch)
+                }
+                None => {
+                    was_terminal
+                        && group_id == expected_group_id_hex
+                        && *generation == Some(i64::from(expected))
+                        && state == terminal_state
+                        && *epoch == terminal_epoch
+                }
             },
-            None => pending.is_none() && !matches!(state, ConversationState::ResetPending { .. })
-                && group_id == expected_group_id_hex
-                && if was_closed { *epoch == terminal_epoch } else { *epoch <= terminal_epoch },
+            None => {
+                pending.is_none()
+                    && !matches!(state, ConversationState::ResetPending { .. })
+                    && group_id == expected_group_id_hex
+                    && if was_closed {
+                        *epoch == terminal_epoch
+                    } else {
+                        *epoch <= terminal_epoch
+                    }
+            }
         };
-        if !matches { return Ok(false); }
+        if !matches {
+            return Ok(false);
+        }
         for alias in [group_id.as_str(), expected_group_id_hex] {
             tx.execute(
                 "INSERT OR IGNORE INTO conversation_group_aliases (conversation_id, user_did, group_id) VALUES (?1, ?2, ?3)",
@@ -1268,13 +1471,23 @@ impl MLSStorageBackend for SqliteStorage {
             ).map_err(storage_error)?;
         }
         let state_json = serde_json::to_string(&terminal_state).map_err(storage_error)?;
-        let changed = tx.execute(
-            "UPDATE conversations SET group_id = ?1, epoch = ?2, state = ?3,
+        let changed = tx
+            .execute(
+                "UPDATE conversations SET group_id = ?1, epoch = ?2, state = ?3,
                     reset_new_group_id = NULL, reset_notified_at_ms = NULL, needs_rejoin = 0
              WHERE conversation_id = ?4 AND user_did = ?5",
-            rusqlite::params![expected_group_id_hex, terminal_epoch, state_json, conversation_id, user_did],
-        ).map_err(storage_error)?;
-        if changed != 1 { return Ok(false); }
+                rusqlite::params![
+                    expected_group_id_hex,
+                    terminal_epoch,
+                    state_json,
+                    conversation_id,
+                    user_did
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Ok(false);
+        }
         // reset_generation remains the high-water fence; all message rows,
         // native state, keys and historical aliases remain untouched.
         tx.commit().map_err(storage_error)?;
@@ -1488,8 +1701,13 @@ impl MLSStorageBackend for SqliteStorage {
         let mut result: Vec<Message> = by_id.into_values().collect();
         result.sort_by(|left, right| {
             // A local send timestamp can be later than the next server entry.
-            crate::types::message_order_key(left.sequence_number, &left.timestamp, &left.id)
-                .cmp(&crate::types::message_order_key(right.sequence_number, &right.timestamp, &right.id))
+            crate::types::message_order_key(left.sequence_number, &left.timestamp, &left.id).cmp(
+                &crate::types::message_order_key(
+                    right.sequence_number,
+                    &right.timestamp,
+                    &right.id,
+                ),
+            )
         });
         if result.len() > limit as usize {
             result.drain(..result.len() - limit as usize);
@@ -1545,10 +1763,19 @@ impl MLSStorageBackend for SqliteStorage {
     }
 
     async fn set_group_state(&self, state: &GroupState) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        // Keep owner selection stable for both native state and incarnation writes.
+        // Match projection lock order: owner before SQLite connection.
+        let owner_scope = self
+            .request_owner
+            .read()
+            .map_err(|_| OrchestratorError::Storage("Account scope unavailable".into()))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         let members_json = serde_json::to_string(&state.members)
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
-        conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO group_states (group_id, conversation_id, epoch, members_json)
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![
@@ -1559,6 +1786,11 @@ impl MLSStorageBackend for SqliteStorage {
             ],
         )
         .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        if let Some(owner) = owner_scope.as_ref() {
+            tx.execute("INSERT INTO conversation_projection_incarnations(owner_did,group_id,epoch) VALUES(?1,?2,?3) ON CONFLICT(owner_did,group_id) DO UPDATE SET epoch=excluded.epoch WHERE epoch<=excluded.epoch",rusqlite::params![owner,state.group_id,state.epoch]).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -1747,6 +1979,7 @@ impl MLSStorageBackend for SqliteStorage {
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
         &[
             "get_conversation_state",
+            "commit_conversation_projection",
             "mark_reset_pending",
             "adopt_reset_pending_target",
             "complete_reset_pending",
@@ -1790,11 +2023,18 @@ struct ResetProjectionRow {
 
 impl ResetProjectionRow {
     fn valid_state(&self) -> Option<ConversationState> {
-        if self.epoch < 0 || self.join_epoch.is_some_and(|epoch| epoch < 0)
-            || self.generation.is_some_and(|generation| !(0..=i64::from(i32::MAX)).contains(&generation))
+        if self.epoch < 0
+            || self.join_epoch.is_some_and(|epoch| epoch < 0)
+            || self
+                .generation
+                .is_some_and(|generation| !(0..=i64::from(i32::MAX)).contains(&generation))
             || !matches!(self.needs_rejoin, 0 | 1)
-        { return None; }
-        if self.state == "Active" { return Some(ConversationState::Active); }
+        {
+            return None;
+        }
+        if self.state == "Active" {
+            return Some(ConversationState::Active);
+        }
         let value: serde_json::Value = serde_json::from_str(&self.state).ok()?;
         let state: ConversationState = serde_json::from_str(&self.state).ok()?;
         // Future/unknown payload fields cannot silently disappear on rewrite.
@@ -1802,35 +2042,72 @@ impl ResetProjectionRow {
     }
 
     fn pending_tuple(&self, require_clean_route: bool) -> Option<(&str, i32, i64)> {
-        let ConversationState::ResetPending { new_group_id, reset_generation, notified_at_ms } = self.valid_state()? else { return None };
+        let ConversationState::ResetPending {
+            new_group_id,
+            reset_generation,
+            notified_at_ms,
+        } = self.valid_state()?
+        else {
+            return None;
+        };
         let target = self.target.as_deref()?;
-        if !valid_reset_target(target) || reset_generation < 0
-            || target != new_group_id || self.generation != Some(i64::from(reset_generation))
+        if !valid_reset_target(target)
+            || reset_generation < 0
+            || target != new_group_id
+            || self.generation != Some(i64::from(reset_generation))
             || self.notified != Some(notified_at_ms)
-            || (require_clean_route && (self.needs_rejoin != 1 || self.quarantine_reason.is_some() || self.quarantine_since.is_some()))
-        { return None; }
+            || (require_clean_route
+                && (self.needs_rejoin != 1
+                    || self.quarantine_reason.is_some()
+                    || self.quarantine_since.is_some()))
+        {
+            return None;
+        }
         Some((target, reset_generation, notified_at_ms))
     }
 }
 
-fn read_reset_projection(tx: &rusqlite::Transaction<'_>, conversation_id: &str) -> Result<Option<ResetProjectionRow>> {
-    let mut statement = tx.prepare(
-        "SELECT user_did,group_id,epoch,join_epoch,state,reset_new_group_id,reset_generation,
+fn read_reset_projection(
+    tx: &rusqlite::Transaction<'_>,
+    conversation_id: &str,
+    owner: Option<&str>,
+) -> Result<Option<ResetProjectionRow>> {
+    let mut statement = tx
+        .prepare(
+            "SELECT user_did,group_id,epoch,join_epoch,state,reset_new_group_id,reset_generation,
                 reset_notified_at_ms,needs_rejoin,quarantine_reason_tag,quarantine_since_ms
-         FROM conversations WHERE conversation_id=?1",
-    ).map_err(storage_error)?;
-    let rows = statement.query_map([conversation_id], |row| Ok(ResetProjectionRow {
-        user_did: row.get(0)?,group_id: row.get(1)?,epoch: row.get(2)?,join_epoch: row.get(3)?,
-        state: row.get(4)?,target: row.get(5)?,generation: row.get(6)?,notified: row.get(7)?,
-        needs_rejoin: row.get(8)?,quarantine_reason: row.get(9)?,quarantine_since: row.get(10)?,
-    })).map_err(storage_error)?;
-    let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(storage_error)?;
+         FROM conversations WHERE conversation_id=?1 AND (?2 IS NULL OR user_did=?2)",
+        )
+        .map_err(storage_error)?;
+    let rows = statement
+        .query_map(rusqlite::params![conversation_id, owner], |row| {
+            Ok(ResetProjectionRow {
+                user_did: row.get(0)?,
+                group_id: row.get(1)?,
+                epoch: row.get(2)?,
+                join_epoch: row.get(3)?,
+                state: row.get(4)?,
+                target: row.get(5)?,
+                generation: row.get(6)?,
+                notified: row.get(7)?,
+                needs_rejoin: row.get(8)?,
+                quarantine_reason: row.get(9)?,
+                quarantine_since: row.get(10)?,
+            })
+        })
+        .map_err(storage_error)?;
+    let mut rows = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(storage_error)?;
     // The callback has no DID argument; account ambiguity must not update
     // multiple projections even if all their pending tuples happen to match.
     Ok(if rows.len() == 1 { rows.pop() } else { None })
 }
 
-fn persisted_reset_quarantine(tx: &rusqlite::Transaction<'_>, conversation_id: &str) -> Result<bool> {
+fn persisted_reset_quarantine(
+    tx: &rusqlite::Transaction<'_>,
+    conversation_id: &str,
+) -> Result<bool> {
     tx.query_row("SELECT EXISTS(SELECT 1 FROM recovery_backoffs WHERE conversation_id=?1 AND quarantined_until_ms IS NOT NULL)", [conversation_id], |row| row.get(0)).map_err(storage_error)
 }
 
@@ -2316,12 +2593,22 @@ mod field_encryption_tests {
         );
     }
 
-    fn exit_table_snapshot(storage: &SqliteStorage, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    fn exit_table_snapshot(
+        storage: &SqliteStorage,
+        table: &str,
+    ) -> Vec<Vec<rusqlite::types::Value>> {
         let conn = storage.conn.lock().unwrap();
-        let mut statement = conn.prepare(&format!("SELECT * FROM {table} ORDER BY rowid")).unwrap();
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
         let columns = statement.column_count();
-        statement.query_map([], |row| (0..columns).map(|column| row.get(column)).collect())
-            .unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap()
+        statement
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -2331,49 +2618,151 @@ mod field_encryption_tests {
         let id = "8188478e-8d96-4a19-9239-3a2a831b40ea";
         let old_group = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         let new_group = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
-        storage.ensure_conversation_exists("did:plc:alice", id, old_group).await.unwrap();
-        storage.set_group_state(&GroupState { group_id: old_group.into(), conversation_id: id.into(), epoch: 9, members: vec![] }).await.unwrap();
+        storage
+            .ensure_conversation_exists("did:plc:alice", id, old_group)
+            .await
+            .unwrap();
+        storage
+            .set_group_state(&GroupState {
+                group_id: old_group.into(),
+                conversation_id: id.into(),
+                epoch: 9,
+                members: vec![],
+            })
+            .await
+            .unwrap();
         let mut message = hmac_fixture_message("retained-exit", 1);
         message.conversation_id = id.into();
         storage.store_message(&message).await.unwrap();
-        storage.mark_reset_pending(id, new_group, 7, 123).await.unwrap();
-        storage.set_conversation_state(id, ConversationState::ResetPending { new_group_id: new_group.into(), reset_generation: 7, notified_at_ms: 123 }).await.unwrap();
+        storage
+            .mark_reset_pending(id, new_group, 7, 123)
+            .await
+            .unwrap();
+        storage
+            .set_conversation_state(
+                id,
+                ConversationState::ResetPending {
+                    new_group_id: new_group.into(),
+                    reset_generation: 7,
+                    notified_at_ms: 123,
+                },
+            )
+            .await
+            .unwrap();
         storage.mark_needs_rejoin(id).await.unwrap();
         let messages = exit_table_snapshot(&storage, "messages");
         let native_projection = exit_table_snapshot(&storage, "group_states");
-        assert!(storage.complete_account_exit(id, new_group, Some(7), 2, ConversationState::Closed).await.unwrap());
-        assert_eq!(storage.get_conversation_state(id).await.unwrap(), Some(ConversationState::Closed));
+        assert!(storage
+            .complete_account_exit(id, new_group, Some(7), 2, ConversationState::Closed)
+            .await
+            .unwrap());
+        assert_eq!(
+            storage.get_conversation_state(id).await.unwrap(),
+            Some(ConversationState::Closed)
+        );
         assert!(!storage.needs_rejoin(id).await.unwrap());
         assert!(storage.get_reset_pending(id).is_none());
-        assert_eq!(storage.get_conversation("did:plc:alice", id).await.unwrap().unwrap().group_id, new_group);
-        assert_eq!(storage.get_conversation("did:plc:alice", id).await.unwrap().unwrap().epoch, 2);
+        assert_eq!(
+            storage
+                .get_conversation("did:plc:alice", id)
+                .await
+                .unwrap()
+                .unwrap()
+                .group_id,
+            new_group
+        );
+        assert_eq!(
+            storage
+                .get_conversation("did:plc:alice", id)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            2
+        );
         assert_eq!(exit_table_snapshot(&storage, "messages"), messages);
-        assert_eq!(exit_table_snapshot(&storage, "group_states"), native_projection);
-        let generation: Option<i64> = storage.conn.lock().unwrap().query_row("SELECT reset_generation FROM conversations WHERE conversation_id = ?1", [id], |row| row.get(0)).unwrap();
+        assert_eq!(
+            exit_table_snapshot(&storage, "group_states"),
+            native_projection
+        );
+        let generation: Option<i64> = storage
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT reset_generation FROM conversations WHERE conversation_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(generation, Some(7));
         let aliases = storage.list_conversation_group_ids(id).unwrap();
         assert!(aliases.contains(&old_group.to_owned()) && aliases.contains(&new_group.to_owned()));
-        assert!(storage.complete_account_exit(id, new_group, Some(7), 2, ConversationState::Closed).await.unwrap());
-        assert!(!storage.complete_account_exit(id, new_group, Some(6), 2, ConversationState::Closed).await.unwrap());
-        assert!(!storage.complete_account_exit(id, new_group, Some(8), 2, ConversationState::Closed).await.unwrap());
-        assert!(storage.complete_account_exit(id, new_group, None, 2, ConversationState::Closed).await.unwrap());
+        assert!(storage
+            .complete_account_exit(id, new_group, Some(7), 2, ConversationState::Closed)
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(id, new_group, Some(6), 2, ConversationState::Closed)
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(id, new_group, Some(8), 2, ConversationState::Closed)
+            .await
+            .unwrap());
+        assert!(storage
+            .complete_account_exit(id, new_group, None, 2, ConversationState::Closed)
+            .await
+            .unwrap());
         drop(storage);
         let reopened = hmac_fixture_storage(root.path(), "exit-crypto-reloaded");
-        assert_eq!(reopened.get_conversation_state(id).await.unwrap(), Some(ConversationState::Closed));
-        assert_eq!(reopened.get_messages(id, 10, None).await.unwrap()[0].text, "fixture body retained-exit");
+        assert_eq!(
+            reopened.get_conversation_state(id).await.unwrap(),
+            Some(ConversationState::Closed)
+        );
+        assert_eq!(
+            reopened.get_messages(id, 10, None).await.unwrap()[0].text,
+            "fixture body retained-exit"
+        );
         assert_eq!(exit_table_snapshot(&reopened, "messages"), messages);
     }
 
     #[tokio::test]
     async fn account_exit_mismatch_and_partial_payload_are_read_only() {
-        for case in ["wrong-group", "old-generation", "new-generation", "no-reset-expectation", "partial", "wrong-state-payload", "newer-epoch", "ambiguous-account", "invalid-terminal"] {
+        for case in [
+            "wrong-group",
+            "old-generation",
+            "new-generation",
+            "no-reset-expectation",
+            "partial",
+            "wrong-state-payload",
+            "newer-epoch",
+            "ambiguous-account",
+            "invalid-terminal",
+        ] {
             let (_root, storage) = new_temp_storage();
             let id = "8188478e-8d96-4a19-9239-3a2a831b40ea";
             let old_group = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
             let target = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
-            storage.ensure_conversation_exists("did:plc:alice", id, old_group).await.unwrap();
-            storage.mark_reset_pending(id, target, 7, 123).await.unwrap();
-            storage.set_conversation_state(id, ConversationState::ResetPending { new_group_id: target.into(), reset_generation: 7, notified_at_ms: 123 }).await.unwrap();
+            storage
+                .ensure_conversation_exists("did:plc:alice", id, old_group)
+                .await
+                .unwrap();
+            storage
+                .mark_reset_pending(id, target, 7, 123)
+                .await
+                .unwrap();
+            storage
+                .set_conversation_state(
+                    id,
+                    ConversationState::ResetPending {
+                        new_group_id: target.into(),
+                        reset_generation: 7,
+                        notified_at_ms: 123,
+                    },
+                )
+                .await
+                .unwrap();
             let mut expected_group = target;
             let mut expected_generation = Some(7);
             let mut terminal = ConversationState::Closed;
@@ -2382,16 +2771,68 @@ mod field_encryption_tests {
                 "old-generation" => expected_generation = Some(6),
                 "new-generation" => expected_generation = Some(8),
                 "no-reset-expectation" => expected_generation = None,
-                "partial" => { storage.conn.lock().unwrap().execute("UPDATE conversations SET reset_notified_at_ms = NULL", []).unwrap(); },
-                "wrong-state-payload" => storage.set_conversation_state(id, ConversationState::ResetPending { new_group_id: old_group.into(), reset_generation: 7, notified_at_ms: 123 }).await.unwrap(),
-                "newer-epoch" => { storage.conn.lock().unwrap().execute("UPDATE conversations SET group_id = ?1, epoch = 99", [target]).unwrap(); },
-                "ambiguous-account" => storage.ensure_conversation_exists("did:plc:bob", id, old_group).await.unwrap(),
+                "partial" => {
+                    storage
+                        .conn
+                        .lock()
+                        .unwrap()
+                        .execute("UPDATE conversations SET reset_notified_at_ms = NULL", [])
+                        .unwrap();
+                }
+                "wrong-state-payload" => storage
+                    .set_conversation_state(
+                        id,
+                        ConversationState::ResetPending {
+                            new_group_id: old_group.into(),
+                            reset_generation: 7,
+                            notified_at_ms: 123,
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                "newer-epoch" => {
+                    storage
+                        .conn
+                        .lock()
+                        .unwrap()
+                        .execute(
+                            "UPDATE conversations SET group_id = ?1, epoch = 99",
+                            [target],
+                        )
+                        .unwrap();
+                }
+                "ambiguous-account" => storage
+                    .ensure_conversation_exists("did:plc:bob", id, old_group)
+                    .await
+                    .unwrap(),
                 "invalid-terminal" => terminal = ConversationState::Active,
                 _ => unreachable!(),
             }
-            let before: Vec<_> = ["conversations", "conversation_group_aliases", "messages", "group_states"].iter().map(|table| exit_table_snapshot(&storage, table)).collect();
-            assert!(!storage.complete_account_exit(id, expected_group, expected_generation, 2, terminal).await.unwrap(), "{case}");
-            let after: Vec<_> = ["conversations", "conversation_group_aliases", "messages", "group_states"].iter().map(|table| exit_table_snapshot(&storage, table)).collect();
+            let before: Vec<_> = [
+                "conversations",
+                "conversation_group_aliases",
+                "messages",
+                "group_states",
+            ]
+            .iter()
+            .map(|table| exit_table_snapshot(&storage, table))
+            .collect();
+            assert!(
+                !storage
+                    .complete_account_exit(id, expected_group, expected_generation, 2, terminal)
+                    .await
+                    .unwrap(),
+                "{case}"
+            );
+            let after: Vec<_> = [
+                "conversations",
+                "conversation_group_aliases",
+                "messages",
+                "group_states",
+            ]
+            .iter()
+            .map(|table| exit_table_snapshot(&storage, table))
+            .collect();
             assert_eq!(before, after, "CAS miss wrote state for {case}");
         }
     }
@@ -2403,20 +2844,60 @@ mod field_encryption_tests {
         let target = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
         for terminal in [ConversationState::Closed, ConversationState::DeviceRemoved] {
             let (_root, storage) = new_temp_storage();
-            storage.ensure_conversation_exists("did:plc:alice", id, old_group).await.unwrap();
-            storage.set_conversation_state(id, ConversationState::DeviceRemoved).await.unwrap();
-            storage.conn.lock().unwrap().execute("UPDATE conversations SET epoch = 9", []).unwrap();
-            storage.mark_reset_pending(id, target, 7, 123).await.unwrap();
+            storage
+                .ensure_conversation_exists("did:plc:alice", id, old_group)
+                .await
+                .unwrap();
+            storage
+                .set_conversation_state(id, ConversationState::DeviceRemoved)
+                .await
+                .unwrap();
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .execute("UPDATE conversations SET epoch = 9", [])
+                .unwrap();
+            storage
+                .mark_reset_pending(id, target, 7, 123)
+                .await
+                .unwrap();
             let before = exit_table_snapshot(&storage, "conversations");
-            assert!(!storage.complete_account_exit(id, target, Some(8), 2, terminal.clone()).await.unwrap());
-            assert!(!storage.complete_account_exit(id, old_group, Some(7), 2, terminal.clone()).await.unwrap());
-            assert!(!storage.complete_account_exit(id, target, None, 2, terminal.clone()).await.unwrap());
+            assert!(!storage
+                .complete_account_exit(id, target, Some(8), 2, terminal.clone())
+                .await
+                .unwrap());
+            assert!(!storage
+                .complete_account_exit(id, old_group, Some(7), 2, terminal.clone())
+                .await
+                .unwrap());
+            assert!(!storage
+                .complete_account_exit(id, target, None, 2, terminal.clone())
+                .await
+                .unwrap());
             assert_eq!(exit_table_snapshot(&storage, "conversations"), before);
-            assert!(storage.complete_account_exit(id, target, Some(7), 2, terminal.clone()).await.unwrap());
-            assert_eq!(storage.get_conversation_state(id).await.unwrap(), Some(terminal));
-            assert_eq!(storage.get_conversation("did:plc:alice", id).await.unwrap().unwrap().epoch, 2);
+            assert!(storage
+                .complete_account_exit(id, target, Some(7), 2, terminal.clone())
+                .await
+                .unwrap());
+            assert_eq!(
+                storage.get_conversation_state(id).await.unwrap(),
+                Some(terminal)
+            );
+            assert_eq!(
+                storage
+                    .get_conversation("did:plc:alice", id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .epoch,
+                2
+            );
             assert!(!storage.needs_rejoin(id).await.unwrap());
-            assert!(storage.list_conversation_group_ids(id).unwrap().contains(&old_group.to_owned()));
+            assert!(storage
+                .list_conversation_group_ids(id)
+                .unwrap()
+                .contains(&old_group.to_owned()));
         }
     }
 
@@ -2425,21 +2906,74 @@ mod field_encryption_tests {
         let canonical_id = "8188478e-8d96-4a19-9239-3a2a831b40ea";
         let canonical_group = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         for (case, id, group, generation) in [
-            ("legacy-id", "exit-legacy".to_owned(), canonical_group.to_owned(), None),
-            ("uppercase-id", canonical_id.to_uppercase(), canonical_group.to_owned(), None),
-            ("compact-id", canonical_id.replace('-', ""), canonical_group.to_owned(), None),
-            ("uuid-v1", "8188478e-8d96-1a19-9239-3a2a831b40ea".into(), canonical_group.to_owned(), None),
-            ("uuid-wrong-variant", "8188478e-8d96-4a19-7239-3a2a831b40ea".into(), canonical_group.to_owned(), None),
+            (
+                "legacy-id",
+                "exit-legacy".to_owned(),
+                canonical_group.to_owned(),
+                None,
+            ),
+            (
+                "uppercase-id",
+                canonical_id.to_uppercase(),
+                canonical_group.to_owned(),
+                None,
+            ),
+            (
+                "compact-id",
+                canonical_id.replace('-', ""),
+                canonical_group.to_owned(),
+                None,
+            ),
+            (
+                "uuid-v1",
+                "8188478e-8d96-1a19-9239-3a2a831b40ea".into(),
+                canonical_group.to_owned(),
+                None,
+            ),
+            (
+                "uuid-wrong-variant",
+                "8188478e-8d96-4a19-7239-3a2a831b40ea".into(),
+                canonical_group.to_owned(),
+                None,
+            ),
             ("empty-group", canonical_id.to_owned(), String::new(), None),
-            ("short-group", canonical_id.to_owned(), "aa".repeat(16), None),
+            (
+                "short-group",
+                canonical_id.to_owned(),
+                "aa".repeat(16),
+                None,
+            ),
             ("long-group", canonical_id.to_owned(), "aa".repeat(33), None),
-            ("uppercase-group", canonical_id.to_owned(), canonical_group.to_uppercase(), None),
-            ("nonhex-group", canonical_id.to_owned(), "gg".repeat(32), None),
-            ("zero-generation", canonical_id.to_owned(), canonical_group.to_owned(), Some(0)),
-            ("negative-generation", canonical_id.to_owned(), canonical_group.to_owned(), Some(-1)),
+            (
+                "uppercase-group",
+                canonical_id.to_owned(),
+                canonical_group.to_uppercase(),
+                None,
+            ),
+            (
+                "nonhex-group",
+                canonical_id.to_owned(),
+                "gg".repeat(32),
+                None,
+            ),
+            (
+                "zero-generation",
+                canonical_id.to_owned(),
+                canonical_group.to_owned(),
+                Some(0),
+            ),
+            (
+                "negative-generation",
+                canonical_id.to_owned(),
+                canonical_group.to_owned(),
+                Some(-1),
+            ),
         ] {
             let (_root, storage) = new_temp_storage();
-            storage.ensure_conversation_exists("did:plc:alice", &id, &group).await.unwrap();
+            storage
+                .ensure_conversation_exists("did:plc:alice", &id, &group)
+                .await
+                .unwrap();
             if let Some(generation) = generation {
                 // Deliberately corrupt stored authority; the validated reset
                 // publication callback now correctly rejects these inputs.
@@ -2447,16 +2981,47 @@ mod field_encryption_tests {
                     "UPDATE conversations SET reset_new_group_id=?1, reset_generation=?2, reset_notified_at_ms=123, needs_rejoin=1 WHERE conversation_id=?3",
                     rusqlite::params![group,generation,id],
                 ).unwrap();
-                storage.set_conversation_state(&id, ConversationState::ResetPending {
-                    new_group_id: group.clone(), reset_generation: generation, notified_at_ms: 123,
-                }).await.unwrap();
+                storage
+                    .set_conversation_state(
+                        &id,
+                        ConversationState::ResetPending {
+                            new_group_id: group.clone(),
+                            reset_generation: generation,
+                            notified_at_ms: 123,
+                        },
+                    )
+                    .await
+                    .unwrap();
             }
-            let before: Vec<_> = ["conversations", "conversation_group_aliases", "messages", "group_states"]
-                .iter().map(|table| exit_table_snapshot(&storage, table)).collect();
-            assert!(!storage.complete_account_exit(&id, &group, generation, 2, ConversationState::Closed).await.unwrap(), "{case}");
-            let after: Vec<_> = ["conversations", "conversation_group_aliases", "messages", "group_states"]
-                .iter().map(|table| exit_table_snapshot(&storage, table)).collect();
-            assert_eq!(before, after, "invalid canonical shape wrote state for {case}");
+            let before: Vec<_> = [
+                "conversations",
+                "conversation_group_aliases",
+                "messages",
+                "group_states",
+            ]
+            .iter()
+            .map(|table| exit_table_snapshot(&storage, table))
+            .collect();
+            assert!(
+                !storage
+                    .complete_account_exit(&id, &group, generation, 2, ConversationState::Closed)
+                    .await
+                    .unwrap(),
+                "{case}"
+            );
+            let after: Vec<_> = [
+                "conversations",
+                "conversation_group_aliases",
+                "messages",
+                "group_states",
+            ]
+            .iter()
+            .map(|table| exit_table_snapshot(&storage, table))
+            .collect();
+            assert_eq!(
+                before, after,
+                "invalid canonical shape wrote state for {case}"
+            );
         }
     }
 
@@ -2465,34 +3030,116 @@ mod field_encryption_tests {
         let (_root, storage) = new_temp_storage();
         let id = "8188478e-8d96-4a19-9239-3a2a831b40ea";
         let group = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-        storage.ensure_conversation_exists("did:plc:alice", id, group).await.unwrap();
-        storage.conn.lock().unwrap().execute("UPDATE conversations SET reset_generation = 7, epoch = 3, needs_rejoin = 1", []).unwrap();
+        storage
+            .ensure_conversation_exists("did:plc:alice", id, group)
+            .await
+            .unwrap();
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE conversations SET reset_generation = 7, epoch = 3, needs_rejoin = 1",
+                [],
+            )
+            .unwrap();
         storage.conn.lock().unwrap().execute_batch("CREATE TRIGGER reject_exit BEFORE UPDATE OF state ON conversations BEGIN SELECT RAISE(ABORT, 'fixture interruption'); END;").unwrap();
         let before = exit_table_snapshot(&storage, "conversations");
         let aliases = exit_table_snapshot(&storage, "conversation_group_aliases");
-        assert!(storage.complete_account_exit(id, group, None, 4, ConversationState::DeviceRemoved).await.is_err());
+        assert!(storage
+            .complete_account_exit(id, group, None, 4, ConversationState::DeviceRemoved)
+            .await
+            .is_err());
         assert_eq!(exit_table_snapshot(&storage, "conversations"), before);
-        assert_eq!(exit_table_snapshot(&storage, "conversation_group_aliases"), aliases, "alias writes must roll back with the terminal projection");
-        storage.conn.lock().unwrap().execute_batch("DROP TRIGGER reject_exit;").unwrap();
-        assert!(!storage.complete_account_exit(id, group, None, 2, ConversationState::DeviceRemoved).await.unwrap());
-        assert!(storage.complete_account_exit(id, group, None, 4, ConversationState::DeviceRemoved).await.unwrap());
-        assert!(storage.complete_account_exit(id, group, None, 4, ConversationState::DeviceRemoved).await.unwrap());
-        assert!(!storage.complete_account_exit(id, group, None, 3, ConversationState::DeviceRemoved).await.unwrap());
-        assert!(!storage.complete_account_exit(id, group, Some(8), 5, ConversationState::DeviceRemoved).await.unwrap());
+        assert_eq!(
+            exit_table_snapshot(&storage, "conversation_group_aliases"),
+            aliases,
+            "alias writes must roll back with the terminal projection"
+        );
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_exit;")
+            .unwrap();
+        assert!(!storage
+            .complete_account_exit(id, group, None, 2, ConversationState::DeviceRemoved)
+            .await
+            .unwrap());
+        assert!(storage
+            .complete_account_exit(id, group, None, 4, ConversationState::DeviceRemoved)
+            .await
+            .unwrap());
+        assert!(storage
+            .complete_account_exit(id, group, None, 4, ConversationState::DeviceRemoved)
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(id, group, None, 3, ConversationState::DeviceRemoved)
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(id, group, Some(8), 5, ConversationState::DeviceRemoved)
+            .await
+            .unwrap());
         let before_forward_retry = exit_table_snapshot(&storage, "conversations");
-        assert!(!storage.complete_account_exit(id, group, Some(7), 5, ConversationState::DeviceRemoved).await.unwrap());
-        assert!(!storage.complete_account_exit(id, group, Some(7), 4, ConversationState::Closed).await.unwrap());
-        assert_eq!(exit_table_snapshot(&storage, "conversations"), before_forward_retry, "a cleared reset generation cannot authorize a new terminal tuple");
-        assert!(storage.complete_account_exit(id, group, Some(7), 4, ConversationState::DeviceRemoved).await.unwrap());
-        assert!(storage.complete_account_exit(id, group, None, 5, ConversationState::DeviceRemoved).await.unwrap());
-        assert!(!storage.complete_account_exit(id, group, None, 4, ConversationState::Closed).await.unwrap());
-        assert!(storage.complete_account_exit(id, group, None, 5, ConversationState::Closed).await.unwrap());
-        assert!(storage.complete_account_exit(id, group, None, 5, ConversationState::Closed).await.unwrap());
-        assert!(!storage.complete_account_exit(id, group, None, 6, ConversationState::Closed).await.unwrap());
-        assert!(!storage.complete_account_exit(id, group, None, 5, ConversationState::DeviceRemoved).await.unwrap());
-        assert_eq!(storage.get_conversation_state(id).await.unwrap(), Some(ConversationState::Closed));
+        assert!(!storage
+            .complete_account_exit(id, group, Some(7), 5, ConversationState::DeviceRemoved)
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(id, group, Some(7), 4, ConversationState::Closed)
+            .await
+            .unwrap());
+        assert_eq!(
+            exit_table_snapshot(&storage, "conversations"),
+            before_forward_retry,
+            "a cleared reset generation cannot authorize a new terminal tuple"
+        );
+        assert!(storage
+            .complete_account_exit(id, group, Some(7), 4, ConversationState::DeviceRemoved)
+            .await
+            .unwrap());
+        assert!(storage
+            .complete_account_exit(id, group, None, 5, ConversationState::DeviceRemoved)
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(id, group, None, 4, ConversationState::Closed)
+            .await
+            .unwrap());
+        assert!(storage
+            .complete_account_exit(id, group, None, 5, ConversationState::Closed)
+            .await
+            .unwrap());
+        assert!(storage
+            .complete_account_exit(id, group, None, 5, ConversationState::Closed)
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(id, group, None, 6, ConversationState::Closed)
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(id, group, None, 5, ConversationState::DeviceRemoved)
+            .await
+            .unwrap());
+        assert_eq!(
+            storage.get_conversation_state(id).await.unwrap(),
+            Some(ConversationState::Closed)
+        );
         assert!(!storage.needs_rejoin(id).await.unwrap());
-        assert_eq!(storage.conn.lock().unwrap().query_row("SELECT reset_generation FROM conversations", [], |row| row.get::<_, Option<i64>>(0)).unwrap(), Some(7));
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT reset_generation FROM conversations", [], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })
+                .unwrap(),
+            Some(7)
+        );
     }
 
     #[tokio::test]
@@ -2688,8 +3335,13 @@ mod field_encryption_tests {
         let storage = hmac_fixture_storage(root.path(), "order-crypto");
         let id = "e16c197e-c3b7-4d96-b9de-ee62400460b3";
         let group = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-        storage.ensure_conversation_exists("did:plc:alice", id, group).await.unwrap();
-        let base = chrono::DateTime::parse_from_rfc3339("2026-09-05T08:46:25Z").unwrap().with_timezone(&Utc);
+        storage
+            .ensure_conversation_exists("did:plc:alice", id, group)
+            .await
+            .unwrap();
+        let base = chrono::DateTime::parse_from_rfc3339("2026-09-05T08:46:25Z")
+            .unwrap()
+            .with_timezone(&Utc);
         // Server acceptance orders own10 before peer11, but the local ACK
         // timestamp is later. Pending timestamps must never override that
         // confirmed order, including a retained local terminal system marker.
@@ -2707,24 +3359,71 @@ mod field_encryption_tests {
             message.timestamp = base + chrono::Duration::milliseconds(millis);
             message.is_own = own;
             if name == "terminal-marker" {
-                message.payload_json = Some(serde_json::to_string(&catbird_mls::orchestrator::types::MLSMessagePayload::system("conversation.closed")).unwrap());
+                message.payload_json = Some(
+                    serde_json::to_string(
+                        &catbird_mls::orchestrator::types::MLSMessagePayload::system(
+                            "conversation.closed",
+                        ),
+                    )
+                    .unwrap(),
+                );
             }
             storage.store_message(&message).await.unwrap();
         }
         let stored = exit_table_snapshot(&storage, "messages");
-        let expected = ["own-10", "peer-11", "peer-12", "pending-before", "pending-between", "pending-after", "terminal-marker"];
+        let expected = [
+            "own-10",
+            "peer-11",
+            "peer-12",
+            "pending-before",
+            "pending-between",
+            "pending-after",
+            "terminal-marker",
+        ];
         let history = storage.get_messages(id, 50, None).await.unwrap();
-        assert_eq!(history.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), expected);
-        assert_eq!(exit_table_snapshot(&storage, "messages"), stored, "display ordering must not rewrite ciphertext, HMAC or append order");
+        assert_eq!(
+            history
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            exit_table_snapshot(&storage, "messages"),
+            stored,
+            "display ordering must not rewrite ciphertext, HMAC or append order"
+        );
         drop(storage);
         let reopened = hmac_fixture_storage(root.path(), "order-crypto-reopened");
         let reloaded = reopened.get_messages(id, 50, None).await.unwrap();
-        assert_eq!(reloaded.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), expected);
-        assert_eq!(reloaded.last().unwrap().payload().unwrap().text.as_deref(), Some("conversation.closed"));
+        assert_eq!(
+            reloaded
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            reloaded.last().unwrap().payload().unwrap().text.as_deref(),
+            Some("conversation.closed")
+        );
         let pending_tail = reopened.get_messages(id, 3, None).await.unwrap();
-        assert_eq!(pending_tail.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), ["pending-between", "pending-after", "terminal-marker"]);
+        assert_eq!(
+            pending_tail
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["pending-between", "pending-after", "terminal-marker"]
+        );
         let before_peer = reopened.get_messages(id, 50, Some(11)).await.unwrap();
-        assert_eq!(before_peer.iter().filter(|message| message.sequence_number > 0).map(|message| message.id.as_str()).collect::<Vec<_>>(), ["own-10"]);
+        assert_eq!(
+            before_peer
+                .iter()
+                .filter(|message| message.sequence_number > 0)
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["own-10"]
+        );
         assert_eq!(exit_table_snapshot(&reopened, "messages"), stored);
     }
 
@@ -3061,7 +3760,10 @@ mod field_encryption_tests {
                         .unwrap();
                 }
             }
-            assert!(storage.get_messages("hmac-fixture", 10, None).await.is_err());
+            assert!(storage
+                .get_messages("hmac-fixture", 10, None)
+                .await
+                .is_err());
             assert!(storage
                 .store_message(&hmac_fixture_message("d", 0))
                 .await
@@ -3291,7 +3993,374 @@ mod field_encryption_tests {
         let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["msg-a", "msg-c"]);
     }
-}
+    #[tokio::test]
+    async fn request_canonical_projection_preserves_policy_and_rejects_stale_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage =
+            SqliteStorage::new(tmp.path().join("host.db").to_str().unwrap(), TEST_DB_KEY).unwrap();
+        let context = MLSContext::new(
+            tmp.path().join("mls.db").to_string_lossy().into_owned(),
+            TEST_DB_KEY.into(),
+            Box::new(InMemoryKeychain::new()),
+        )
+        .unwrap();
+        context.set_content_root_key(vec![0x63; 32]).unwrap();
+        storage.set_mls_context(context);
+        let canonical = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../tests/fixtures/canonical-conversation-state.json"
+            ))
+            .unwrap()
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let owner = canonical.participants[0].user_did.to_string();
+        storage.bind_request_owner(Some(&owner));
+        let view = ConversationView {
+            conversation_id: canonical.coordinates.conversation_id.to_string(),
+            group_id: hex::encode(canonical.coordinates.group_id.as_ref()),
+            epoch: canonical.coordinates.epoch as u64,
+            members: vec![],
+            metadata: None,
+            created_at: None,
+            updated_at: None,
+            sequencer_did: None,
+            canonical_state: Some(canonical.clone()),
+        };
+        let request = ConversationProjectionCommitRequest::live(&owner, view.clone(), vec![]);
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&request)
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::AlreadyAbsent { affected_rows: 1 }
+        ));
+        assert_eq!(
+            storage
+                .get_conversation(&owner, &view.conversation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .canonical_state,
+            Some(canonical.clone())
+        );
+        assert_eq!(
+            storage.list_conversations(&owner).await.unwrap()[0].canonical_state,
+            Some(canonical.clone())
+        );
+        assert!(storage
+            .list_conversations("did:plc:unrelated")
+            .await
+            .unwrap()
+            .is_empty());
+        let mut accepted = view.clone();
+        accepted
+            .canonical_state
+            .as_mut()
+            .unwrap()
+            .coordinates
+            .state_version += 1;
+        accepted.canonical_state.as_mut().unwrap().participants[1].status = "active".into();
+        // A later canonical refresh must not erase a completed reset's high-water mark.
+        storage.conn.lock().unwrap().execute("UPDATE conversations SET reset_generation=7 WHERE user_did=?1 AND conversation_id=?2",rusqlite::params![owner,view.conversation_id]).unwrap();
+        storage
+            .commit_conversation_projection(&ConversationProjectionCommitRequest::live(
+                &owner,
+                accepted.clone(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&request)
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 }
+        ));
+        assert_eq!(
+            storage
+                .get_conversation(&owner, &view.conversation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .canonical_state,
+            accepted.canonical_state
+        );
+        assert_eq!(storage.conn.lock().unwrap().query_row("SELECT reset_generation FROM conversations WHERE user_did=?1 AND conversation_id=?2",rusqlite::params![owner,view.conversation_id],|r|r.get::<_,i32>(0)).unwrap(),7);
+        assert!(storage
+            .mark_reset_pending(&view.conversation_id, &"ab".repeat(32), 7, 100)
+            .await
+            .is_err());
+        assert_eq!(storage.conn.lock().unwrap().query_row("SELECT reset_new_group_id FROM conversations WHERE user_did=?1 AND conversation_id=?2",rusqlite::params![owner,view.conversation_id],|r|r.get::<_,Option<String>>(0)).unwrap(),None);
+        // Host terminal state must prevent replayed active UI projection.
+        storage
+            .set_conversation_state(&view.conversation_id, ConversationState::Closed)
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&ConversationProjectionCommitRequest::live(
+                    &owner,
+                    accepted,
+                    vec![]
+                ))
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 }
+        ));
+    }
+    #[tokio::test]
+    async fn request_alias_retirement_replay_preserves_history_and_exact_fences() {
+        use catbird_mls::orchestrator::AliasRetirementAuthority;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("host.db");
+        let storage = SqliteStorage::new(path.to_str().unwrap(), TEST_DB_KEY).unwrap();
+        let context = MLSContext::new(
+            tmp.path().join("mls.db").to_string_lossy().into_owned(),
+            TEST_DB_KEY.into(),
+            Box::new(InMemoryKeychain::new()),
+        )
+        .unwrap();
+        context.set_content_root_key(vec![0x64; 32]).unwrap();
+        storage.set_mls_context(context.clone());
+        let canonical = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../tests/fixtures/canonical-conversation-state.json"
+            ))
+            .unwrap()
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let owner = canonical.participants[0].user_did.to_string();
+        storage.bind_request_owner(Some(&owner));
+        let view = ConversationView {
+            conversation_id: canonical.coordinates.conversation_id.to_string(),
+            group_id: hex::encode(canonical.coordinates.group_id.as_ref()),
+            epoch: canonical.coordinates.epoch as u64,
+            members: vec![],
+            metadata: None,
+            created_at: None,
+            updated_at: None,
+            sequencer_did: None,
+            canonical_state: Some(canonical),
+        };
+        let mut alias = view.clone();
+        alias.conversation_id = view.group_id.clone();
+        alias.canonical_state = None;
+        assert!(view.epoch > 0);
+        alias.epoch = view.epoch - 1;
+        storage
+            .ensure_conversation_exists(&owner, &alias.conversation_id, &alias.group_id)
+            .await
+            .unwrap();
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE conversations SET epoch=?1 WHERE user_did=?2",
+                rusqlite::params![alias.epoch, owner],
+            )
+            .unwrap();
+        let message = Message {
+            id: "retained-alias-first".into(),
+            conversation_id: alias.conversation_id.clone(),
+            sender_did: owner.clone(),
+            text: "protected alias history".into(),
+            timestamp: Utc::now(),
+            epoch: alias.epoch,
+            sequence_number: 1,
+            is_own: true,
+            delivery_status: None,
+            payload_json: None,
+        };
+        storage.store_message(&message).await.unwrap();
+        storage
+            .set_group_state(&GroupState {
+                group_id: alias.group_id.clone(),
+                conversation_id: alias.conversation_id.clone(),
+                epoch: alias.epoch,
+                members: vec![owner.clone()],
+            })
+            .await
+            .unwrap();
+        let authority = AliasRetirementAuthority::from_views(&owner, &view, &alias).unwrap();
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&ConversationProjectionCommitRequest::live(
+                    &owner,
+                    view.clone(),
+                    vec![authority.clone()]
+                ))
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 }
+        ));
+        storage
+            .set_group_state(&GroupState {
+                group_id: view.group_id.clone(),
+                conversation_id: view.conversation_id.clone(),
+                epoch: view.epoch,
+                members: vec![owner.clone()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_conversation(&owner, &alias.conversation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            alias.epoch
+        );
 
-#[cfg(test)]
-mod reset_target_tests;
+        let mut wrong = authority.clone();
+        wrong.alias_incarnation += 1;
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&ConversationProjectionCommitRequest::live(
+                    &owner,
+                    view.clone(),
+                    vec![wrong]
+                ))
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 }
+        ));
+        assert!(storage
+            .get_conversation(&owner, &view.conversation_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&ConversationProjectionCommitRequest::live(
+                    &owner,
+                    view.clone(),
+                    vec![authority.clone()]
+                ))
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::Retired { .. }
+        ));
+        assert_eq!(storage.list_conversations(&owner).await.unwrap().len(), 1);
+        let messages = storage
+            .get_messages(&view.conversation_id, 50, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, message.text);
+        assert_eq!(messages[0].conversation_id, view.conversation_id);
+        assert!(storage
+            .get_conversation(&owner, &alias.conversation_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM conversations WHERE user_did=?1 AND conversation_id=?2",
+                    rusqlite::params![owner, alias.conversation_id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        drop(storage);
+        let storage = SqliteStorage::new(path.to_str().unwrap(), TEST_DB_KEY).unwrap();
+        storage.set_mls_context(context);
+        storage.bind_request_owner(Some(&owner));
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&ConversationProjectionCommitRequest::replay(
+                    authority.clone()
+                ))
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::AlreadyAbsent { affected_rows: 0 }
+        ));
+        let mut changed = authority.clone();
+        changed.alias_incarnation += 1;
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&ConversationProjectionCommitRequest::replay(
+                    changed
+                ))
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 }
+        ));
+        storage.bind_request_owner(Some("did:plc:other"));
+        assert!(storage
+            .commit_conversation_projection(&ConversationProjectionCommitRequest::replay(authority))
+            .await
+            .is_err());
+        assert!(storage
+            .list_conversations("did:plc:other")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    #[tokio::test]
+    async fn request_reset_projection_exact_target_epoch_and_owner_are_atomic() {
+        let (_tmp, storage) = new_temp_storage();
+        let owner = "did:plc:alice";
+        let other = "did:plc:bob";
+        let cid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let old = "11".repeat(32);
+        let first = "22".repeat(32);
+        let next = "33".repeat(32);
+        storage
+            .ensure_conversation_exists(owner, cid, &old)
+            .await
+            .unwrap();
+        storage
+            .ensure_conversation_exists(other, cid, &old)
+            .await
+            .unwrap();
+        storage.bind_request_owner(Some(owner));
+        storage
+            .mark_reset_pending(cid, &first, 7, 123)
+            .await
+            .unwrap();
+        assert!(!storage
+            .complete_reset_pending(cid, 6, &first, 9)
+            .await
+            .unwrap());
+        assert!(!storage
+            .adopt_reset_pending_target(cid, 7, &next, &first)
+            .await
+            .unwrap());
+        assert!(storage
+            .adopt_reset_pending_target(cid, 7, &first, &next)
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_reset_pending(cid, 7, &first, 9)
+            .await
+            .unwrap());
+        assert!(storage
+            .complete_reset_pending(cid, 7, &next, 9)
+            .await
+            .unwrap());
+        let conn = storage.conn.lock().unwrap();
+        let row:(String,u64,u64,Option<i32>,Option<String>)=conn.query_row("SELECT group_id,epoch,join_epoch,reset_generation,reset_new_group_id FROM conversations WHERE conversation_id=?1 AND user_did=?2",rusqlite::params![cid,owner],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+        assert_eq!(row, (next, 9, 9, Some(7), None));
+        let other_group: String = conn
+            .query_row(
+                "SELECT group_id FROM conversations WHERE conversation_id=?1 AND user_did=?2",
+                rusqlite::params![cid, other],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(other_group, old);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM conversation_projection_group_history WHERE owner_did=?1 AND group_id=?2",rusqlite::params![owner,old],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+}

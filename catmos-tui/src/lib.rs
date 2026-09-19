@@ -1,6 +1,7 @@
 pub mod app;
 pub mod event;
 pub mod keybinds;
+mod requests;
 pub mod widgets;
 
 use std::io;
@@ -102,6 +103,11 @@ pub async fn run() -> anyhow::Result<()> {
                 info!("WebSocket subscription active");
                 while let Some(ws_event) = ws_rx.recv().await {
                     match ws_event {
+                        catmos_core::chat::WsEvent::InventoryRefreshed => {
+                            if ws_tx.send(AppEvent::InventoryRefreshed).is_err() {
+                                break;
+                            }
+                        }
                         catmos_core::chat::WsEvent::Message {
                             convo_id,
                             plaintext,
@@ -318,6 +324,11 @@ async fn main_loop(
                     }
 
                     match app.screen {
+                        Screen::Requests | Screen::RequestRecipient | Screen::RequestCompose => {
+                            if let Err(error) = requests::handle(app, key).await {
+                                app.set_status(format!("Request: {error}"));
+                            }
+                        }
                         Screen::Chat => handle_chat_key(app, key, &event_tx).await,
                         Screen::CommandPalette => {
                             // Command palette is a future enhancement
@@ -332,6 +343,22 @@ async fn main_loop(
                             }
                         }
                     }
+                }
+                AppEvent::InventoryRefreshed => {
+                    app.conversations = app.service.db.list_conversations().await?;
+                    if let Some(convo) = app.active_conversation().cloned() {
+                        match app
+                            .service
+                            .fetch_messages(&convo.conversation_id, 100)
+                            .await
+                        {
+                            Ok(messages) => app.messages = messages,
+                            Err(error) => {
+                                app.set_status(format!("History refresh deferred: {error}"))
+                            }
+                        }
+                    }
+                    app.requests = app.service.request_views(false).await?;
                 }
                 AppEvent::Tick => {
                     // Nothing to do on tick for now (future: refresh, animate)
@@ -480,7 +507,16 @@ async fn handle_chat_key(
         Action::Quit => app.should_quit = true,
         Action::ToggleSidebar => app.sidebar_visible = !app.sidebar_visible,
         Action::ToggleMembers => app.member_panel_visible = !app.member_panel_visible,
-        Action::NewConvo => app.screen = Screen::NewConvo,
+        Action::NewConvo => {
+            app.input.clear();
+            app.cursor_pos = 0;
+            app.screen = Screen::RequestRecipient;
+        }
+        Action::Requests => {
+            if let Err(error) = requests::open(app).await {
+                app.set_status(format!("Requests: {error}"));
+            }
+        }
         Action::JoinConvo => {
             // Future: open join dialog
         }
@@ -494,6 +530,22 @@ async fn handle_chat_key(
             reload_messages(app).await;
         }
         Action::SendMessage => {
+            if let Some(conversation) = app.active_conversation() {
+                app.send_allowed = match app.service.request_authority().await {
+                    Ok(authority) => authority
+                        .ensure_conversation_ready(&conversation.conversation_id)
+                        .await
+                        .map(|r| r.send_allowed)
+                        .unwrap_or(false),
+                    Err(_) => false,
+                };
+            }
+            if !app.send_allowed {
+                app.set_status(
+                    "Replies are unavailable until consent and device readiness are verified",
+                );
+                return;
+            }
             let text = app.take_input();
             if !text.is_empty() {
                 if let Some(convo) = app.active_conversation() {
@@ -548,6 +600,14 @@ async fn handle_chat_key(
 async fn reload_messages(app: &mut App) {
     if let Some(convo) = app.active_conversation() {
         let convo_id = convo.conversation_id.clone();
+        app.send_allowed = match app.service.request_authority().await {
+            Ok(a) => a
+                .ensure_conversation_ready(&convo_id)
+                .await
+                .map(|r| r.send_allowed)
+                .unwrap_or(false),
+            Err(_) => false,
+        };
         match app.service.load_local_messages(&convo_id, 50).await {
             Ok(msgs) => {
                 app.set_status(format!("read · {} messages", msgs.len()));

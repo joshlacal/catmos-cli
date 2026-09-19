@@ -1,15 +1,15 @@
 pub mod auth;
 pub mod chat;
+pub(crate) mod device_records;
 pub mod error;
 pub mod mls;
-pub mod recovery;
-pub mod storage;
-pub mod types;
 pub mod orchestrator_api;
 pub mod orchestrator_credentials;
 pub mod orchestrator_storage;
+pub mod recovery;
 pub mod runtime;
-pub(crate) mod device_records;
+pub mod storage;
+pub mod types;
 pub type CliOrchestrator = catbird_mls::orchestrator::MLSOrchestrator<
     orchestrator_storage::SqliteStorage,
     orchestrator_api::CliApiClient,

@@ -142,6 +142,122 @@ impl Database {
             .and_then(|g| g.as_ref().cloned())
     }
 
+    pub async fn retain_authenticated_inventory(&self, owner: &str, bytes: &[u8]) -> Result<()> {
+        let key = self
+            .content_root_key_snapshot()
+            .ok_or_else(|| CatmosError::Storage("Protected inventory key unavailable".into()))?;
+        let protected = catbird_mls::field_encryption::encrypt_payload(
+            &key,
+            &format!("inventory-snapshot/v2/{owner}"),
+            bytes,
+        )
+        .map_err(|e| CatmosError::Storage(e.to_string()))?;
+        sqlx::query("INSERT INTO authenticated_inventory(owner_did,protected) VALUES(?,?) ON CONFLICT(owner_did) DO UPDATE SET protected=excluded.protected").bind(owner).bind(protected).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    fn seal_request_draft(&self, draft: &crate::chat::requests::RequestDraft) -> Result<Vec<u8>> {
+        let key = self
+            .content_root_key_snapshot()
+            .ok_or_else(|| CatmosError::Storage("Protected draft key unavailable".into()))?;
+        let domain = format!(
+            "request-draft/v2/{}/{}",
+            draft.owner_did, draft.input.draft_id
+        );
+        let raw = serde_json::to_vec(draft).map_err(|e| CatmosError::Storage(e.to_string()))?;
+        catbird_mls::field_encryption::encrypt_payload(&key, &domain, &raw)
+            .map_err(|e| CatmosError::Storage(e.to_string()))
+    }
+    pub async fn create_request_draft(
+        &self,
+        draft: &crate::chat::requests::RequestDraft,
+    ) -> Result<()> {
+        uuid::Uuid::parse_str(&draft.input.draft_id)
+            .map_err(|_| CatmosError::Storage("Invalid draft ID".into()))?;
+        let raw = self.seal_request_draft(draft)?;
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO request_drafts(owner_did,draft_id,protected) VALUES(?,?,?)",
+        )
+        .bind(&draft.owner_did)
+        .bind(&draft.input.draft_id)
+        .bind(raw)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            let existing = self
+                .read_request_draft(&draft.owner_did, &draft.input.draft_id)
+                .await?
+                .ok_or_else(|| CatmosError::Storage("Draft disappeared".into()))?
+                .0;
+            if existing.input != draft.input {
+                return Err(CatmosError::Storage(
+                    "Draft ID already binds different content".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+    pub async fn list_request_drafts(
+        &self,
+        owner: &str,
+    ) -> Result<Vec<crate::chat::requests::RequestDraft>> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT draft_id FROM request_drafts WHERE owner_did=? ORDER BY rowid",
+        )
+        .bind(owner)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut drafts = Vec::new();
+        for id in ids {
+            if let Some((draft, _)) = self.read_request_draft(owner, &id).await? {
+                drafts.push(draft);
+            }
+        }
+        Ok(drafts)
+    }
+    pub async fn read_request_draft(
+        &self,
+        owner: &str,
+        id: &str,
+    ) -> Result<Option<(crate::chat::requests::RequestDraft, Vec<u8>)>> {
+        let raw: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT protected FROM request_drafts WHERE owner_did=? AND draft_id=?",
+        )
+        .bind(owner)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(raw) = raw else { return Ok(None) };
+        let key = self
+            .content_root_key_snapshot()
+            .ok_or_else(|| CatmosError::Storage("Protected draft key unavailable".into()))?;
+        let domain = format!("request-draft/v2/{owner}/{id}");
+        let plain = catbird_mls::field_encryption::decrypt_payload(&key, &domain, &raw)
+            .map_err(|e| CatmosError::Storage(e.to_string()))?;
+        let draft: crate::chat::requests::RequestDraft =
+            serde_json::from_slice(&plain).map_err(|e| CatmosError::Storage(e.to_string()))?;
+        if draft.owner_did != owner || draft.input.draft_id != id {
+            return Err(CatmosError::Storage(
+                "Draft account binding mismatch".into(),
+            ));
+        }
+        Ok(Some((draft, raw)))
+    }
+    pub async fn replace_request_draft(
+        &self,
+        draft: &crate::chat::requests::RequestDraft,
+        expected: &[u8],
+    ) -> Result<Vec<u8>> {
+        let next = self.seal_request_draft(draft)?;
+        let changed=sqlx::query("UPDATE request_drafts SET protected=? WHERE owner_did=? AND draft_id=? AND protected=?").bind(&next).bind(&draft.owner_did).bind(&draft.input.draft_id).bind(expected).execute(&self.pool).await?.rows_affected();
+        if changed != 1 {
+            return Err(CatmosError::Storage(
+                "Draft changed concurrently; reload before retry".into(),
+            ));
+        }
+        Ok(next)
+    }
+
     /// Test-only accessor for the underlying `SqlitePool`. Integration
     /// tests in `tests/` need to issue raw `PRAGMA` / `SELECT` queries to
     /// inspect the schema and the encrypted/legacy column populations.
@@ -153,6 +269,9 @@ impl Database {
     }
 
     async fn migrate(&self) -> Result<()> {
+        sqlx::query("CREATE TABLE IF NOT EXISTS authenticated_inventory(owner_did TEXT PRIMARY KEY,protected BLOB NOT NULL)").execute(&self.pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS request_drafts (owner_did TEXT NOT NULL, draft_id TEXT NOT NULL, protected BLOB NOT NULL, PRIMARY KEY(owner_did,draft_id))").execute(&self.pool).await?;
+
         let statements = [
             (
                 "conversations",
@@ -323,9 +442,12 @@ impl Database {
                 continue;
             }
             let stmt = format!("ALTER TABLE messages ADD COLUMN {col} {decl}");
-            sqlx::query(sqlx::AssertSqlSafe(stmt)).execute(&self.pool).await.map_err(|e| {
-                CatmosError::Storage(format!("Add messages column '{col}' failed: {e}"))
-            })?;
+            sqlx::query(sqlx::AssertSqlSafe(stmt))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    CatmosError::Storage(format!("Add messages column '{col}' failed: {e}"))
+                })?;
         }
 
         // ── MLSMessageFieldMigrationV1: drop pre-cutover plaintext rows ──
@@ -392,7 +514,10 @@ impl Database {
         let mut transaction = self.pool.begin().await?;
         for (key, value) in values {
             sqlx::query("INSERT OR REPLACE INTO session (key, value) VALUES (?1, ?2)")
-                .bind(key).bind(value).execute(&mut *transaction).await?;
+                .bind(key)
+                .bind(value)
+                .execute(&mut *transaction)
+                .await?;
         }
         transaction.commit().await?;
         Ok(())
@@ -408,8 +533,11 @@ impl Database {
     ) -> Result<bool> {
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for (key, _) in values {
-            let current: Option<String> = sqlx::query_scalar("SELECT value FROM session WHERE key = ?1")
-                .bind(key).fetch_optional(&mut *transaction).await?;
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT value FROM session WHERE key = ?1")
+                    .bind(key)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
             if current.as_ref() != expected.get(*key) {
                 transaction.rollback().await?;
                 return Ok(false);
@@ -417,7 +545,10 @@ impl Database {
         }
         for (key, value) in values {
             sqlx::query("INSERT OR REPLACE INTO session (key, value) VALUES (?1, ?2)")
-                .bind(key).bind(value).execute(&mut *transaction).await?;
+                .bind(key)
+                .bind(value)
+                .execute(&mut *transaction)
+                .await?;
         }
         transaction.commit().await?;
         Ok(true)
@@ -425,13 +556,21 @@ impl Database {
 
     /// Read a consistent snapshot even if another process replaces auth while
     /// this process is restoring its session.
-    pub(crate) async fn get_session_values(&self, keys: &[&str]) -> Result<std::collections::HashMap<String, String>> {
+    pub(crate) async fn get_session_values(
+        &self,
+        keys: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>> {
         let mut transaction = self.pool.begin().await?;
         let mut values = std::collections::HashMap::new();
         for key in keys {
-            let value: Option<String> = sqlx::query_scalar("SELECT value FROM session WHERE key = ?1")
-                .bind(key).fetch_optional(&mut *transaction).await?;
-            if let Some(value) = value { values.insert((*key).to_string(), value); }
+            let value: Option<String> =
+                sqlx::query_scalar("SELECT value FROM session WHERE key = ?1")
+                    .bind(key)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+            if let Some(value) = value {
+                values.insert((*key).to_string(), value);
+            }
         }
         transaction.commit().await?;
         Ok(values)
@@ -1919,6 +2058,10 @@ mod reset_pending_tests {
 
 fn serialize_content(content: &MessageContent) -> (String, String) {
     match content {
+        MessageContent::GroupInvitation { .. } => (
+            "groupInvitation".into(),
+            serde_json::to_string(content).expect("serializable typed note"),
+        ),
         MessageContent::Text(text) => ("text".into(), text.clone()),
         MessageContent::Reaction {
             target_message_id,
@@ -1940,6 +2083,7 @@ fn serialize_content(content: &MessageContent) -> (String, String) {
 
 fn deserialize_content(content_type: &str, content_json: &str) -> MessageContent {
     match content_type {
+        "groupInvitation" => serde_json::from_str(content_json).unwrap_or(MessageContent::Unknown),
         "text" => MessageContent::Text(content_json.to_string()),
         "reaction" => {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(content_json) {

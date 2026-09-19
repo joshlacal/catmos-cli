@@ -199,9 +199,14 @@ impl ChatService {
         conversation_id: &str,
     ) -> Result<Option<catbird_mls::orchestrator::types::ConversationState>> {
         use catbird_mls::orchestrator::storage::MLSStorageBackend;
-        let orchestrator = self.orchestrator().await
+        let orchestrator = self
+            .orchestrator()
+            .await
             .ok_or_else(|| CatmosError::Other("MLS orchestrator unavailable".into()))?;
-        orchestrator.storage().get_conversation_state(conversation_id).await
+        orchestrator
+            .storage()
+            .get_conversation_state(conversation_id)
+            .await
             .map_err(|error| CatmosError::Other(error.to_string()))
     }
 
@@ -214,12 +219,16 @@ impl ChatService {
         limit: u32,
     ) -> Result<Vec<catbird_mls::orchestrator::types::Message>> {
         use catbird_mls::orchestrator::storage::MLSStorageBackend;
-        let orchestrator = self.orchestrator().await.ok_or_else(|| {
-            CatmosError::Other("MLS orchestrator unavailable".into())
-        })?;
+        let orchestrator = self
+            .orchestrator()
+            .await
+            .ok_or_else(|| CatmosError::Other("MLS orchestrator unavailable".into()))?;
         let state = self.canonical_conversation_state(conversation_id).await?;
         use catbird_mls::orchestrator::types::ConversationState;
-        if !matches!(state, Some(ConversationState::DeviceRemoved | ConversationState::Closed)) {
+        if !matches!(
+            state,
+            Some(ConversationState::DeviceRemoved | ConversationState::Closed)
+        ) {
             orchestrator
                 .fetch_messages(conversation_id, None, limit, None, None, None)
                 .await
@@ -249,31 +258,45 @@ impl ChatService {
         let current = self.conversations().await;
         if exact_stable_match_for_sources(input, &durable, &current)?.is_some()
             || self.aliases.read().await.get(input).is_some()
-            || durable.iter().chain(current.iter()).any(|convo| convo.group_id == input)
+            || durable
+                .iter()
+                .chain(current.iter())
+                .any(|convo| convo.group_id == input)
         {
             return self.resolve_conversation_ids(input).await.map(|ids| ids.0);
         }
-        let candidates: HashSet<String> = durable.iter().chain(current.iter())
+        let candidates: HashSet<String> = durable
+            .iter()
+            .chain(current.iter())
             .filter(|convo| {
                 convo.name.as_deref() == Some(input)
-                    || (!input.is_empty() && (convo.conversation_id.starts_with(input)
-                        || convo.group_id.starts_with(input)))
+                    || (!input.is_empty()
+                        && (convo.conversation_id.starts_with(input)
+                            || convo.group_id.starts_with(input)))
             })
             .map(|convo| convo.conversation_id.clone())
             .collect();
         if candidates.len() > 1 {
-            return Err(CatmosError::ConvoNotFound(
-                format!("Ambiguous conversation {input}; use its full conversation ID"),
-            ));
+            return Err(CatmosError::ConvoNotFound(format!(
+                "Ambiguous conversation {input}; use its full conversation ID"
+            )));
         }
-        let canonical = candidates.iter().next().map(String::as_str).unwrap_or(input);
-        self.resolve_conversation_ids(canonical).await.map(|ids| ids.0)
+        let canonical = candidates
+            .iter()
+            .next()
+            .map(String::as_str)
+            .unwrap_or(input);
+        self.resolve_conversation_ids(canonical)
+            .await
+            .map(|ids| ids.0)
     }
 
     /// Resolve the current crypto group only for direct MLS debug operations.
     pub async fn resolve_mls_group_id(&self, input: &str) -> Result<String> {
         let conversation_id = self.resolve_convo(input).await?;
-        self.resolve_conversation_ids(&conversation_id).await.map(|ids| ids.1)
+        self.resolve_conversation_ids(&conversation_id)
+            .await
+            .map(|ids| ids.1)
     }
 
     /// Resolve a conversation input into its stable API/storage identity and
@@ -849,7 +872,9 @@ Body: {}",
         match (&self.auth, &self.token_session) {
             (AuthMethod::OAuth { session_cookie, .. }, _) => Ok(session_cookie.clone()),
             (AuthMethod::AppPassword { pds_url, .. }, Some(session)) => {
-                if !nsid.starts_with("blue.catbird.chat.") && !nsid.starts_with("blue.catbird.mlsChat.") {
+                if !nsid.starts_with("blue.catbird.chat.")
+                    && !nsid.starts_with("blue.catbird.mlsChat.")
+                {
                     return session.current_bearer().await;
                 }
                 let client = crate::device_records::public_client()?;
@@ -857,9 +882,15 @@ Body: {}",
                 let proxy = crate::mls::atproto_proxy_header_value();
                 let audience = crate::auth::service_auth::audience(&proxy)?;
                 crate::auth::service_auth::acquire(
-                    &client, &pds, self.did(), audience, nsid,
-                    session.current_bearer().await?, || session.refresh(&self.db),
-                ).await
+                    &client,
+                    &pds,
+                    self.did(),
+                    audience,
+                    nsid,
+                    session.current_bearer().await?,
+                    || session.refresh(&self.db),
+                )
+                .await
             }
             (AuthMethod::AppPassword { .. }, None) => Err(CatmosError::AuthFailed(
                 "AppPassword auth without a TokenSession — restart catmos".into(),
@@ -895,27 +926,40 @@ Body: {}",
         description: Option<&str>,
     ) -> Result<Conversation> {
         if let Some(orchestrator) = self.orchestrator().await {
-            let created = orchestrator.create_group(name, Some(members), description).await
+            let created = orchestrator
+                .create_group(name, Some(members), description)
+                .await
                 .map_err(|error| CatmosError::Other(error.to_string()))?;
             let conversation = Conversation {
                 conversation_id: created.conversation_id,
                 group_id: created.group_id,
-                name: created.metadata.as_ref().and_then(|metadata| metadata.name.clone()),
-                description: created.metadata.as_ref().and_then(|metadata| metadata.description.clone()),
+                name: created
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.name.clone()),
+                description: created
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.description.clone()),
                 // Canonical create may adopt an existing conversation; the
                 // current account and local clock are not creation evidence.
                 creator: None,
                 epoch: created.epoch,
                 cipher_suite: MLS_CIPHER_SUITE.to_owned(),
-                members: created.members.into_iter().map(|member| crate::types::Member {
-                    did: member.did.clone(),
-                    user_did: member.did,
-                    device_id: None,
-                    device_name: None,
-                    is_admin: member.role == catbird_mls::orchestrator::types::MemberRole::Admin,
-                    is_moderator: false,
-                    joined_at: chrono::Utc::now(),
-                }).collect(),
+                members: created
+                    .members
+                    .into_iter()
+                    .map(|member| crate::types::Member {
+                        did: member.did.clone(),
+                        user_did: member.did,
+                        device_id: None,
+                        device_name: None,
+                        is_admin: member.role
+                            == catbird_mls::orchestrator::types::MemberRole::Admin,
+                        is_moderator: false,
+                        joined_at: chrono::Utc::now(),
+                    })
+                    .collect(),
                 created_at: None,
                 last_message_at: created.updated_at,
                 unread_count: 0,
@@ -928,7 +972,8 @@ Body: {}",
             };
             self.db.store_conversation(&conversation).await?;
             let mut conversations = self.conversations.write().await;
-            conversations.retain(|existing| existing.conversation_id != conversation.conversation_id);
+            conversations
+                .retain(|existing| existing.conversation_id != conversation.conversation_id);
             conversations.push(conversation.clone());
             return Ok(conversation);
         }
@@ -1162,7 +1207,9 @@ Body: {}",
         let orchestrator = self.orchestrator().await.ok_or_else(|| {
             CatmosError::Other("MLS orchestrator unavailable; cannot leave conversation".into())
         })?;
-        orchestrator.leave_group(&stable_convo_id).await
+        orchestrator
+            .leave_group(&stable_convo_id)
+            .await
             .map_err(|error| CatmosError::Other(error.to_string()))
     }
 
@@ -1281,6 +1328,7 @@ Body: {}",
         name: Option<&str>,
         description: Option<&str>,
     ) -> Result<()> {
+        self.require_ordinary_effects(convo_id).await?;
         let (stable_convo_id, group_id) = self.resolve_conversation_ids(convo_id).await?;
         let group_id_bytes = hex::decode(&group_id)
             .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
@@ -1361,6 +1409,7 @@ Body: {}",
     }
 
     pub async fn add_member(&self, convo_id: &str, member_did: &str) -> Result<()> {
+        self.require_ordinary_effects(convo_id).await?;
         let (stable_convo_id, group_id) = self.resolve_conversation_ids(convo_id).await?;
         let kp_refs = self.fetch_key_packages(&[member_did.to_string()]).await?;
         if kp_refs.is_empty() {
@@ -1451,6 +1500,7 @@ Body: {}",
                 .await
                 .map_err(|error| CatmosError::Other(error.to_string()));
         }
+        self.require_ordinary_effects(convo_id).await?;
         let (stable_convo_id, group_id) = self.resolve_conversation_ids(convo_id).await?;
         let did = self.did().to_string();
         let plan = self.mls.with_commit_context(|ctx| {
@@ -1544,6 +1594,7 @@ Body: {}",
         admin: bool,
         _moderator: bool,
     ) -> Result<()> {
+        self.require_ordinary_effects(convo_id).await?;
         let (stable_convo_id, _) = self.resolve_conversation_ids(convo_id).await?;
         if admin {
             let req = serde_json::json!({
@@ -1567,6 +1618,7 @@ Body: {}",
         emoji: &str,
         remove: bool,
     ) -> Result<()> {
+        self.require_ordinary_effects(convo_id).await?;
         let action = if remove { "remove" } else { "add" };
         let payload = serde_json::json!({
             "version": 1,
@@ -1577,6 +1629,16 @@ Body: {}",
                 "action": action,
             }
         });
+        if let Some(authority) = self.orchestrator().await {
+            authority
+                .send_payload_json(
+                    &self.resolve_conversation_ids(convo_id).await?.0,
+                    &payload.to_string(),
+                )
+                .await
+                .map_err(|e| CatmosError::Other(e.to_string()))?;
+            return Ok(());
+        }
         let plaintext = serde_json::to_vec(&payload)?;
 
         let (stable_convo_id, group_id) = self.resolve_conversation_ids(convo_id).await?;
@@ -1641,6 +1703,7 @@ Body: {}",
     }
 
     pub async fn upload_blob(&self, convo_id: &str, file_path: &str) -> Result<String> {
+        self.require_ordinary_effects(convo_id).await?;
         let (stable_convo_id, _) = self.resolve_conversation_ids(convo_id).await?;
         let data = tokio::fs::read(file_path)
             .await
@@ -1866,7 +1929,12 @@ Body: {}",
     }
 }
 
-fn build_request_parts(auth: &AuthMethod, config: &Config, nsid: &str, bearer: &str) -> Result<(String, HeaderMap)> {
+fn build_request_parts(
+    auth: &AuthMethod,
+    config: &Config,
+    nsid: &str,
+    bearer: &str,
+) -> Result<(String, HeaderMap)> {
     let mut headers = HeaderMap::new();
     headers.insert(
         AUTHORIZATION,
@@ -1877,9 +1945,7 @@ fn build_request_parts(auth: &AuthMethod, config: &Config, nsid: &str, bearer: &
     let url = match auth {
         AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
         AuthMethod::AppPassword { pds_url, .. } => {
-            if nsid.starts_with("blue.catbird.chat.")
-                || nsid.starts_with("blue.catbird.mlsChat.")
-            {
+            if nsid.starts_with("blue.catbird.chat.") || nsid.starts_with("blue.catbird.mlsChat.") {
                 let proxy_val = crate::mls::atproto_proxy_header_value();
                 if let Ok(hv) = HeaderValue::from_str(&proxy_val) {
                     headers.insert(
@@ -1898,7 +1964,6 @@ fn build_request_parts(auth: &AuthMethod, config: &Config, nsid: &str, bearer: &
 
     Ok((url, headers))
 }
-
 
 /// Resolve an input against a fetched conversation list without performing
 /// any I/O. The first value is stable for API/storage/UI routing; the second
@@ -2236,15 +2301,48 @@ mod tests {
     fn renewed_blob_authorization_keeps_the_original_auth_method_destination() {
         let mut config = Config::default();
         config.server.mls_url = "https://chat.catbird.blue".into();
-        let direct_chat = std::env::var("ATPROTO_CHAT_HOST").unwrap_or_else(|_| config.server.mls_url.clone());
+        let direct_chat =
+            std::env::var("ATPROTO_CHAT_HOST").unwrap_or_else(|_| config.server.mls_url.clone());
         for (auth, expected) in [
-            (AuthMethod::AppPassword { handle: "actor.catbird.blue".into(), did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(), pds_url: "https://pds.catbird.blue".into() }, direct_chat),
-            (AuthMethod::OAuth { session_cookie: "test-session".into(), did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(), nest_url: "https://nest.catbird.blue".into() }, "https://nest.catbird.blue".into()),
+            (
+                AuthMethod::AppPassword {
+                    handle: "actor.catbird.blue".into(),
+                    did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    pds_url: "https://pds.catbird.blue".into(),
+                },
+                direct_chat,
+            ),
+            (
+                AuthMethod::OAuth {
+                    session_cookie: "test-session".into(),
+                    did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    nest_url: "https://nest.catbird.blue".into(),
+                },
+                "https://nest.catbird.blue".into(),
+            ),
         ] {
-            let initial = build_request_parts(&auth, &config, "blue.catbird.chat.getBlob", "old-scoped-token").unwrap();
-            let renewed = build_request_parts(&auth, &config, "blue.catbird.chat.getBlob", "renewed-scoped-token").unwrap();
+            let initial = build_request_parts(
+                &auth,
+                &config,
+                "blue.catbird.chat.getBlob",
+                "old-scoped-token",
+            )
+            .unwrap();
+            let renewed = build_request_parts(
+                &auth,
+                &config,
+                "blue.catbird.chat.getBlob",
+                "renewed-scoped-token",
+            )
+            .unwrap();
             assert_eq!(initial.0, renewed.0);
-            assert_eq!(renewed.0, format!("{}/xrpc/blue.catbird.chat.getBlob", expected.trim_end_matches('/')));
+            assert_eq!(
+                renewed.0,
+                format!(
+                    "{}/xrpc/blue.catbird.chat.getBlob",
+                    expected.trim_end_matches('/')
+                )
+            );
             assert_eq!(renewed.1[AUTHORIZATION], "Bearer renewed-scoped-token");
             assert!(!renewed.0.starts_with("https://pds.catbird.blue/"));
         }
@@ -2324,12 +2422,17 @@ mod tests {
                 let calls = handler_calls.clone();
                 async move {
                     if calls.fetch_add(1, Ordering::Relaxed) < 2 {
-                        (axum::http::StatusCode::OK, axum::Json(serde_json::json!({
-                            "entries": [], "hasMore": false,
-                        })))
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "entries": [], "hasMore": false,
+                            })),
+                        )
                     } else {
-                        (axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                         axum::Json(serde_json::json!({"error": "temporarily unavailable"})))
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(serde_json::json!({"error": "temporarily unavailable"})),
+                        )
                     }
                 }
             }),
@@ -2339,57 +2442,155 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
         let temporary = tempfile::tempdir().unwrap();
-        let db = Arc::new(Database::open_unencrypted(&temporary.path().join("chat.db")).await.unwrap());
-        db.store_session_value("mls_device_id", "test-device").await.unwrap();
-        let mls = Arc::new(MlsManager::new(&temporary.path().join("mls"), "did:plc:historytest").unwrap());
+        let db = Arc::new(
+            Database::open_unencrypted(&temporary.path().join("chat.db"))
+                .await
+                .unwrap(),
+        );
+        db.store_session_value("mls_device_id", "test-device")
+            .await
+            .unwrap();
+        let mls = Arc::new(
+            MlsManager::new(&temporary.path().join("mls"), "did:plc:historytest").unwrap(),
+        );
         mls.context().set_content_root_key(vec![0x74; 32]).unwrap();
         let service = Arc::new(ChatService::new(
-            AuthMethod::OAuth { session_cookie: "test-only".into(), did: "did:plc:historytest".into(), nest_url: endpoint },
-            None, mls.clone(), db, Config::default(),
-            Arc::new(RwLock::new(AliasStore::with_path(temporary.path().join("aliases.json")))),
+            AuthMethod::OAuth {
+                session_cookie: "test-only".into(),
+                did: "did:plc:historytest".into(),
+                nest_url: endpoint,
+            },
+            None,
+            mls.clone(),
+            db,
+            Config::default(),
+            Arc::new(RwLock::new(AliasStore::with_path(
+                temporary.path().join("aliases.json"),
+            ))),
         ));
-        let storage = Arc::new(SqliteStorage::new(temporary.path().join("orchestrator.db").to_str().unwrap(), "test-only").unwrap());
+        let storage = Arc::new(
+            SqliteStorage::new(
+                temporary.path().join("orchestrator.db").to_str().unwrap(),
+                "test-only",
+            )
+            .unwrap(),
+        );
         storage.set_mls_context(mls.context().clone());
-        storage.store_message(&catbird_mls::orchestrator::types::Message {
-            id: "retained-message".into(), conversation_id: "history-conversation".into(),
-            sender_did: "did:plc:peer".into(), text: "retained authenticated history".into(),
-            timestamp: Utc::now(), epoch: 1, sequence_number: 0, is_own: false,
-            delivery_status: None, payload_json: None,
-        }).await.unwrap();
+        storage
+            .store_message(&catbird_mls::orchestrator::types::Message {
+                id: "retained-message".into(),
+                conversation_id: "history-conversation".into(),
+                sender_did: "did:plc:peer".into(),
+                text: "retained authenticated history".into(),
+                timestamp: Utc::now(),
+                epoch: 1,
+                sequence_number: 0,
+                is_own: false,
+                delivery_status: None,
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+        // Exercise the terminal conversation gate with a complete local actor;
+        // send admission now captures exact device/auth generation first.
+        let credentials = Arc::new(KeyringCredentialStore::new());
+        let device = "b0b00000-0000-4000-8000-000000000001";
+        credentials
+            .store_device_uuid(service.did(), device)
+            .await
+            .unwrap();
+        credentials
+            .store_signing_key(service.did(), &[31; 32])
+            .await
+            .unwrap();
+        KeyringCredentialStore::retain_generation(
+            service.did(),
+            device,
+            "synthetic-history-key",
+            1,
+        )
+        .await
+        .unwrap();
         let orchestrator = Arc::new(MLSOrchestrator::new(
-            mls.context().clone(), storage.clone(),
+            mls.context().clone(),
+            storage.clone(),
             Arc::new(CliApiClient::new(service.clone())),
-            Arc::new(KeyringCredentialStore::new()), OrchestratorConfig::default(),
+            credentials,
+            OrchestratorConfig::default(),
         ));
         orchestrator.initialize(service.did()).await.unwrap();
         service.set_orchestrator(orchestrator.clone()).await;
         for _ in 0..2 {
-            let history = service.load_canonical_message_history("history-conversation", 50).await.unwrap();
+            let history = service
+                .load_canonical_message_history("history-conversation", 50)
+                .await
+                .unwrap();
             assert_eq!(history.len(), 1);
             assert_eq!(history[0].text, "retained authenticated history");
         }
-        let error = service.load_canonical_message_history("history-conversation", 50).await.unwrap_err();
+        let error = service
+            .load_canonical_message_history("history-conversation", 50)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("503"), "{error}");
         assert_eq!(calls.load(Ordering::Relaxed), 3);
         use catbird_mls::orchestrator::types::{ConversationState, SyncCursor};
-        storage.ensure_conversation_exists(service.did(), "history-conversation", "000102030405060708090a0b0c0d0e0f").await.unwrap();
-        let cursor = SyncCursor { conversations_cursor: Some("inventory-cursor".into()), messages_cursor: Some("message-cursor".into()) };
-        storage.set_sync_cursor(service.did(), &cursor).await.unwrap();
+        storage
+            .ensure_conversation_exists(
+                service.did(),
+                "history-conversation",
+                "000102030405060708090a0b0c0d0e0f",
+            )
+            .await
+            .unwrap();
+        let cursor = SyncCursor {
+            conversations_cursor: Some("inventory-cursor".into()),
+            messages_cursor: Some("message-cursor".into()),
+        };
+        storage
+            .set_sync_cursor(service.did(), &cursor)
+            .await
+            .unwrap();
         for (state, expected_send_error) in [
-            (ConversationState::DeviceRemoved, "conversation_device_removed"),
+            (
+                ConversationState::DeviceRemoved,
+                "conversation_device_removed",
+            ),
             (ConversationState::Closed, "conversation_closed"),
         ] {
-            storage.set_conversation_state("history-conversation", state.clone()).await.unwrap();
+            storage
+                .set_conversation_state("history-conversation", state.clone())
+                .await
+                .unwrap();
             orchestrator.initialize(service.did()).await.unwrap();
             for _ in 0..2 {
-                let history = service.load_canonical_message_history("history-conversation", 50).await.unwrap();
+                let history = service
+                    .load_canonical_message_history("history-conversation", 50)
+                    .await
+                    .unwrap();
                 assert_eq!(history.len(), 1);
                 assert_eq!(history[0].text, "retained authenticated history");
             }
-            let send_error = orchestrator.send_message("history-conversation", "must remain blocked").await.unwrap_err();
-            assert!(send_error.to_string().contains(expected_send_error), "{send_error}");
-            assert_eq!(storage.get_conversation_state("history-conversation").await.unwrap(), Some(state));
-            assert_eq!(calls.load(Ordering::Relaxed), 3, "terminal reads and sends must not reach getEntries");
+            let send_error = orchestrator
+                .send_message("history-conversation", "must remain blocked")
+                .await
+                .unwrap_err();
+            assert!(
+                send_error.to_string().contains(expected_send_error),
+                "{send_error}"
+            );
+            assert_eq!(
+                storage
+                    .get_conversation_state("history-conversation")
+                    .await
+                    .unwrap(),
+                Some(state)
+            );
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                3,
+                "terminal reads and sends must not reach getEntries"
+            );
             let unchanged = storage.get_sync_cursor(service.did()).await.unwrap();
             assert_eq!(unchanged.conversations_cursor, cursor.conversations_cursor);
             assert_eq!(unchanged.messages_cursor, cursor.messages_cursor);

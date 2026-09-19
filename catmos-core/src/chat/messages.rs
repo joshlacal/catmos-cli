@@ -175,11 +175,13 @@ pub(crate) struct ApplicationEntryResp {
 }
 
 fn extract_commit_bytes(entry: &CommitEntryResp) -> Result<Vec<u8>> {
-    let artifact = entry.signed_request.get("body").and_then(|body| body.get("commit"))
+    let artifact = entry
+        .signed_request
+        .get("body")
+        .and_then(|body| body.get("commit"))
         .ok_or_else(|| CatmosError::Xrpc("Commit entry omitted its MLS artifact".into()))?;
     super::entries::artifact_bytes(artifact, "commit")
 }
-
 
 fn is_replayed_or_own_commit_error(err: &CatmosError) -> bool {
     if let CatmosError::Mls(mls_err) = err {
@@ -328,7 +330,9 @@ impl ChatService {
         let stable_convo_id = self.resolve_conversation_ids(convo_id).await?.0;
 
         if let Some(orchestrator) = self.orchestrator().await {
-            let sent = orchestrator.send_message(&stable_convo_id, text).await
+            let sent = orchestrator
+                .send_message(&stable_convo_id, text)
+                .await
                 .map_err(|error| CatmosError::Other(error.to_string()))?;
             let message = Message {
                 id: sent.id,
@@ -567,37 +571,27 @@ impl ChatService {
         Ok((plaintext, sender_did))
     }
 
-    pub async fn send_typing(&self, convo_id: &str, is_typing: bool) -> Result<()> {
-        let (stable_convo_id, _) = self.resolve_conversation_ids(convo_id).await?;
-        let action = if is_typing { "typing" } else { "typingStop" };
-        let noop = vec![0u8; 512];
-        let msg_id = ulid::Ulid::new().to_string();
-
-        let req = serde_json::json!({
-            "convoId": stable_convo_id,
-            "ciphertext": BASE64.encode(&noop),
-            "epoch": 0,
-            "msgId": msg_id,
-            "paddedSize": 512,
-            "delivery": "ephemeral",
-            "action": action,
-        });
-
-        let _: serde_json::Value = self
-            .xrpc_procedure("blue.catbird.chat.sendMessage", &req)
-            .await?;
-
-        Ok(())
+    pub async fn send_typing(&self, convo_id: &str, _is_typing: bool) -> Result<()> {
+        self.require_ordinary_effects(convo_id).await?;
+        // No shared high-level canonical typing signer is exposed to this host.
+        // Never fall back to an unsigned sendMessage/noop payload.
+        Err(CatmosError::UnsupportedOperation {
+            operation: "publishTyping",
+        })
     }
 
     /// Fetch all conversations from the server, decrypt metadata, and cache locally.
     pub async fn fetch_conversations(&self) -> Result<Vec<Conversation>> {
-        self.fetch_conversations_with_states().await.map(|(conversations, _)| conversations)
+        self.fetch_conversations_with_states()
+            .await
+            .map(|(conversations, _)| conversations)
     }
 
     /// Preserve the exact server snapshot until the shared orchestrator can
     /// apply invitation consent gates. Local/legacy rows carry no snapshot.
-    pub(crate) async fn fetch_conversations_with_states(&self) -> Result<(
+    pub(crate) async fn fetch_conversations_with_states(
+        &self,
+    ) -> Result<(
         Vec<Conversation>,
         HashMap<String, catbird_atproto::blue_catbird::chat::ConversationState>,
     )> {
@@ -607,7 +601,12 @@ impl ChatService {
         let mut page_cursor: Option<String> = None;
 
         loop {
-            let mut params = vec![("actorDeviceId", actor_device_id.as_str()), ("limit", "50")];
+            let mut params = vec![
+                ("actorDeviceId", actor_device_id.as_str()),
+                ("limit", "50"),
+                ("supportedProtocolVersions", "1"),
+                ("supportedProtocolVersions", "2"),
+            ];
             let cursor_holder;
             if let Some(ref c) = page_cursor {
                 cursor_holder = c.clone();
@@ -659,13 +658,22 @@ impl ChatService {
                                 .to_string(),
                         ));
                     }
-                    let canonical_state = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
-                        state_obj.to_string().as_bytes(),
-                    ).map_err(|error| {
-                        CatmosError::Xrpc(format!("invalid canonical conversation state: {error}"))
-                    })?;
-                    if canonical_states.insert(convo_id.clone(), canonical_state).is_some() {
-                        return Err(CatmosError::Xrpc("duplicate canonical conversation state".into()));
+                    let canonical_state =
+                        catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+                            state_obj.to_string().as_bytes(),
+                        )
+                        .map_err(|error| {
+                            CatmosError::Xrpc(format!(
+                                "invalid canonical conversation state: {error}"
+                            ))
+                        })?;
+                    if canonical_states
+                        .insert(convo_id.clone(), canonical_state)
+                        .is_some()
+                    {
+                        return Err(CatmosError::Xrpc(
+                            "duplicate canonical conversation state".into(),
+                        ));
                     }
                     let cipher_suite = state_obj
                         .get("cipherSuite")
@@ -774,11 +782,17 @@ impl ChatService {
                 if conversation.name.is_some() && conversation.description.is_some() {
                     continue;
                 }
-                let local = match runtime_views.get(&conversation.conversation_id)
-                    .filter(|view| view.group_id == conversation.group_id && view.metadata.is_some())
-                {
+                let local = match runtime_views
+                    .get(&conversation.conversation_id)
+                    .filter(|view| {
+                        view.group_id == conversation.group_id && view.metadata.is_some()
+                    }) {
                     Some(view) => Some(view.clone()),
-                    None => match orchestrator.storage().get_conversation(self.did(), &conversation.conversation_id).await {
+                    None => match orchestrator
+                        .storage()
+                        .get_conversation(self.did(), &conversation.conversation_id)
+                        .await
+                    {
                         Ok(local) => local,
                         Err(error) => {
                             debug!(conversation = %conversation.conversation_id, %error, "Optional local title hydration failed");
@@ -788,8 +802,12 @@ impl ChatService {
                 };
                 if let Some(local) = local.filter(|local| local.group_id == conversation.group_id) {
                     if let Some(metadata) = local.metadata {
-                        if conversation.name.is_none() { conversation.name = metadata.name; }
-                        if conversation.description.is_none() { conversation.description = metadata.description; }
+                        if conversation.name.is_none() {
+                            conversation.name = metadata.name;
+                        }
+                        if conversation.description.is_none() {
+                            conversation.description = metadata.description;
+                        }
                     }
                 }
             }
@@ -916,6 +934,15 @@ impl ChatService {
     /// Sync MLS state for a conversation by processing all commit messages
     /// in seq order.
     pub async fn sync_conversation(&self, convo_id: &str) -> Result<()> {
+        if let Some(authority) = self.orchestrator().await {
+            let stable = self.resolve_conversation_ids(convo_id).await?.0;
+            authority
+                .fetch_messages(&stable, None, 100, None, None, None)
+                .await
+                .map_err(|e| CatmosError::Other(e.to_string()))?;
+            return Ok(());
+        }
+
         let (stable_convo_id, group_id_hex) = self.resolve_conversation_ids(convo_id).await?;
         let gid_bytes = hex::decode(&group_id_hex)
             .map_err(|e| CatmosError::Other(format!("Invalid group ID hex: {e}")))?;
@@ -975,8 +1002,9 @@ impl ChatService {
                 )
                 .await?;
 
-            let entries_resp: GetEntriesResp = serde_json::from_value(resp)
-                .map_err(|error| CatmosError::Xrpc(format!("Invalid conversation entries: {error}")))?;
+            let entries_resp: GetEntriesResp = serde_json::from_value(resp).map_err(|error| {
+                CatmosError::Xrpc(format!("Invalid conversation entries: {error}"))
+            })?;
 
             if entries_resp.entries.is_empty() {
                 break;
@@ -1118,6 +1146,33 @@ impl ChatService {
     /// Fetch messages for a conversation from the server, decrypt each, and store locally.
     pub async fn fetch_messages(&self, convo_id: &str, limit: u32) -> Result<Vec<Message>> {
         let (stable_convo_id, _) = self.resolve_conversation_ids(convo_id).await?;
+        if let Some(authority) = self.orchestrator().await {
+            let (_messages, _) = authority
+                .fetch_messages(&stable_convo_id, None, limit, None, None, None)
+                .await
+                .map_err(|e| CatmosError::Other(e.to_string()))?;
+            use catbird_mls::orchestrator::MLSStorageBackend;
+            let messages = authority
+                .storage()
+                .get_messages(&stable_convo_id, limit, None)
+                .await
+                .map_err(|e| CatmosError::Other(e.to_string()))?;
+            for message in messages {
+                let host = Message {
+                    id: message.id,
+                    convo_id: stable_convo_id.clone(),
+                    sender_did: Some(message.sender_did),
+                    content: parse_message_content(
+                        message.payload_json.as_deref().unwrap_or(&message.text),
+                    ),
+                    epoch: message.epoch,
+                    seq: message.sequence_number,
+                    created_at: message.timestamp,
+                };
+                self.db.store_message(&host).await?;
+            }
+            return self.load_local_messages(&stable_convo_id, limit).await;
+        }
 
         if let Err(e) = self.sync_conversation(&stable_convo_id).await {
             warn!(
@@ -1199,9 +1254,11 @@ impl ChatService {
                     "entryId": app_entry.entry_id, "conversationId": app_entry.conversation_id,
                     "seq": app_entry.seq, "receivedAt": app_entry.received_at,
                     "signedRequest": app_entry.signed_request,
-                }), &stable_convo_id,
-            ).map_err(|error| CatmosError::Xrpc(error.to_string()))?
-                .ok_or_else(|| CatmosError::Xrpc("Application entry has no MLS envelope".into()))?;
+                }),
+                &stable_convo_id,
+            )
+            .map_err(|error| CatmosError::Xrpc(error.to_string()))?
+            .ok_or_else(|| CatmosError::Xrpc("Application entry has no MLS envelope".into()))?;
             let ciphertext = envelope.ciphertext;
 
             match self.decrypt_message(&group_id, &ciphertext) {
@@ -1215,7 +1272,9 @@ impl ChatService {
                         sender_did,
                         content,
                         epoch: envelope.server_epoch.expect("canonical envelope epoch"),
-                        seq: envelope.server_sequence.expect("canonical envelope sequence"),
+                        seq: envelope
+                            .server_sequence
+                            .expect("canonical envelope sequence"),
                         created_at,
                     };
                     if let Err(e) = self.db.store_message(&msg).await {
@@ -1244,6 +1303,16 @@ impl ChatService {
 
 /// Parse a decrypted JSON payload into a `MessageContent`.
 fn parse_message_content(plaintext: &str) -> MessageContent {
+    if let Ok(payload) = catbird_mls::orchestrator::MLSMessagePayload::decode(plaintext.as_bytes())
+    {
+        if let Ok(Some(reference)) = payload.checked_group_invitation() {
+            return MessageContent::GroupInvitation {
+                text: payload.text.clone().unwrap_or_default(),
+                reference,
+            };
+        }
+    }
+
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(plaintext) {
         let msg_type = v
             .get("messageType")
@@ -1338,8 +1407,9 @@ fn merge_message_buckets(
 
     let mut messages: Vec<Message> = by_id.into_values().collect();
     messages.sort_by(|left, right| {
-        crate::types::message_order_key(left.seq, &left.created_at, &left.id)
-            .cmp(&crate::types::message_order_key(right.seq, &right.created_at, &right.id))
+        crate::types::message_order_key(left.seq, &left.created_at, &left.id).cmp(
+            &crate::types::message_order_key(right.seq, &right.created_at, &right.id),
+        )
     });
 
     let keep = limit as usize;
@@ -1461,14 +1531,21 @@ mod tests {
     }
 
     fn canonical_state_fixture(id: &str, group: &str, pending_invitee: bool) -> Value {
-        let mut state: Value = serde_json::from_str(include_str!("../../tests/fixtures/canonical-conversation-state.json")).unwrap();
+        let mut state: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/canonical-conversation-state.json"
+        ))
+        .unwrap();
         state["coordinates"]["conversationId"] = serde_json::json!(id);
-        state["coordinates"]["groupId"] = serde_json::json!({"$bytes": BASE64.encode(hex::decode(group).unwrap())});
+        state["coordinates"]["groupId"] =
+            serde_json::json!({"$bytes": BASE64.encode(hex::decode(group).unwrap())});
         state["coordinates"]["epoch"] = serde_json::json!(0);
         state["metadataSnapshot"]["coordinate"]["conversationId"] = serde_json::json!({"$bytes": BASE64.encode(uuid::Uuid::parse_str(id).unwrap().as_bytes())});
-        state["metadataSnapshot"]["coordinate"]["groupId"] = state["coordinates"]["groupId"].clone();
+        state["metadataSnapshot"]["coordinate"]["groupId"] =
+            state["coordinates"]["groupId"].clone();
         state["metadataSnapshot"]["coordinate"]["epoch"] = serde_json::json!(0);
-        if !pending_invitee { state["participants"].as_array_mut().unwrap().truncate(1); }
+        if !pending_invitee {
+            state["participants"].as_array_mut().unwrap().truncate(1);
+        }
         state
     }
 
@@ -1481,22 +1558,43 @@ mod tests {
         let old_date = "2026-09-05T02:34:00+00:00";
         let mut cached = fixture_conversation(id, group);
         cached.creator = Some(old_creator.to_owned());
-        cached.created_at = Some(chrono::DateTime::parse_from_rfc3339(old_date).unwrap().with_timezone(&Utc));
+        cached.created_at = Some(
+            chrono::DateTime::parse_from_rfc3339(old_date)
+                .unwrap()
+                .with_timezone(&Utc),
+        );
         service.db.store_conversation(&cached).await.unwrap();
-        service.db.store_session_value("mls_device_id", "device-1").await.unwrap();
-        service.handle_cache.write().await.insert("did:plc:first-member".into(), "first.test".into());
+        service
+            .db
+            .store_session_value("mls_device_id", "device-1")
+            .await
+            .unwrap();
+        service
+            .handle_cache
+            .write()
+            .await
+            .insert("did:plc:first-member".into(), "first.test".into());
         let response = serde_json::json!({
             "items": [{"state": canonical_state_fixture(id, group, false)}]
         });
         let router = axum::Router::new().route(
             "/xrpc/blue.catbird.chat.getConversations",
-            axum::routing::get(move || { let response = response.clone(); async move { axum::Json(response) } }),
+            axum::routing::get(move || {
+                let response = response.clone();
+                async move { axum::Json(response) }
+            }),
         );
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
         service.auth = AuthMethod::OAuth {
-            session_cookie: "test-cookie".into(), did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(), nest_url: format!("http://{address}"),
+            session_cookie: "test-cookie".into(),
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            nest_url: format!("http://{address}"),
         };
         for _ in 0..2 {
             let rows = service.fetch_conversations().await.unwrap();
@@ -1514,7 +1612,11 @@ mod tests {
         // those unproven values as evidence in cache or native projections.
         let preserved: (String, String) = sqlx::query_as(
             "SELECT creator, created_at FROM conversations WHERE conversation_id = ?1",
-        ).bind(id).fetch_one(service.db.pool_for_test()).await.unwrap();
+        )
+        .bind(id)
+        .fetch_one(service.db.pool_for_test())
+        .await
+        .unwrap();
         assert_eq!(preserved, (old_creator.to_owned(), old_date.to_owned()));
         let api = crate::orchestrator_api::CliApiClient::new(Arc::new(service));
         use catbird_mls::orchestrator::api_client::MLSAPIClient;
@@ -1531,7 +1633,11 @@ mod tests {
         use catbird_mls::orchestrator::storage::MLSStorageBackend;
         use catbird_mls::orchestrator::{MLSOrchestrator, OrchestratorConfig};
         let mut service = test_service().await;
-        service.db.store_session_value("mls_device_id", "device-1").await.unwrap();
+        service
+            .db
+            .store_session_value("mls_device_id", "device-1")
+            .await
+            .unwrap();
         let group = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
         let ids = [
             "550e8400-e29b-41d4-a716-446655440001",
@@ -1544,56 +1650,112 @@ mod tests {
         let response = serde_json::json!({"items": ids.iter().map(|id| serde_json::json!({
             "state": canonical_state_fixture(id, group, false)
         })).collect::<Vec<_>>()});
-        let router = axum::Router::new().route("/xrpc/blue.catbird.chat.getConversations",
-            axum::routing::get(move || { let value = response.clone(); async move { axum::Json(value) } }));
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let router = axum::Router::new().route(
+            "/xrpc/blue.catbird.chat.getConversations",
+            axum::routing::get(move || {
+                let value = response.clone();
+                async move { axum::Json(value) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
         service.auth = AuthMethod::OAuth {
-            session_cookie: "test-cookie".into(), did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(), nest_url: format!("http://{address}"),
+            session_cookie: "test-cookie".into(),
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            nest_url: format!("http://{address}"),
         };
         let service = Arc::new(service);
         let native_dir = tempfile::tempdir().unwrap();
         let native_path = native_dir.path().join("title-store.db");
-        let storage = Arc::new(SqliteStorage::new(native_path.to_str().unwrap(), "test-only").unwrap());
+        let storage =
+            Arc::new(SqliteStorage::new(native_path.to_str().unwrap(), "test-only").unwrap());
         for (index, id) in ids.iter().enumerate() {
-            let stored_group = if index == 2 { "111102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" } else { group };
-            storage.ensure_conversation_exists(service.did(), id, stored_group).await.unwrap();
+            let stored_group = if index == 2 {
+                "111102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+            } else {
+                group
+            };
+            storage
+                .ensure_conversation_exists(service.did(), id, stored_group)
+                .await
+                .unwrap();
             storage.update_metadata_json(id, r#"{"name":"Known native title","description":"Known description","avatar_url":null}"#, 1, "local", None, None).unwrap();
         }
         let orchestrator = Arc::new(MLSOrchestrator::new(
-            service.mls.context().clone(), storage.clone(), Arc::new(CliApiClient::new(service.clone())),
-            Arc::new(KeyringCredentialStore::new()), OrchestratorConfig::default(),
+            service.mls.context().clone(),
+            storage.clone(),
+            Arc::new(CliApiClient::new(service.clone())),
+            Arc::new(KeyringCredentialStore::new()),
+            OrchestratorConfig::default(),
         ));
-        let mut runtime_view = storage.get_conversation(service.did(), ids[0]).await.unwrap().unwrap();
+        let mut runtime_view = storage
+            .get_conversation(service.did(), ids[0])
+            .await
+            .unwrap()
+            .unwrap();
         runtime_view.metadata.as_mut().unwrap().name = Some("Known runtime title".into());
-        orchestrator.conversations().lock().await.insert(ids[0].into(), runtime_view);
+        orchestrator
+            .conversations()
+            .lock()
+            .await
+            .insert(ids[0].into(), runtime_view);
         service.set_orchestrator(orchestrator.clone()).await;
         let rows = service.fetch_conversations().await.unwrap();
         assert_eq!(rows[0].name.as_deref(), Some("Known runtime title"));
         assert_eq!(rows[1].name.as_deref(), Some("Known host title"));
-        assert_eq!(rows[2].name, None, "different group metadata must not bleed into current inventory");
+        assert_eq!(
+            rows[2].name, None,
+            "different group metadata must not bleed into current inventory"
+        );
         // The host persists a known title before a later inventory/cache miss.
         orchestrator.conversations().lock().await.clear();
-        storage.update_metadata_json(ids[0], "{}", 2, "local", None, None).unwrap();
+        storage
+            .update_metadata_json(ids[0], "{}", 2, "local", None, None)
+            .unwrap();
         let repeated = service.fetch_conversations().await.unwrap();
         assert_eq!(repeated[0].name.as_deref(), Some("Known runtime title"));
         assert_eq!(repeated[1].name.as_deref(), Some("Known host title"));
         let reloaded = service.db.list_conversations().await.unwrap();
-        assert_eq!(reloaded.iter().find(|row| row.conversation_id == ids[0]).unwrap().name.as_deref(), Some("Known runtime title"));
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|row| row.conversation_id == ids[0])
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Known runtime title")
+        );
         // An unavailable optional native metadata table cannot turn a valid
         // server inventory into an error or erase known host titles.
         let failing_store = rusqlite::Connection::open(&native_path).unwrap();
-        failing_store.pragma_update(None, "key", "test-only").unwrap();
-        failing_store.execute_batch("DROP TABLE conversations;").unwrap();
+        failing_store
+            .pragma_update(None, "key", "test-only")
+            .unwrap();
+        failing_store
+            .execute_batch("DROP TABLE conversations;")
+            .unwrap();
         // Refresh the reader connection's SQLite schema cache after the
         // external fixture DDL before asserting its prepare failure.
         let _ = storage.get_conversation(service.did(), ids[0]).await;
-        assert!(storage.get_conversation(service.did(), ids[0]).await.is_err());
+        assert!(storage
+            .get_conversation(service.did(), ids[0])
+            .await
+            .is_err());
         let without_optional_metadata = service.fetch_conversations().await.unwrap();
         assert_eq!(without_optional_metadata.len(), 3);
-        assert_eq!(without_optional_metadata[0].name.as_deref(), Some("Known runtime title"));
-        assert_eq!(without_optional_metadata[1].name.as_deref(), Some("Known host title"));
+        assert_eq!(
+            without_optional_metadata[0].name.as_deref(),
+            Some("Known runtime title")
+        );
+        assert_eq!(
+            without_optional_metadata[1].name.as_deref(),
+            Some("Known host title")
+        );
         assert_eq!(without_optional_metadata[2].name, None);
         server.abort();
     }
@@ -1601,23 +1763,43 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn canonical_inventory_preserves_pending_and_active_admission_state_through_cli() {
         use catbird_mls::orchestrator::api_client::MLSAPIClient;
-        use catbird_mls::orchestrator::canonical_transport::{decode_conversation_state, encode_conversation_state};
+        use catbird_mls::orchestrator::canonical_transport::{
+            decode_conversation_state, encode_conversation_state,
+        };
         let mut service = test_service().await;
-        service.db.store_session_value("mls_device_id", "22222222-2222-4222-9222-222222222222").await.unwrap();
-        service.handle_cache.write().await.insert("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(), "creator.test".into());
-        let wire: Value = serde_json::from_str(include_str!("../../tests/fixtures/canonical-conversation-state.json")).unwrap();
+        service
+            .db
+            .store_session_value("mls_device_id", "22222222-2222-4222-9222-222222222222")
+            .await
+            .unwrap();
+        service.handle_cache.write().await.insert(
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            "creator.test".into(),
+        );
+        let wire: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/canonical-conversation-state.json"
+        ))
+        .unwrap();
         let shared = Arc::new(Mutex::new(wire));
         let response = shared.clone();
-        let router = axum::Router::new().route("/xrpc/blue.catbird.chat.getConversations",
+        let router = axum::Router::new().route(
+            "/xrpc/blue.catbird.chat.getConversations",
             axum::routing::get(move || {
                 let state = response.lock().unwrap().clone();
                 async move { axum::Json(serde_json::json!({"items": [{"state": state}]})) }
-            }));
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
         service.auth = AuthMethod::OAuth {
-            session_cookie: "test-cookie".into(), did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(), nest_url: format!("http://{address}"),
+            session_cookie: "test-cookie".into(),
+            did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            nest_url: format!("http://{address}"),
         };
         let api = crate::orchestrator_api::CliApiClient::new(Arc::new(service));
         for (status, version) in [("pending", 41), ("active", 42)] {
@@ -1632,8 +1814,17 @@ mod tests {
             let view = &page.conversations[0];
             assert_eq!(view.canonical_state.as_ref(), Some(&expected));
             assert_eq!(view.epoch, expected.coordinates.epoch as u64);
-            assert_eq!(view.canonical_state.as_ref().unwrap().participants[1].leaf_count, 0);
-            assert_eq!(decode_conversation_state(&encode_conversation_state(view.canonical_state.as_ref().unwrap()).unwrap()).unwrap(), expected);
+            assert_eq!(
+                view.canonical_state.as_ref().unwrap().participants[1].leaf_count,
+                0
+            );
+            assert_eq!(
+                decode_conversation_state(
+                    &encode_conversation_state(view.canonical_state.as_ref().unwrap()).unwrap()
+                )
+                .unwrap(),
+                expected
+            );
         }
         shared.lock().unwrap()["participants"][1]["status"] = serde_json::json!("unknown");
         assert!(api.get_conversations(10, None).await.is_err());
@@ -1645,13 +1836,20 @@ mod tests {
         let mut view = ConvoViewResp {
             conversation_id: Some("550e8400-e29b-41d4-a716-446655440000".into()),
             group_id: "000102030405060708090a0b0c0d0e0f".into(),
-            creator: "did:plc:creator".into(), epoch: 0,
-            cipher_suite: crate::mls::MLS_CIPHER_SUITE.into(), members: vec![],
-            created_at: "2026-09-05T02:34:00Z".into(), last_message_at: None, metadata: None,
+            creator: "did:plc:creator".into(),
+            epoch: 0,
+            cipher_suite: crate::mls::MLS_CIPHER_SUITE.into(),
+            members: vec![],
+            created_at: "2026-09-05T02:34:00Z".into(),
+            last_message_at: None,
+            metadata: None,
         };
         let explicit = convo_resp_to_conversation(&view).unwrap();
         assert_eq!(explicit.creator.as_deref(), Some("did:plc:creator"));
-        assert_eq!(explicit.created_at.unwrap().to_rfc3339(), "2026-09-05T02:34:00+00:00");
+        assert_eq!(
+            explicit.created_at.unwrap().to_rfc3339(),
+            "2026-09-05T02:34:00+00:00"
+        );
         view.creator.clear();
         view.created_at = "invalid date".into();
         let absent = convo_resp_to_conversation(&view).unwrap();
@@ -1685,14 +1883,23 @@ mod tests {
 
     #[test]
     fn service_mapper_preserves_every_commit_bearing_v2_entry() {
-        use catbird_mls::chat_v2::wire::{COMMIT_ENTRY_KIND, LEAF_RECOVERY_FULFILLMENT_ENTRY_KIND, LEAVE_COMMIT_FULFILLMENT_ENTRY_KIND};
-        for kind in [COMMIT_ENTRY_KIND, LEAF_RECOVERY_FULFILLMENT_ENTRY_KIND, LEAVE_COMMIT_FULFILLMENT_ENTRY_KIND] {
+        use catbird_mls::chat_v2::wire::{
+            COMMIT_ENTRY_KIND, LEAF_RECOVERY_FULFILLMENT_ENTRY_KIND,
+            LEAVE_COMMIT_FULFILLMENT_ENTRY_KIND,
+        };
+        for kind in [
+            COMMIT_ENTRY_KIND,
+            LEAF_RECOVERY_FULFILLMENT_ENTRY_KIND,
+            LEAVE_COMMIT_FULFILLMENT_ENTRY_KIND,
+        ] {
             let value = serde_json::json!({
                 "$type": kind, "conversationId": "conversation", "entryId": "entry", "seq": 1,
                 "signedRequest": {"body": {"commit": {"bytes": {"$bytes": BASE64.encode(b"commit")}}}},
             });
             let mapped: ConversationEntryResp = serde_json::from_value(value).unwrap();
-            let ConversationEntryResp::Commit(commit) = mapped else { panic!("commit was dropped: {kind}") };
+            let ConversationEntryResp::Commit(commit) = mapped else {
+                panic!("commit was dropped: {kind}")
+            };
             assert_eq!(extract_commit_bytes(&commit).unwrap(), b"commit");
         }
         assert!(serde_json::from_value::<GetEntriesResp>(serde_json::json!({})).is_err());
@@ -1720,19 +1927,33 @@ mod tests {
         first.name = Some("friends".into());
         service.db.store_conversation(&first).await.unwrap();
         *service.conversations.write().await = vec![first.clone()];
-        service.aliases.write().await.set("old-device".into(), group.into()).unwrap();
+        service
+            .aliases
+            .write()
+            .await
+            .set("old-device".into(), group.into())
+            .unwrap();
         for input in [stable, group, "friends", "old-device", "550e8400"] {
             assert_eq!(service.resolve_convo(input).await.unwrap(), stable);
         }
-        assert_eq!(service.resolve_mls_group_id("friends").await.unwrap(), group);
+        assert_eq!(
+            service.resolve_mls_group_id("friends").await.unwrap(),
+            group
+        );
         let mut second = fixture_conversation(
-            "550e8400-e29b-41d4-a716-446655440001", "111102030405060708090a0b0c0d0e0f",
+            "550e8400-e29b-41d4-a716-446655440001",
+            "111102030405060708090a0b0c0d0e0f",
         );
         second.name = first.name.clone();
         service.db.store_conversation(&second).await.unwrap();
         service.conversations.write().await.push(second);
         for input in ["friends", "550e8400"] {
-            assert!(service.resolve_convo(input).await.unwrap_err().to_string().contains("Ambiguous"));
+            assert!(service
+                .resolve_convo(input)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Ambiguous"));
         }
         assert_eq!(service.resolve_convo(stable).await.unwrap(), stable);
     }
@@ -1819,7 +2040,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn reaction_uses_current_group_for_mls_and_stable_id_for_api() {
+    async fn reaction_without_shared_authority_fails_before_transport() {
         let mut service = test_service().await;
         let conversation_id = "550e8400-e29b-41d4-a716-446655440000";
         let group_id = "000102030405060708090a0b0c0d0e0f";
@@ -1864,21 +2085,20 @@ mod tests {
             nest_url: format!("http://{address}"),
         };
 
-        service
+        let error = service
             .send_reaction(conversation_id, "message-1", "🔥", false)
             .await
-            .expect("send reaction through mock XRPC");
+            .expect_err("missing shared authority must withhold reactions");
+        let typing_error = service
+            .send_typing(conversation_id, true)
+            .await
+            .expect_err("typing must withhold without authority");
+        assert!(typing_error
+            .to_string()
+            .contains("authority is not initialized"));
         server.abort();
-
-        let request = captured
-            .lock()
-            .expect("capture lock")
-            .clone()
-            .expect("reaction request captured");
-        assert_eq!(request["convoId"], conversation_id);
-        assert!(request["ciphertext"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty()));
+        assert!(error.to_string().contains("authority is not initialized"));
+        assert!(captured.lock().expect("capture lock").is_none());
     }
 
     async fn mock_get_conversations_missing_group_id() -> axum::Json<Value> {
@@ -2420,17 +2640,48 @@ mod tests {
     fn merge_message_buckets_uses_confirmed_sequence_then_pending_timestamp() {
         let now = Utc::now();
         let message = |id: &str, seq, offset| Message {
-            id: id.into(), convo_id: "source-bucket".into(), sender_did: Some("did:plc:test".into()),
-            content: MessageContent::Text(id.into()), epoch: 1, seq,
+            id: id.into(),
+            convo_id: "source-bucket".into(),
+            sender_did: Some("did:plc:test".into()),
+            content: MessageContent::Text(id.into()),
+            epoch: 1,
+            seq,
             created_at: now + chrono::Duration::milliseconds(offset),
         };
-        let merged = merge_message_buckets(vec![
-            vec![message("own-10", 10, 500), message("pending-between-b", 0, 450), message("pending-after", 0, 1000)],
-            vec![message("peer-11", 11, 409), message("pending-before", 0, 0), message("pending-between-a", 0, 450)],
-        ], "stable-conversation", 50).unwrap();
-        assert_eq!(merged.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(),
-            ["own-10", "peer-11", "pending-before", "pending-between-a", "pending-between-b", "pending-after"]);
-        assert!(merged.iter().all(|message| message.convo_id == "stable-conversation"));
+        let merged = merge_message_buckets(
+            vec![
+                vec![
+                    message("own-10", 10, 500),
+                    message("pending-between-b", 0, 450),
+                    message("pending-after", 0, 1000),
+                ],
+                vec![
+                    message("peer-11", 11, 409),
+                    message("pending-before", 0, 0),
+                    message("pending-between-a", 0, 450),
+                ],
+            ],
+            "stable-conversation",
+            50,
+        )
+        .unwrap();
+        assert_eq!(
+            merged
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "own-10",
+                "peer-11",
+                "pending-before",
+                "pending-between-a",
+                "pending-between-b",
+                "pending-after"
+            ]
+        );
+        assert!(merged
+            .iter()
+            .all(|message| message.convo_id == "stable-conversation"));
     }
 
     #[test]

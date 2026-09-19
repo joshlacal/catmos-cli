@@ -74,6 +74,10 @@ pub struct Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageContent {
+    GroupInvitation {
+        text: String,
+        reference: catbird_mls::GroupInvitationReference,
+    },
     Text(String),
     Reaction {
         target_message_id: String,
@@ -124,12 +128,23 @@ pub fn is_local_membership_left_marker(
     if !has_durable_terminal_state || !message.is_own || message.sender_did != own_did {
         return false;
     }
-    let Some((entry_id, device_id)) = message.id.strip_prefix("membership-left:").and_then(|value| value.split_once(':')) else {
+    let Some((entry_id, device_id)) = message
+        .id
+        .strip_prefix("membership-left:")
+        .and_then(|value| value.split_once(':'))
+    else {
         return false;
     };
-    let canonical_uuid = |value: &str| uuid::Uuid::parse_str(value).is_ok_and(|id| id.get_version_num() == 4 && id.hyphenated().to_string() == value);
-    device_id == own_device_id && canonical_uuid(entry_id) && canonical_uuid(device_id)
-        && message.payload().is_some_and(|payload| payload.version == 1
-            && payload.message_type == MLSMessageType::System
-            && payload.text.as_deref() == Some("membership.left"))
+    let canonical_uuid = |value: &str| {
+        uuid::Uuid::parse_str(value)
+            .is_ok_and(|id| id.get_version_num() == 4 && id.hyphenated().to_string() == value)
+    };
+    device_id == own_device_id
+        && canonical_uuid(entry_id)
+        && canonical_uuid(device_id)
+        && message.payload().is_some_and(|payload| {
+            payload.version == 1
+                && payload.message_type == MLSMessageType::System
+                && payload.text.as_deref() == Some("membership.left")
+        })
 }

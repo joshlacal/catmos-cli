@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use axum::extract::State;
+use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -13,12 +13,16 @@ use catmos_core::orchestrator_credentials::KeyringCredentialStore;
 use catmos_core::runtime::{Runtime, RuntimeStartup};
 use catmos_core::storage::config::Config;
 use catmos_core::storage::db::Database;
+use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 struct ServerState {
     projection: Arc<RwLock<Projection>>,
     enrollments: Arc<AtomicUsize>,
+    inventory: Arc<RwLock<serde_json::Value>>,
+    tickets: Arc<RwLock<Vec<serde_json::Value>>>,
+    websocket_endpoint: String,
 }
 
 #[derive(Clone, Default)]
@@ -57,6 +61,29 @@ async fn own_devices(State(state): State<ServerState>) -> Json<serde_json::Value
     }))
 }
 
+async fn inventory(
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+) -> Json<serde_json::Value> {
+    if uri.path().ends_with("getConversations") {
+        assert!(uri.query().unwrap().contains("supportedProtocolVersions=1"));
+        assert!(uri.query().unwrap().contains("supportedProtocolVersions=2"));
+        let page = serde_json::json!({"inventorySessionId":uuid::Uuid::new_v4().to_string(),"snapshotEventCursor":uuid::Uuid::new_v4().to_string(),"snapshotExpiresAt":(chrono::Utc::now()+chrono::Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Millis,true),"hasMore":false,"items":[],"inventoryScope":{"supportedProtocolVersions":["1","2"],"scopeDigest":{"$bytes":base64::engine::general_purpose::STANDARD.encode([3u8;32])}}});
+        *state.inventory.write().unwrap() = page;
+    }
+    Json(state.inventory.read().unwrap().clone())
+}
+async fn ticket(
+    State(state): State<ServerState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let inventory = state.inventory.read().unwrap();
+    assert_eq!(body["inventorySessionId"], inventory["inventorySessionId"]);
+    assert_eq!(body["eventCursor"], inventory["snapshotEventCursor"]);
+    state.tickets.write().unwrap().push(body);
+    Json(serde_json::json!({"ticket":"synthetic-local-ticket","endpoint":state.websocket_endpoint}))
+}
+
 struct SeededLegacyAccount {
     did: String,
     device_id: String,
@@ -66,7 +93,10 @@ struct SeededLegacyAccount {
 }
 
 async fn seed_legacy_account(endpoint: &str, legacy_fields: &[&str]) -> SeededLegacyAccount {
-    let did = format!("did:web:{}.runtime-migration.invalid", uuid::Uuid::new_v4());
+    let did = format!(
+        "did:web:{}.runtime-migration.example.net",
+        uuid::Uuid::new_v4()
+    );
     let device_id = uuid::Uuid::new_v4().to_string();
     let mls_did = format!("{did}#{device_id}");
 
@@ -147,19 +177,57 @@ async fn enroll(State(state): State<ServerState>) -> (StatusCode, Json<serde_jso
 async fn public_startup_adopts_an_old_tui_identity_without_enrollment() {
     // This integration test has its own process, so its profile and MLS test
     // key provider cannot race the library test binary's process globals.
-    std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
-    std::env::set_var("CATMOS_TEST_SHARED_KEYCHAIN_FALLBACK", "1");
+    if std::env::var("CATMOS_RUNTIME_OS_KEYCHAIN").as_deref() == Ok("1") {
+        // Explicit local qualification uses unique synthetic accounts in the
+        // real OS keychain so a separate CLI process can reopen their custody.
+        std::env::remove_var("CATMOS_TEST_KEYCHAIN_FALLBACK");
+        std::env::remove_var("CATMOS_TEST_SHARED_KEYCHAIN_FALLBACK");
+    } else {
+        std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
+        std::env::set_var("CATMOS_TEST_SHARED_KEYCHAIN_FALLBACK", "1");
+    }
     let profile = format!("runtime-migration-{}", uuid::Uuid::new_v4());
     Config::initialize_profile(Some(&profile)).unwrap();
+    if let Ok(path) = std::env::var("CATMOS_CLI_SMOKE_PROFILE") {
+        std::fs::write(path, &profile).unwrap();
+    }
 
     let enrollments = Arc::new(AtomicUsize::new(0));
     let projection = Arc::new(RwLock::new(Projection::default()));
+    let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket_endpoint = format!("ws://{}", ws_listener.local_addr().unwrap());
+    let ws_server = tokio::spawn(async move {
+        for connection in 0..2 {
+            let (stream, _) = ws_listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::json!({"$type":"blue.catbird.chat.defs#eventEnvelope","previousCursor":"not-an-authority-cursor","cursor":"not-persisted","createdAt":"2026-09-19T00:00:00.000Z","payload":{"$type":"blue.catbird.chat.defs#watermarkEvent","issuedAt":"2026-09-19T00:00:00.000Z"}}).to_string())).await.unwrap();
+            if connection == 0 {
+                ws.close(None).await.unwrap();
+            } else {
+                let _ = ws.next().await;
+            }
+        }
+    });
+    let tickets = Arc::new(RwLock::new(Vec::new()));
     let state = ServerState {
         projection: Arc::clone(&projection),
         enrollments: Arc::clone(&enrollments),
+        inventory: Arc::new(RwLock::new(serde_json::Value::Null)),
+        tickets: Arc::clone(&tickets),
+        websocket_endpoint,
     };
     let app = Router::new()
         .route("/auth/session", get(session))
+        .route("/xrpc/blue.catbird.chat.getConversations", get(inventory))
+        .route("/xrpc/blue.catbird.chat.getPendingWelcomes", get(inventory))
+        .route(
+            "/xrpc/blue.catbird.chat.getLeafRecoveryInbox",
+            get(inventory),
+        )
+        .route(
+            "/xrpc/blue.catbird.chat.getSubscriptionTicket",
+            post(ticket),
+        )
         .route("/xrpc/blue.catbird.chat.getOwnDevices", get(own_devices))
         .route("/xrpc/blue.catbird.chat.enrollDevice", post(enroll))
         .with_state(state);
@@ -172,7 +240,7 @@ async fn public_startup_adopts_an_old_tui_identity_without_enrollment() {
     select_projection(&projection, &account);
 
     // Device-record publication is expected to fail against the deliberately
-    // non-resolving .invalid DID. Registration reconciliation happens first.
+    // non-resolving reserved example.net DID. Registration reconciliation happens first.
     let startup = Runtime::initialize(RuntimeStartup::command(false)).await;
     assert!(startup.is_err());
     assert_eq!(
@@ -286,5 +354,75 @@ async fn public_startup_adopts_an_old_tui_identity_without_enrollment() {
     assert!(partial_error.to_string().contains("incomplete"));
     assert_eq!(enrollments.load(Ordering::SeqCst), 0);
 
+    // Actual JSON WebSocket frames must drive shared authenticated snapshot
+    // ingestion. Reconnect tickets must use a fresh applied fence, not either
+    // event-supplied cursor or the first session forever.
+    let mut config = Config::load().unwrap();
+    config.default_account = Some(matching.did.clone());
+    config.save().unwrap();
+    select_projection(&projection, &matching);
+    let runtime = Runtime::initialize_offline().await.unwrap();
+    let mut events = runtime.service().subscribe().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while tickets.read().unwrap().len() < 2 {
+            if let Some(catmos_core::chat::WsEvent::Error(error)) = events.recv().await {
+                panic!("subscription fixture: {error}");
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let sent = tickets.read().unwrap().clone();
+    assert_ne!(sent[0]["inventorySessionId"], sent[1]["inventorySessionId"]);
+    assert_ne!(sent[0]["eventCursor"], sent[1]["eventCursor"]);
+    assert_ne!(sent[1]["eventCursor"], "not-persisted");
+    let draft = runtime
+        .service()
+        .save_request_draft(catbird_mls::DirectRequestInput {
+            draft_id: uuid::Uuid::new_v4().to_string(),
+            recipient_did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            text: "retained offline introduction".into(),
+            invitation: None,
+        })
+        .await
+        .unwrap();
+    drop(events);
+    ws_server.abort();
+    drop(runtime);
     server.abort();
+    // Optional process-level qualification uses the actual built CLI, with the
+    // fixture server stopped. A preview-list read must use only local custody.
+    if let Ok(binary) = std::env::var("CATMOS_CLI_SMOKE_BINARY") {
+        let mut config = Config::load().unwrap();
+        config.default_account = Some(matching.did.clone());
+        config.save().unwrap();
+        let mut command = tokio::process::Command::new(binary);
+        command.kill_on_drop(true);
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            command
+                .args(["--profile", &profile, "request", "list", "--offline"])
+                .output(),
+        )
+        .await
+        .expect("offline child exceeded 30 seconds")
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "offline CLI failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(value["requests"].is_array());
+        assert!(value["drafts"].is_array());
+        assert!(value["drafts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["draftId"] == draft.input.draft_id));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("retained offline introduction"));
+        if let Ok(path) = std::env::var("CATMOS_CLI_SMOKE_OUTPUT") {
+            std::fs::write(path, output.stdout).unwrap();
+        }
+    }
 }

@@ -2,6 +2,10 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum CatmosError {
+    #[error("Unsupported canonical operation: {operation}")]
+    UnsupportedOperation { operation: &'static str },
+    #[error("Operation requires verified account consent and device readiness")]
+    RequestEffectsNotAuthorized,
     #[error("Authentication required. Run `catmos login` first.")]
     NotAuthenticated,
     #[error("Authentication failed: {0}")]

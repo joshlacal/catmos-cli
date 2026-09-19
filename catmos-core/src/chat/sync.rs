@@ -30,6 +30,7 @@ impl ChatService {
 
     /// Update the read cursor for a conversation on the server.
     pub async fn update_cursor(&self, convo_id: &str, cursor: &str) -> Result<()> {
+        self.require_ordinary_effects(convo_id).await?;
         let req = UpdateCursorReq {
             convo_id: convo_id.to_string(),
             cursor: cursor.to_string(),

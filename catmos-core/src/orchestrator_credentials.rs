@@ -33,9 +33,30 @@ impl KeyringCredentialStore {
     }
 
     fn entry(key: &str) -> std::result::Result<Entry, keyring::Error> {
-        Entry::new(&crate::storage::config::Config::keychain_service(SERVICE_NAME), key)
+        Entry::new(
+            &crate::storage::config::Config::keychain_service(SERVICE_NAME),
+            key,
+        )
     }
 
+    pub(crate) async fn retain_generation(
+        user_did: &str,
+        device_id: &str,
+        key_id: &str,
+        generation: i64,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        if generation < 1 {
+            return Err(OrchestratorError::Credential(
+                "Invalid authenticated generation".into(),
+            ));
+        }
+        let store = Self;
+        let signing = store.get_signing_key(user_did).await?.ok_or_else(|| {
+            OrchestratorError::Credential("Missing enrolled signing custody".into())
+        })?;
+        Self::store_string(format!("request_generation:{user_did}"),&serde_json::json!({"deviceId":device_id,"keyId":key_id,"generation":generation,"custodyHash":hex::encode(Sha256::digest(signing))}).to_string()).await
+    }
     fn key_signing(user_did: &str) -> String {
         format!("signing_key:{}", user_did)
     }
@@ -67,7 +88,9 @@ impl KeyringCredentialStore {
         let mut hasher = sha2::Sha256::new();
         hasher.update(key.as_bytes());
         let hash = hex::encode(hasher.finalize());
-        let dir = crate::storage::config::Config::data_dir().ok()?.join("credentials");
+        let dir = crate::storage::config::Config::data_dir()
+            .ok()?
+            .join("credentials");
         let _ = std::fs::create_dir_all(&dir);
         Some(dir.join(format!("{hash}.key")))
     }
@@ -132,7 +155,8 @@ impl KeyringCredentialStore {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            let mut file = options.open(&path)
+            let mut file = options
+                .open(&path)
                 .map_err(|error| OrchestratorError::Credential(error.to_string()))?;
             #[cfg(unix)]
             {
@@ -208,8 +232,60 @@ impl KeyringCredentialStore {
 
 #[async_trait]
 impl CredentialStore for KeyringCredentialStore {
+    async fn get_auth_generation(&self, user_did: &str) -> Result<Option<i64>> {
+        use sha2::{Digest, Sha256};
+        let Some(raw) = Self::get_string(format!("request_generation:{user_did}")).await? else {
+            return Ok(None);
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| OrchestratorError::Credential(e.to_string()))?;
+        let Some(key) = self.get_signing_key(user_did).await? else {
+            return Ok(None);
+        };
+        if value["deviceId"].as_str() != self.get_device_uuid(user_did).await?.as_deref()
+            || value["custodyHash"] != hex::encode(Sha256::digest(key))
+        {
+            return Ok(None);
+        }
+        Ok(value["generation"].as_i64().filter(|g| *g > 0))
+    }
+    async fn direct_request_receipt_authority_document(&self) -> Result<Option<Vec<u8>>> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| OrchestratorError::Credential(e.to_string()))?;
+        let mut response = client
+            .get("https://chat.catbird.blue/.well-known/did.json")
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Credential(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| OrchestratorError::Credential(e.to_string()))?;
+        if response.content_length().is_some_and(|n| n > 1024 * 1024) {
+            return Err(OrchestratorError::Credential(
+                "Authority document too large".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| OrchestratorError::Credential(e.to_string()))?
+        {
+            if bytes.len() + chunk.len() > 1024 * 1024 {
+                return Err(OrchestratorError::Credential(
+                    "Authority document too large".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Some(bytes))
+    }
+
     async fn get_authorized_device_keys(&self, root_did: &str) -> Result<Option<Vec<Vec<u8>>>> {
-        crate::device_records::authorized_keys(root_did).await
+        crate::device_records::authorized_keys(root_did)
+            .await
             .map(Some)
             .map_err(|error| OrchestratorError::Credential(error.to_string()))
     }
@@ -274,6 +350,7 @@ impl CredentialStore for KeyringCredentialStore {
         Self::delete_key(Self::key_device_uuid(user_did));
         Self::delete_key(Self::key_server_device_id(user_did));
         Self::delete_key(Self::key_local_device_uuid(user_did));
+        Self::delete_key(format!("request_generation:{user_did}"));
         Ok(())
     }
 }

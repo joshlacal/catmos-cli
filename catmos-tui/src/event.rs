@@ -7,6 +7,7 @@ use catmos_core::types::{Conversation, Message};
 /// Events the TUI main loop can receive.
 #[derive(Debug)]
 pub enum AppEvent {
+    InventoryRefreshed,
     /// A keyboard event from crossterm.
     Key(KeyEvent),
     /// Periodic tick for UI refresh.
@@ -14,11 +15,16 @@ pub enum AppEvent {
     /// An incoming chat message (from WebSocket).
     ChatMessage(Message),
     /// The MLS epoch advanced for a conversation — re-fetch messages.
-    EpochAdvanced { convo_id: String, new_epoch: u64 },
+    EpochAdvanced {
+        convo_id: String,
+        new_epoch: u64,
+    },
     /// The conversation list was updated.
     ConvoListUpdated(Vec<Conversation>),
     /// The MLS tree diverged for a conversation — needs silent repair.
-    TreeDiverged { convo_id: String },
+    TreeDiverged {
+        convo_id: String,
+    },
     /// The MLS group was reset by an admin — rejoin with new group ID.
     GroupReset {
         convo_id: String,

@@ -12,6 +12,15 @@ use crate::app::App;
 
 /// Render the full TUI layout into the terminal frame.
 pub fn render(frame: &mut Frame, app: &App) {
+    if matches!(
+        app.screen,
+        crate::app::Screen::Requests
+            | crate::app::Screen::RequestRecipient
+            | crate::app::Screen::RequestCompose
+    ) {
+        crate::requests::render(frame, app);
+        return;
+    }
     let size = frame.area();
 
     // Top-level vertical split: status bar | middle | input

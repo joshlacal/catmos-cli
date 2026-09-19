@@ -10,10 +10,21 @@ pub enum Screen {
     Chat,
     CommandPalette,
     NewConvo,
+    Requests,
+    RequestRecipient,
+    RequestCompose,
 }
 
 /// Central application state for the TUI.
 pub struct App {
+    pub requests: Vec<catmos_core::chat::requests::RequestView>,
+    pub selected_request: usize,
+    pub request_drafts: Vec<catmos_core::chat::requests::RequestDraft>,
+    pub selected_draft: usize,
+    pub request_scroll: u16,
+    pub request_draft: Option<catmos_core::chat::requests::RequestDraft>,
+    pub request_delivery: Option<bool>,
+    pub send_allowed: bool,
     /// The chat service for XRPC calls, encryption, etc.
     pub service: Arc<ChatService>,
 
@@ -61,6 +72,14 @@ impl App {
         member_panel_visible: bool,
     ) -> Self {
         Self {
+            requests: Vec::new(),
+            selected_request: 0,
+            request_drafts: Vec::new(),
+            selected_draft: 0,
+            request_scroll: 0,
+            request_draft: None,
+            request_delivery: None,
+            send_allowed: false,
             service,
             screen: Screen::Chat,
             conversations: Vec::new(),

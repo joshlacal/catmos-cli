@@ -4,9 +4,9 @@
 //! This module implements the complete flow that makes a catmos-cli device
 //! capable of decrypting messages in existing MLS conversations.
 
-use sha2::{Digest, Sha256};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use super::{MlsManager, MLS_CIPHER_SUITE};
@@ -169,7 +169,8 @@ impl MlsManager {
         let prepared = catbird_mls::orchestrator::canonical_transport::prepare_signed_request_with(
             &binding,
             catbird_mls::orchestrator::CanonicalOperation::EnrollDevice,
-            serde_json::to_vec(&body).map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?,
+            serde_json::to_vec(&body)
+                .map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?,
             |transcript| {
                 self.with_context(|ctx| {
                     ctx.sign_with_identity_key(mls_did.clone(), transcript.to_vec())
@@ -180,9 +181,10 @@ impl MlsManager {
         .map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?;
 
         let prepared_body_bytes = prepared.body.ok_or_else(|| {
-            CatmosError::Mls(catbird_mls::MLSError::Internal("Prepared enrollment body is missing".into()))
+            CatmosError::Mls(catbird_mls::MLSError::Internal(
+                "Prepared enrollment body is missing".into(),
+            ))
         })?;
-
 
         // 5. Submit to enrollDevice
         let resp: serde_json::Value = service
@@ -204,10 +206,14 @@ impl MlsManager {
         let mls_did = format!("{did}#{server_device_id}");
 
         // 6. Persist device info
-        db.store_session_value(KEY_DEVICE_ID, &server_device_id).await?;
+        db.store_session_value(KEY_DEVICE_ID, &server_device_id)
+            .await?;
         db.store_session_value(KEY_MLS_DID, &mls_did).await?;
 
-        info!("Device registered successfully: id={}, mls_did={}", server_device_id, mls_did);
+        info!(
+            "Device registered successfully: id={}, mls_did={}",
+            server_device_id, mls_did
+        );
 
         let info = DeviceInfo {
             device_id: server_device_id,
@@ -218,7 +224,6 @@ impl MlsManager {
 
         Ok(info)
     }
-
 
     /// Process a base64-encoded welcome message to join a group.
     /// Returns the group ID bytes on success.

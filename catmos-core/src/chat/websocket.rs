@@ -1,17 +1,14 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
-
 use catbird_atproto::blue_catbird::chat::subscribe_events::SubscribeEventsMessage;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
 /// Raw GroupResetEvent fields for manual DAG-CBOR deserialization.
 /// The generated `SubscribeEventsMessage` does not yet include this variant,
 /// so we parse it from raw bytes when `decode_framed` returns `UnknownEventType`.
+#[cfg(test)]
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct RawGroupResetEvent {
@@ -35,6 +32,7 @@ struct RawGroupResetEvent {
 /// `lexicon/reset-requested-event` branch). We parse it from raw bytes when
 /// `decode_framed` returns `UnknownEventType`, mirroring the
 /// `RawGroupResetEvent` pattern above.
+#[cfg(test)]
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct RawResetRequestedEvent {
@@ -69,6 +67,8 @@ use crate::error::{CatmosError, Result};
 /// Events emitted by the WebSocket subscription.
 #[derive(Debug, Clone)]
 pub enum WsEvent {
+    /// Shared authority has durably refreshed inventory and ordinary entries.
+    InventoryRefreshed,
     /// A new message was received (convo_id, plaintext, sender_did).
     Message {
         convo_id: String,
@@ -158,24 +158,33 @@ impl ChatService {
         ticket: &str,
         cursor: &str,
         endpoint: Option<&str>,
-    ) -> String {
-        let endpoint = endpoint.map(String::from).unwrap_or_else(|| {
-            let base = config.server.mls_url.clone();
-            format!("{base}/xrpc/blue.catbird.chat.subscribeEvents?ticket={ticket}&cursor={cursor}")
+    ) -> Result<String> {
+        let endpoint = endpoint.map(str::to_owned).unwrap_or_else(|| {
+            format!(
+                "{}/xrpc/blue.catbird.chat.subscribeEvents",
+                config.server.mls_url.trim_end_matches('/')
+            )
         });
-
-        let mut url_str = endpoint;
-        if !url_str.contains("cursor=") {
-            let sep = if url_str.contains('?') { "&" } else { "?" };
-            url_str = format!("{url_str}{sep}cursor={cursor}");
-        }
-        if !url_str.contains("ticket=") {
-            let sep = if url_str.contains('?') { "&" } else { "?" };
-            url_str = format!("{url_str}{sep}ticket={ticket}");
-        }
-        url_str
-            .replace("https://", "wss://")
-            .replace("http://", "ws://")
+        let mut url = url::Url::parse(&endpoint)
+            .map_err(|_| CatmosError::WebSocket("Invalid subscription endpoint".into()))?;
+        let scheme = match url.scheme() {
+            "https" | "wss" => "wss",
+            "http" | "ws" => "ws",
+            _ => return Err(CatmosError::WebSocket("Invalid subscription scheme".into())),
+        };
+        url.set_scheme(scheme)
+            .map_err(|_| CatmosError::WebSocket("Invalid subscription scheme".into()))?;
+        let retained = url
+            .query_pairs()
+            .filter(|(key, _)| key != "cursor" && key != "ticket")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<Vec<_>>();
+        url.set_query(None);
+        url.query_pairs_mut()
+            .extend_pairs(retained)
+            .append_pair("ticket", ticket)
+            .append_pair("cursor", cursor);
+        Ok(url.into())
     }
 
     /// Subscribe to real-time events via WebSocket.
@@ -185,15 +194,9 @@ impl ChatService {
     /// exponential backoff (max 30s) on disconnect/error.
     pub async fn subscribe(&self) -> Result<mpsc::UnboundedReceiver<WsEvent>> {
         let actor_device_id = self.actor_device_id().await?;
-        let (inventory_session_id, event_cursor) = {
-            let guard = self.inventory_session.read().await;
-            guard.clone().unwrap_or_else(|| {
-                (
-                    "catmos-cli-session".to_string(),
-                    "0".to_string(),
-                )
-            })
-        };
+        let applied = self.refresh_subscription_state().await?;
+        let inventory_session_id = applied.inventory_session_id().to_owned();
+        let event_cursor = applied.event_cursor().to_owned();
 
         // 1. Get a subscription ticket for the initial connection
         let ticket_resp: SubscriptionTicketResponse = self
@@ -212,9 +215,9 @@ impl ChatService {
             &ticket_resp.ticket,
             &event_cursor,
             ticket_resp.endpoint.as_deref(),
-        );
+        )?;
 
-        debug!("Connecting WebSocket to {ws_url}");
+        debug!("Connecting authenticated WebSocket");
 
         // 2. Connect
         let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
@@ -225,141 +228,99 @@ impl ChatService {
 
         let (tx, rx) = mpsc::unbounded_channel();
 
-        // Clone what the background reconnect task needs
-        let mls = self.mls.clone();
-        let own_commits = self.own_commits.clone();
-        let config = self.config.clone();
-        let auth = self.auth.clone();
-        let token_session = self.token_session.clone();
-        let db = self.db.clone();
-        let http = self.http.clone();
-        let actor_device_id_task = actor_device_id.clone();
-        let inventory_session_task = inventory_session_id.clone();
-        let event_cursor_task = event_cursor.clone();
-
-        // 3. Spawn reader task with reconnect loop
+        let service = self.clone();
         tokio::spawn(async move {
             let mut attempt: u32 = 0;
             let mut current_stream = Some(ws_stream);
-
             loop {
+                if tx.is_closed() {
+                    return;
+                }
                 if let Some(stream) = current_stream.take() {
-                    // Reset attempt counter on successful connection
                     attempt = 0;
-
                     let (mut write, mut read) = stream.split();
-                    let mut disconnected = false;
-
-                    while let Some(msg_result) = read.next().await {
-                        match msg_result {
-                            Ok(tungstenite::Message::Binary(data)) => {
-                                if let Some(ws_event) = try_decode_unknown_event(&data) {
-                                    if tx.send(ws_event).is_err() {
-                                        debug!("WsEvent receiver dropped, stopping reader");
-                                        return;
-                                    }
-                                } else if let Ok((_header, body)) =
-                                    jacquard_common::xrpc::subscription::parse_event_header(&data)
-                                {
-                                    if let Ok(event) =
-                                        serde_ipld_dagcbor::from_slice::<SubscribeEventsMessage>(&body)
-                                    {
-                                        let ws_event =
-                                            convert_event(event, &mls, &own_commits).await;
-                                        if tx.send(ws_event).is_err() {
-                                            debug!("WsEvent receiver dropped, stopping reader");
-                                            return;
-                                        }
-                                    } else if let Ok(event) =
-                                        serde_json::from_slice::<SubscribeEventsMessage>(&body)
-                                    {
-                                        let ws_event =
-                                            convert_event(event, &mls, &own_commits).await;
-                                        if tx.send(ws_event).is_err() {
-                                            debug!("WsEvent receiver dropped, stopping reader");
-                                            return;
-                                        }
-                                    } else {
-                                        warn!("Failed to decode WebSocket event body");
-                                    }
-                                }
-                            }
+                    while let Some(frame) = read.next().await {
+                        let event = match frame {
                             Ok(tungstenite::Message::Text(text)) => {
-                                warn!("Received unexpected text frame, ignoring: {text}");
+                                decode_canonical_hint(text.as_bytes())
+                            }
+                            Ok(tungstenite::Message::Binary(bytes)) => {
+                                decode_canonical_hint(&bytes)
                             }
                             Ok(tungstenite::Message::Ping(data)) => {
-                                if let Err(e) = write.send(tungstenite::Message::Pong(data)).await {
-                                    warn!("Failed to send pong: {e}");
+                                if write.send(tungstenite::Message::Pong(data)).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Ok(tungstenite::Message::Pong(_)) => continue,
+                            _ => break,
+                        };
+                        match event {
+                            Ok(SubscribeEventsMessage::EventEnvelope(_)) => {
+                                // Frames are hints, never custody or policy authority. Do not
+                                // persist their cursor, seq-as-epoch, or reset fields. The same
+                                // serialized task refetches and applies authenticated authority.
+                                if let Err(error) = service.refresh_subscription_state().await {
+                                    let _ = tx.send(WsEvent::Error(format!(
+                                        "Event reconciliation failed: {error}"
+                                    )));
+                                    break;
+                                }
+                                if tx.send(WsEvent::InventoryRefreshed).is_err() {
+                                    return;
                                 }
                             }
-                            Ok(tungstenite::Message::Close(_)) => {
-                                info!("WebSocket closed by server");
-                                disconnected = true;
+                            Ok(SubscribeEventsMessage::TypingEvent(_)) => {
+                                // No typing effect before an independent policy-gated handler.
+                            }
+                            Err(error) => {
+                                let _ = tx.send(WsEvent::Error(error.to_string()));
                                 break;
                             }
-                            Err(e) => {
-                                error!("WebSocket error: {e}");
-                                disconnected = true;
-                                break;
-                            }
-                            _ => {}
                         }
-                    }
-
-                    if !disconnected {
-                        // Stream ended without explicit close/error — still reconnect
-                        info!("WebSocket stream ended");
                     }
                 }
-
-                // ── Reconnect with exponential backoff ──────────────────
-                attempt += 1;
-                let backoff_secs = std::cmp::min(2u64.saturating_pow(attempt), 30);
+                attempt = attempt.saturating_add(1);
                 let _ = tx.send(WsEvent::Reconnecting);
-                info!("WebSocket reconnecting in {backoff_secs}s (attempt {attempt})");
-                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-
-                // Get a fresh subscription ticket using a temporary client
-                // (we can't hold &self across the spawn boundary, so we
-                //  rebuild the request manually). Uses the jacquard token
-                // session so token refresh happens transparently.
-                let ticket_result = get_subscription_ticket_standalone(
-                    &http,
-                    &auth,
-                    token_session.as_ref(),
-                    &db,
-                    &config,
-                    &actor_device_id_task,
-                    &inventory_session_task,
-                    &event_cursor_task,
-                )
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2u64.saturating_pow(attempt).min(30))) => {}
+                }
+                // A new exact inventory is required on every reconnect, including
+                // expired tickets. Its applied fence replaces the original snapshot.
+                let result = async {
+                    let applied = service.refresh_subscription_state().await?;
+                    let actor = service.actor_device_id().await?;
+                    let response: SubscriptionTicketResponse = service
+                        .xrpc_procedure(
+                            "blue.catbird.chat.getSubscriptionTicket",
+                            &serde_json::json!({
+                                "actorDeviceId": actor,
+                                "eventCursor": applied.event_cursor(),
+                                "inventorySessionId": applied.inventory_session_id(),
+                            }),
+                        )
+                        .await?;
+                    let url = Self::build_ws_url(
+                        &service.config,
+                        &response.ticket,
+                        applied.event_cursor(),
+                        response.endpoint.as_deref(),
+                    )?;
+                    let (stream, _) = tokio_tungstenite::connect_async(url)
+                        .await
+                        .map_err(|e| CatmosError::WebSocket(e.to_string()))?;
+                    Ok::<_, CatmosError>(stream)
+                }
                 .await;
-
-                match ticket_result {
-                    Ok(ticket_resp) => {
-                        let ws_url = ChatService::build_ws_url(
-                            &config,
-                            &ticket_resp.ticket,
-                            &event_cursor_task,
-                            ticket_resp.endpoint.as_deref(),
-                        );
-                        debug!("Reconnecting WebSocket to {ws_url}");
-
-                        match tokio_tungstenite::connect_async(&ws_url).await {
-                            Ok((stream, _)) => {
-                                info!("WebSocket reconnected");
-                                current_stream = Some(stream);
-                                // Loop continues with the new stream
-                            }
-                            Err(e) => {
-                                error!("WebSocket reconnect failed: {e}");
-                                // Loop continues to retry with backoff
-                            }
-                        }
+                match result {
+                    Ok(stream) => {
+                        current_stream = Some(stream);
+                        let _ = tx.send(WsEvent::InventoryRefreshed);
                     }
-                    Err(e) => {
-                        error!("Failed to get subscription ticket for reconnect: {e}");
-                        // Loop continues to retry with backoff
+                    Err(error) => {
+                        let _ = tx.send(WsEvent::Error(format!("Reconnect failed: {error}")));
                     }
                 }
             }
@@ -369,168 +330,69 @@ impl ChatService {
     }
 }
 
-/// Standalone subscription ticket fetch for use inside the reconnect task.
-/// Avoids needing a `&ChatService` reference across the spawn boundary.
-/// On 401/400 with an AppPassword session, refreshes tokens via jacquard
-/// and retries once.
-async fn get_subscription_ticket_standalone(
-    http: &reqwest::Client,
-    auth: &crate::auth::AuthMethod,
-    token_session: Option<&crate::auth::TokenSession>,
-    db: &crate::storage::db::Database,
-    config: &crate::storage::config::Config,
-    actor_device_id: &str,
-    inventory_session_id: &str,
-    event_cursor: &str,
-) -> std::result::Result<SubscriptionTicketResponse, String> {
-    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-    use reqwest::StatusCode;
-
-    let nsid = "blue.catbird.chat.getSubscriptionTicket";
-
-    let (base_url, is_proxy) = match auth {
-        crate::auth::AuthMethod::OAuth { nest_url, .. } => (format!("{nest_url}/xrpc/{nsid}"), false),
-        crate::auth::AuthMethod::AppPassword { pds_url, .. } => {
-            (format!("{}/xrpc/{nsid}", pds_url.trim_end_matches('/')), true)
-        }
-    };
-
-    // Resolve the bearer token for this attempt — OAuth uses the cookie;
-    // AppPassword pulls the current access JWT out of the token session.
-    let initial_bearer = match (auth, token_session) {
-        (crate::auth::AuthMethod::OAuth { session_cookie, .. }, _) => session_cookie.clone(),
-        (crate::auth::AuthMethod::AppPassword { .. }, Some(sess)) => sess
-            .current_bearer()
-            .await
-            .map_err(|e| format!("bearer fetch failed: {e}"))?,
-        (crate::auth::AuthMethod::AppPassword { .. }, None) => {
-            return Err("AppPassword auth without a TokenSession".into());
-        }
-    };
-
-    let build_headers = |bearer: &str| -> std::result::Result<HeaderMap, String> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {bearer}")).map_err(|e| e.to_string())?,
-        );
-        if is_proxy {
-            let proxy_val = crate::mls::atproto_proxy_header_value();
-            if let Ok(hv) = HeaderValue::from_str(&proxy_val) {
-                headers.insert(
-                    reqwest::header::HeaderName::from_static("atproto-proxy"),
-                    hv,
-                );
-            }
-        }
-        Ok(headers)
-    };
-
-    let ticket_body = serde_json::json!({
-        "actorDeviceId": actor_device_id,
-        "eventCursor": event_cursor,
-        "inventorySessionId": inventory_session_id,
-    });
-
-    let resp = http
-        .post(&base_url)
-        .headers(build_headers(&initial_bearer)?)
-        .json(&ticket_body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
-
-    let status = resp.status();
-    let body_bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
-
-    // Retry once after token refresh only if AppPassword + ExpiredToken
-    let body_bytes = if token_session.is_some() && crate::chat::service::is_expired_token_response(status, &body_bytes) {
-        let sess = token_session.expect("checked above");
-        let new_bearer = sess
-            .refresh(db)
-            .await
-            .map_err(|e| format!("refresh failed: {e}"))?;
-        let retry_resp = http
-            .post(&base_url)
-            .headers(build_headers(&new_bearer)?)
-            .json(&ticket_body)
-            .send()
-            .await
-            .map_err(|e| format!("Network error (retry): {e}"))?;
-        let retry_status = retry_resp.status();
-        let retry_bytes = retry_resp
-            .bytes()
-            .await
-            .map_err(|e| format!("Network error (retry): {e}"))?;
-        if !retry_status.is_success() {
-            let body = String::from_utf8_lossy(&retry_bytes);
-            return Err(format!("Ticket request failed: {body}"));
-        }
-        retry_bytes
-    } else {
-        if !status.is_success() {
-            let body = String::from_utf8_lossy(&body_bytes);
-            return Err(format!("Ticket request failed: {body}"));
-        }
-        body_bytes
-    };
-
-    serde_json::from_slice::<SubscriptionTicketResponse>(&body_bytes)
-        .map_err(|e| format!("Parse error: {e}"))
+/// Parse the canonical server JSON transport with a bounded frame. Legacy
+/// framed-CBOR events are not forwarded into policy-mutating host handlers.
+fn decode_canonical_hint(bytes: &[u8]) -> Result<SubscribeEventsMessage> {
+    if bytes.len() > 1024 * 1024 {
+        return Err(CatmosError::WebSocket("Event frame exceeds bound".into()));
+    }
+    serde_json::from_slice(bytes)
+        .map_err(|_| CatmosError::WebSocket("Invalid canonical event frame".into()))
 }
-/// Convert a decoded `SubscribeEventsMessage` into a `WsEvent`, decrypting
-/// message ciphertext where applicable.
-///
-/// `own_commits` is checked for commit messages to prevent duplicate processing
-/// of our own commits received back via WebSocket (spec section 5.4).
-async fn convert_event(
-    event: SubscribeEventsMessage,
-    _mls: &Arc<crate::mls::MlsManager>,
-    _own_commits: &Arc<Mutex<HashMap<[u8; 32], Instant>>>,
-) -> WsEvent {
-    match event {
-        SubscribeEventsMessage::EventEnvelope(env) => match env.payload {
-            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::MessageAvailableEvent(msg_evt) => {
-                let convo_id = msg_evt.conversation_id.to_string();
-                let seq = msg_evt.seq as u64;
-                WsEvent::EpochAdvanced {
-                    convo_id,
-                    new_epoch: seq,
-                }
+
+impl ChatService {
+    async fn refresh_subscription_state(
+        &self,
+    ) -> Result<catbird_mls::orchestrator::authenticated_inventory::AppliedInventoryFence> {
+        use catbird_mls::orchestrator::MLSStorageBackend;
+        let applied = self.refresh_authenticated_inventory().await?;
+        let authority = self.request_authority().await?;
+        for view in authority
+            .storage()
+            .list_conversations(self.did())
+            .await
+            .map_err(|e| CatmosError::Other(e.to_string()))?
+        {
+            // Pending requests were projected by exact inventory ingestion. Their
+            // introduction is not ordinary history and cannot trigger host effects.
+            if !authority
+                .ensure_conversation_ready(&view.conversation_id)
+                .await
+                .map_err(|e| CatmosError::Other(e.to_string()))?
+                .send_allowed
+            {
+                continue;
             }
-            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::ConversationChangedEvent(evt) => {
-                let convo_id = evt.conversation_id.to_string();
-                WsEvent::EpochAdvanced {
-                    convo_id,
-                    new_epoch: 0,
+            let mut cursor: Option<String> = None;
+            let mut seen = std::collections::HashSet::new();
+            for page in 0..100 {
+                let (_, next) = authority
+                    .fetch_messages(
+                        &view.conversation_id,
+                        cursor.as_deref(),
+                        100,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| CatmosError::Other(e.to_string()))?;
+                let Some(next) = next else {
+                    break;
+                };
+                if page == 99 || !seen.insert(next.clone()) {
+                    return Err(CatmosError::WebSocket(
+                        "Message catch-up exceeds bound".into(),
+                    ));
                 }
+                cursor = Some(next);
             }
-            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::ResetRequestedEvent(evt) => {
-                WsEvent::ResetRequested {
-                    convo_id: evt.conversation_id.to_string(),
-                    crypto_session_id: String::new(),
-                    generation: 0,
-                    trigger: "reset_requested".to_string(),
-                    request_event_id: evt.reset_request_id.to_string(),
-                    expected_new_mls_group_id: None,
-                }
-            }
-            _ => WsEvent::EpochAdvanced {
-                convo_id: String::new(),
-                new_epoch: 0,
-            },
-        },
-        SubscribeEventsMessage::TypingEvent(evt) => WsEvent::Typing {
-            convo_id: evt.conversation_id.to_string(),
-            sender_did: evt.actor_did.to_string(),
-            is_typing: evt.is_typing,
-        },
+        }
+        Ok(applied)
     }
 }
 
+#[cfg(test)]
 /// Attempt to decode a raw framed binary message for event types not yet in the
 /// generated `SubscribeEventsMessage` enum. Returns `Some(WsEvent)` on success.
 fn try_decode_unknown_event(data: &[u8]) -> Option<WsEvent> {
@@ -591,6 +453,43 @@ mod tests {
 
     use super::*;
     use serde::Serialize;
+
+    #[test]
+    fn subscription_url_uses_exact_applied_fence_and_encodes_opaque_values() {
+        let config = crate::storage::config::Config::default();
+        let value = ChatService::build_ws_url(
+            &config,
+            "t+&",
+            "c+/=",
+            Some("ws://127.0.0.1:1234?cursor=stale&ticket=old"),
+        )
+        .unwrap();
+        let url = url::Url::parse(&value).unwrap();
+        assert_eq!(url.path(), "/");
+        assert_eq!(
+            url.query_pairs().collect::<Vec<_>>(),
+            vec![
+                ("ticket".into(), "t+&".into()),
+                ("cursor".into(), "c+/=".into())
+            ]
+        );
+        assert!(ChatService::build_ws_url(&config, "t", "c", Some("file:///tmp/test")).is_err());
+    }
+
+    #[test]
+    fn canonical_json_hint_is_parsed_without_promoting_event_fields_to_authority() {
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "$type":"blue.catbird.chat.defs#eventEnvelope", "cursor":"untrusted-next", "previousCursor":"untrusted-prior",
+            "createdAt":"2026-09-19T00:00:00.000Z", "payload": {"$type":"blue.catbird.chat.defs#watermarkEvent", "issuedAt":"2026-09-19T00:00:00.000Z"}
+        })).unwrap();
+        assert!(matches!(
+            decode_canonical_hint(&raw).unwrap(),
+            SubscribeEventsMessage::EventEnvelope(_)
+        ));
+        assert!(decode_canonical_hint(b"{invalid").is_err());
+        assert!(decode_canonical_hint(&vec![b' '; 1024 * 1024 + 1]).is_err());
+        assert!(decode_canonical_hint(br#"{"$type":"unknown"}"#).is_err());
+    }
 
     /// Mirror of `jacquard_common::xrpc::subscription::EventHeader` for
     /// encoding test fixtures. The real type is `Deserialize`-only.

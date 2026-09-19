@@ -40,4 +40,5 @@ futures-util = "0.3"
 hostname = "0.4"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["process"] }
 tempfile = "3"

@@ -457,6 +457,7 @@ impl ChatService {
         convo_id: &str,
         clear_needs_rejoin_on_success: bool,
     ) -> Result<()> {
+        self.require_ordinary_effects(convo_id).await?;
         // Recovery callers historically passed the MLS group ID here, while
         // the transition/getGroupState APIs are keyed by the stable
         // conversation ID. Keep the two identities separate for the entire
@@ -744,6 +745,13 @@ impl ChatService {
     /// (NEEDS_REJOIN), with `DEFERRED_RECOVERY_PAUSE` between conversations
     /// (§8.5).
     pub async fn run_deferred_recovery(&self) {
+        if let Some(authority) = self.orchestrator().await {
+            if let Err(error) = authority.sync_with_server(false).await {
+                tracing::warn!(%error,"Shared recovery deferred");
+            }
+            return;
+        }
+
         // Snapshot the conversation list to avoid holding the read lock
         // across awaits.
         let convo_ids: Vec<String> = {

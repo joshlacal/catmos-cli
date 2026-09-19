@@ -98,6 +98,7 @@ impl ChatService {
         convo_id: &str,
         group_id_hex: &str,
     ) -> Result<Option<DecryptedMetadata>> {
+        self.require_ordinary_effects(convo_id).await?;
         let (stable_convo_id, resolved_group_id) = self.resolve_conversation_ids(convo_id).await?;
         validate_group_id_hex(group_id_hex)?;
         let group_id_hex = if group_id_hex == resolved_group_id {
@@ -861,9 +862,7 @@ impl ChatService {
 
         if self.should_retry_after_refresh(status, &body_bytes) {
             self.refresh_bearer().await?;
-            let fresh_bearer = self
-                .get_service_token(UPLOAD_NSID)
-                .await?;
+            let fresh_bearer = self.get_service_token(UPLOAD_NSID).await?;
             let (url, mut headers) = self.build_request(UPLOAD_NSID, &fresh_bearer)?;
             headers.insert(
                 reqwest::header::CONTENT_TYPE,
@@ -894,5 +893,4 @@ impl ChatService {
 
         Ok(returned_blob_id)
     }
-
 }
