@@ -9,6 +9,16 @@ use tracing::{info, warn};
 
 use crate::error::{CatmosError, Result};
 
+/// Process-scoped persistence for tests that must reopen the same MLS context.
+/// Ordinary fallback instances remain isolated; only an explicitly isolated
+/// integration-test process opts into this map.
+static SHARED_TEST_KEYCHAIN: std::sync::OnceLock<Mutex<HashMap<String, Vec<u8>>>> =
+    std::sync::OnceLock::new();
+
+fn shared_test_key(service: &str, key: &str) -> String {
+    format!("{service}\0{key}")
+}
+
 // ─── SystemKeychain ──────────────────────────────────────────────────────────
 
 /// Keychain implementation using the OS keychain via the `keyring` crate,
@@ -50,6 +60,13 @@ impl SystemKeychain {
 #[async_trait::async_trait]
 impl KeychainAccess for SystemKeychain {
     async fn read(&self, key: String) -> std::result::Result<Option<Vec<u8>>, MLSError> {
+        if std::env::var_os("CATMOS_TEST_SHARED_KEYCHAIN_FALLBACK").is_some() {
+            return SHARED_TEST_KEYCHAIN
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .map_err(|e| MLSError::Internal(format!("Keychain fallback lock poisoned: {e}")))
+                .map(|map| map.get(&shared_test_key(&self.service, &key)).cloned());
+        }
         let fb = self
             .fallback
             .lock()
@@ -70,6 +87,15 @@ impl KeychainAccess for SystemKeychain {
     }
 
     async fn write(&self, key: String, value: Vec<u8>) -> std::result::Result<(), MLSError> {
+        if std::env::var_os("CATMOS_TEST_SHARED_KEYCHAIN_FALLBACK").is_some() {
+            return SHARED_TEST_KEYCHAIN
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .map_err(|e| MLSError::Internal(format!("Keychain fallback lock poisoned: {e}")))
+                .map(|mut map| {
+                    map.insert(shared_test_key(&self.service, &key), value);
+                });
+        }
         let mut fb = self
             .fallback
             .lock()

@@ -9,6 +9,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use catbird_mls::orchestrator::credentials::CredentialStore;
+use catbird_mls::orchestrator::types::DeviceInfo;
+use catbird_mls::orchestrator::MLSAPIClient;
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::auth::{restore_saved_auth, RestoredAuth};
@@ -58,6 +63,9 @@ impl RuntimeStartup {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeStartupReport {
     pub reconciled_blocked_groups: usize,
+    /// True when startup adopted an existing TUI-only device into the shared
+    /// orchestrator credential adapter after exact local/server validation.
+    pub adopted_legacy_tui_device: bool,
 }
 
 /// Fully initialized per-account MLS runtime shared by CLI and TUI callers.
@@ -70,6 +78,7 @@ pub struct Runtime {
     config: Config,
     service: Arc<ChatService>,
     orchestrator: Arc<CliOrchestrator>,
+    database: Arc<Database>,
     startup_report: RuntimeStartupReport,
 }
 
@@ -120,6 +129,8 @@ impl Runtime {
     }
 
     async fn start_network(&mut self, run_startup_sync: bool) -> anyhow::Result<()> {
+        self.startup_report.adopted_legacy_tui_device =
+            reconcile_legacy_tui_custody(&self.did, &self.database, &self.orchestrator).await?;
         self.orchestrator
             .ensure_device_registered()
             .await
@@ -237,8 +248,226 @@ async fn assemble_local_runtime(input: LocalRuntimeInput) -> anyhow::Result<Runt
         config: input.config,
         service,
         orchestrator,
+        database: input.database,
         startup_report: RuntimeStartupReport::default(),
     })
+}
+
+const LEGACY_DEVICE_ID: &str = "mls_device_id";
+const LEGACY_MLS_DID: &str = "mls_did";
+const LEGACY_DEVICE_UUID: &str = "device_uuid";
+
+#[derive(Debug)]
+struct LegacyCustody {
+    device_id: String,
+    mls_did: String,
+    device_uuid: String,
+}
+
+#[derive(Debug)]
+enum CredentialTuple {
+    Absent,
+    Complete {
+        mls_did: String,
+        device_id: String,
+        signing_key: Vec<u8>,
+        local_device_uuid: Option<String>,
+    },
+    Partial,
+}
+
+async fn read_legacy_custody(database: &Database) -> anyhow::Result<Option<LegacyCustody>> {
+    let values = database
+        .get_session_values(&[LEGACY_DEVICE_ID, LEGACY_MLS_DID, LEGACY_DEVICE_UUID])
+        .await?;
+    let device_id = values.get(LEGACY_DEVICE_ID).cloned();
+    let mls_did = values.get(LEGACY_MLS_DID).cloned();
+    let device_uuid = values.get(LEGACY_DEVICE_UUID).cloned();
+    match (device_id, mls_did, device_uuid) {
+        (None, None, None) => Ok(None),
+        (Some(device_id), Some(mls_did), Some(device_uuid)) => Ok(Some(LegacyCustody {
+            device_id,
+            mls_did,
+            device_uuid,
+        })),
+        _ => {
+            anyhow::bail!("legacy TUI device custody is incomplete; refusing new device enrollment")
+        }
+    }
+}
+
+async fn read_credential_tuple(
+    credentials: &KeyringCredentialStore,
+    did: &str,
+) -> anyhow::Result<CredentialTuple> {
+    let mls_did = credentials.get_mls_did(did).await?;
+    let device_id = credentials.get_device_uuid(did).await?;
+    let signing_key = credentials.get_signing_key(did).await?;
+    let local_device_uuid = credentials.get_local_device_uuid(did).await?;
+    match (mls_did, device_id, signing_key) {
+        (None, None, None) if local_device_uuid.is_none() => Ok(CredentialTuple::Absent),
+        (Some(mls_did), Some(device_id), Some(signing_key)) => Ok(CredentialTuple::Complete {
+            mls_did,
+            device_id,
+            signing_key,
+            local_device_uuid,
+        }),
+        _ => Ok(CredentialTuple::Partial),
+    }
+}
+
+fn validate_legacy_tuple(did: &str, legacy: &LegacyCustody) -> anyhow::Result<()> {
+    if legacy.device_id.trim().is_empty()
+        || legacy.mls_did.trim().is_empty()
+        || legacy.device_uuid.trim().is_empty()
+    {
+        anyhow::bail!("legacy TUI device custody contains an empty value");
+    }
+    let parsed_uuid = uuid::Uuid::parse_str(&legacy.device_uuid)
+        .map_err(|_| anyhow::anyhow!("legacy TUI device UUID is invalid"))?;
+    if parsed_uuid.to_string() != legacy.device_uuid
+        || legacy.device_id != legacy.device_uuid
+        || legacy.mls_did != format!("{did}#{}", legacy.device_uuid)
+    {
+        anyhow::bail!("legacy TUI device custody does not describe one exact canonical identity");
+    }
+    Ok(())
+}
+
+fn validate_server_projection(
+    legacy: &LegacyCustody,
+    public_key: &[u8],
+    server_device: Option<&DeviceInfo>,
+) -> anyhow::Result<()> {
+    let expected_key_id =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(public_key));
+    let matches = server_device.is_some_and(|device| {
+        device.device_id == legacy.device_id
+            && device.device_uuid == legacy.device_uuid
+            && device.mls_did == legacy.mls_did
+            && device.status.as_deref() == Some("active")
+            && device
+                .auth_generation
+                .is_some_and(|generation| generation >= 1)
+            && device.signature_public_key.as_deref() == Some(public_key)
+            && device.key_id.as_deref() == Some(expected_key_id.as_str())
+    });
+    if !matches {
+        anyhow::bail!("server device projection does not match retained legacy TUI custody");
+    }
+    Ok(())
+}
+
+/// Adopt a legacy TUI-only identity before the shared orchestrator can decide
+/// that an empty credential adapter represents first use.
+///
+/// Every local and server proof is checked before an empty adapter is written.
+/// Partial state or any conflict returns an error, leaving fresh enrollment
+/// unreachable for an installation that already has identity evidence.
+async fn reconcile_legacy_tui_custody(
+    did: &str,
+    database: &Database,
+    orchestrator: &CliOrchestrator,
+) -> anyhow::Result<bool> {
+    let legacy = read_legacy_custody(database).await?;
+    let current = read_credential_tuple(orchestrator.credentials(), did).await?;
+    let Some(legacy) = legacy else {
+        return match current {
+            CredentialTuple::Absent | CredentialTuple::Complete { .. } => Ok(false),
+            CredentialTuple::Partial => anyhow::bail!(
+                "orchestrator credential custody is incomplete; refusing new device enrollment"
+            ),
+        };
+    };
+
+    validate_legacy_tuple(did, &legacy)?;
+    let signing_key = orchestrator
+        .mls_context()
+        .export_identity_key(legacy.mls_did.clone())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "retained legacy TUI signer is unavailable for {}: {error}",
+                legacy.mls_did
+            )
+        })?;
+    let public_key = orchestrator
+        .mls_context()
+        .identity_public_key(legacy.mls_did.clone())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "retained legacy TUI signer identity is unavailable for {}: {error}",
+                legacy.mls_did
+            )
+        })?;
+
+    match &current {
+        CredentialTuple::Absent => {}
+        CredentialTuple::Partial => {
+            anyhow::bail!("legacy TUI custody conflicts with incomplete orchestrator credentials")
+        }
+        CredentialTuple::Complete {
+            mls_did,
+            device_id,
+            signing_key: current_signing_key,
+            local_device_uuid,
+        } => {
+            if mls_did != &legacy.mls_did
+                || device_id != &legacy.device_id
+                || current_signing_key != &signing_key
+                || local_device_uuid
+                    .as_deref()
+                    .is_some_and(|uuid| uuid != legacy.device_uuid)
+            {
+                anyhow::bail!("legacy TUI custody conflicts with orchestrator credential custody");
+            }
+        }
+    }
+
+    let devices = orchestrator
+        .api_client()
+        .list_devices(&legacy.device_id)
+        .await
+        .map_err(|error| anyhow::anyhow!("legacy TUI device reconciliation failed: {error}"))?;
+    let server_device = devices
+        .iter()
+        .find(|device| device.device_id == legacy.device_id);
+    validate_server_projection(&legacy, &public_key, server_device)?;
+
+    if matches!(current, CredentialTuple::Complete { .. }) {
+        if orchestrator
+            .credentials()
+            .get_local_device_uuid(did)
+            .await?
+            .is_none()
+        {
+            orchestrator
+                .credentials()
+                .store_local_device_uuid(did, &legacy.device_uuid)
+                .await?;
+        }
+        return Ok(false);
+    }
+
+    let credentials = orchestrator.credentials();
+    let adoption = async {
+        credentials.store_signing_key(did, &signing_key).await?;
+        credentials.store_mls_did(did, &legacy.mls_did).await?;
+        credentials
+            .store_device_uuid(did, &legacy.device_id)
+            .await?;
+        credentials
+            .store_local_device_uuid(did, &legacy.device_uuid)
+            .await?;
+        Ok::<(), catbird_mls::orchestrator::error::OrchestratorError>(())
+    }
+    .await;
+    if let Err(error) = adoption {
+        let _ = credentials.clear_all(did).await;
+        return Err(anyhow::anyhow!(
+            "failed to adopt validated legacy TUI custody: {error}"
+        ));
+    }
+    Ok(true)
 }
 
 async fn reconcile_blocked_groups(service: &Arc<ChatService>) -> usize {
