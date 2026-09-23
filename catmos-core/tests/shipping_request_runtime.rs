@@ -861,6 +861,9 @@ impl Tui {
         Ok(())
     }
     async fn quit(mut self) -> anyhow::Result<()> {
+        // Request screens own every key (Ctrl-Q is not global there); Esc
+        // returns to Chat, where Ctrl-Q quits.
+        self.keys("\u{1b}").await?;
         self.keys("\u{11}").await?;
         let reply = self.call(json!({"op":"exit","timeout":30})).await?;
         ensure!(reply["code"] == 0, "actual TUI exit: {reply}");

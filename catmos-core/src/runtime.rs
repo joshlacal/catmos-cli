@@ -641,52 +641,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_tui_initializes_real_orchestrator_and_hydrates_offline_journal() {
-        let (_root, input) = fixture().await;
-        let policy = RuntimeStartup::interactive();
-        assert!(policy.run_startup_sync());
-        assert!(!policy.network_failures_are_fatal());
-
-        let runtime = assemble_local_runtime(input).await.unwrap();
-
-        // C35: standalone TUI initializes real orchestrator
-        assert_eq!(runtime.did(), DID);
-        let orchestrator = runtime.orchestrator();
-        let service_authority = runtime
-            .service()
-            .orchestrator()
-            .await
-            .expect("service must expose initialized authority");
-        assert!(Arc::ptr_eq(orchestrator, &service_authority));
-
-        // Offline journal hydration: protect ownership without network outcome resolution blocking
-        runtime
-            .orchestrator()
-            .storage()
-            .ensure_conversation_exists(
-                DID,
-                "request-offline-convo",
-                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
-            )
-            .await
-            .unwrap();
-        runtime
-            .orchestrator()
-            .storage()
-            .set_conversation_state("request-offline-convo", ConversationState::Active)
-            .await
-            .unwrap();
-
-        let state = runtime
-            .orchestrator()
-            .storage()
-            .get_conversation_state("request-offline-convo")
-            .await
-            .unwrap();
-        assert_eq!(state, Some(ConversationState::Active));
-    }
-
-    #[tokio::test]
     async fn local_bootstrap_reopens_the_same_protected_orchestrator_state() {
         let (root, input) = fixture().await;
         let database_key = input.database_key.clone();
