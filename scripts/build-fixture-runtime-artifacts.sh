@@ -46,7 +46,7 @@ pin() {
   else
     jj -R "$shared" workspace add --name fixture-build --revision "$commit" "$dir" >/dev/null 2>&1
   fi
-  jj -R "$dir" st | grep -Fq 'The working copy has no changes.' \
+  grep -Fq 'The working copy has no changes.' <<<"$(jj -R "$dir" st)" \
     || { printf '%s private workspace is not clean\n' "$name" >&2; exit 1; }
   [[ $(jj -R "$dir" log -r '@-' --no-graph -T commit_id) == "$commit" ]] \
     || { printf '%s private workspace is not on %s\n' "$name" "$commit" >&2; exit 1; }
