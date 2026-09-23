@@ -45,6 +45,13 @@ struct Proxy {
     service: String,
     http: reqwest::Client,
     trace: Mutex<Vec<Value>>,
+    /// Every HTTP request reaching the TLS-terminated fixture, including
+    /// synthetic PDS/session endpoints and requests refused while offline.
+    /// This is the process transport boundary used for zero-effect counts.
+    seen: Mutex<Vec<Value>>,
+    /// While set, every request is recorded and refused before any handler or
+    /// upstream service can observe it.
+    offline: AtomicBool,
     evidence: PathBuf,
     drop_publication_response: AtomicBool,
 }
@@ -53,6 +60,11 @@ impl Drop for Proxy {
         if let Ok(trace) = self.trace.lock() {
             if let Ok(raw) = serde_json::to_vec_pretty(&*trace) {
                 let _ = std::fs::write(self.evidence.join("http-metadata.json"), raw);
+            }
+        }
+        if let Ok(seen) = self.seen.lock() {
+            if let Ok(raw) = serde_json::to_vec_pretty(&*seen) {
+                let _ = std::fs::write(self.evidence.join("transport-requests.json"), raw);
             }
         }
     }
@@ -93,6 +105,18 @@ fn actor_for_session<'a>(proxy: &'a Proxy, request: &Request) -> Option<&'a Arc<
 async fn serve(State(proxy): State<Arc<Proxy>>, request: Request) -> Response {
     let path = request.uri().path().to_string();
     let query = request.uri().query().unwrap_or("").to_owned();
+    let offline = proxy.offline.load(Ordering::SeqCst);
+    proxy.seen.lock().unwrap().push(json!({
+        "method": request.method().as_str(),
+        "path": path,
+        "refusedOffline": offline,
+    }));
+    if offline {
+        return response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":"FixtureNetworkOffline"}),
+        );
+    }
     let host = request
         .headers()
         .get("host")
@@ -312,7 +336,39 @@ async fn actual_cli_lost_publication_response_replays_after_process_restart() ->
     shipping_cli_scenario(true).await
 }
 
-async fn shipping_cli_scenario(lose_publication_response: bool) -> anyhow::Result<()> {
+/// Live shipping service, synthetic session/PDS facade, TLS terminator and two
+/// seeded actual-CLI profiles. Dropping it stops every process it started.
+struct Fixture {
+    binary: PathBuf,
+    evidence: PathBuf,
+    proxy: Arc<Proxy>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    tls: Option<TlsProcess>,
+    _server: ShippingServerFixture,
+    _https: HttpsDidFixture,
+}
+impl Fixture {
+    /// Close the socket and the request handler: later processes observe a
+    /// connection failure instead of any server response.
+    fn stop_network(&mut self) {
+        self.tls.take();
+        self.task.abort();
+    }
+    /// Index of the next request that will reach the transport boundary.
+    fn transport_mark(&self) -> usize {
+        self.proxy.seen.lock().unwrap().len()
+    }
+    fn transport_since(&self, mark: usize) -> Vec<Value> {
+        self.proxy.seen.lock().unwrap()[mark..].to_vec()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.stop_network();
+    }
+}
+
+async fn start_fixture(lose_publication_response: bool) -> anyhow::Result<Fixture> {
     connect_guarded_request_database(4).await?;
     let binary = PathBuf::from(
         std::env::var("CATMOS_RUNTIME_CLI").context("retained fixture-only CLI path")?,
@@ -458,6 +514,8 @@ async fn shipping_cli_scenario(lose_publication_response: bool) -> anyhow::Resul
         service: server.base_url.clone(),
         http: reqwest::Client::new(),
         trace: Mutex::new(Vec::new()),
+        seen: Mutex::new(Vec::new()),
+        offline: AtomicBool::new(false),
         evidence: evidence.clone(),
         drop_publication_response: AtomicBool::new(lose_publication_response),
     });
@@ -488,7 +546,7 @@ async fn shipping_cli_scenario(lose_publication_response: bool) -> anyhow::Resul
         serde_json::from_str::<Value>(&ready)?["port"] == tls_port,
         "TLS proxy readiness mismatch"
     );
-    let tls = TlsProcess(tls);
+    let tls = Some(TlsProcess(tls));
     let address = format!("127.0.0.1:{tls_port}").parse()?;
     let untrusted = reqwest::Client::builder()
         .no_proxy()
@@ -530,6 +588,24 @@ async fn shipping_cli_scenario(lose_publication_response: bool) -> anyhow::Resul
             .await
             .is_err(),
         "fixture TLS ignored hostname mismatch"
+    );
+    Ok(Fixture {
+        binary,
+        evidence,
+        proxy,
+        task,
+        tls,
+        _server: server,
+        _https: https,
+    })
+}
+
+async fn shipping_cli_scenario(lose_publication_response: bool) -> anyhow::Result<()> {
+    let mut fixture = start_fixture(lose_publication_response).await?;
+    let (binary, evidence, proxy) = (
+        fixture.binary.clone(),
+        fixture.evidence.clone(),
+        fixture.proxy.clone(),
     );
 
     let alice = &proxy.actors[0];
@@ -669,8 +745,7 @@ async fn shipping_cli_scenario(lose_publication_response: bool) -> anyhow::Resul
             && String::from_utf8_lossy(&history.stdout).contains(std::str::from_utf8(reply)?),
         "sender did not decrypt reply after process restart"
     );
-    drop(tls);
-    task.abort();
+    fixture.stop_network();
     let offline = json_command(&binary, bob, &["request", "list", "--offline"], b"").await?;
     ensure!(
         offline["requests"]
@@ -687,6 +762,449 @@ async fn shipping_cli_scenario(lose_publication_response: bool) -> anyhow::Resul
     std::fs::write(
         evidence.join("http-metadata.json"),
         serde_json::to_vec_pretty(&*proxy.trace.lock().unwrap())?,
+    )?;
+    Ok(())
+}
+
+/// The actual interactive `catmos` executable under a pseudo-terminal. The
+/// driver returns only match booleans; rendered protected text never leaves it.
+struct Tui {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+}
+impl Tui {
+    async fn start(binary: &Path, actor: &Actor) -> anyhow::Result<Self> {
+        let mut child = tokio::process::Command::new("python3")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/tui_pty_driver.py"))
+            .arg(binary)
+            .arg(&actor.profile)
+            .arg(&actor.manifest)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdin = child.stdin.take().context("driver stdin")?;
+        let stdout = child.stdout.take().context("driver stdout")?;
+        use tokio::io::AsyncBufReadExt;
+        Ok(Self {
+            child,
+            stdin,
+            lines: tokio::io::BufReader::new(stdout).lines(),
+        })
+    }
+    async fn call(&mut self, command: Value) -> anyhow::Result<Value> {
+        let mut line = serde_json::to_vec(&command)?;
+        line.push(b'\n');
+        self.stdin.write_all(&line).await?;
+        self.stdin.flush().await?;
+        let reply = tokio::time::timeout(Duration::from_secs(180), self.lines.next_line())
+            .await
+            .context("TUI driver reply timeout")??
+            .context("TUI driver closed")?;
+        Ok(serde_json::from_str(&reply)?)
+    }
+    async fn expect(&mut self, text: &str, timeout: u64) -> anyhow::Result<()> {
+        let reply = self
+            .call(json!({"op":"expect","text":text,"timeout":timeout}))
+            .await?;
+        ensure!(reply["found"] == true, "actual TUI never rendered {text:?}");
+        Ok(())
+    }
+    async fn keys(&mut self, data: &str) -> anyhow::Result<()> {
+        self.call(json!({"op":"keys","data":data})).await?;
+        Ok(())
+    }
+    async fn quit(mut self) -> anyhow::Result<()> {
+        self.keys("\u{11}").await?;
+        let reply = self.call(json!({"op":"exit","timeout":30})).await?;
+        ensure!(reply["code"] == 0, "actual TUI exit: {reply}");
+        let _ = self.child.wait().await;
+        Ok(())
+    }
+}
+
+/// Wait until no request has reached the transport for `quiet`, bounded.
+/// Background reads may continue; the caller classifies its measured window.
+async fn settle_transport(fixture: &Fixture, quiet: Duration, bound: Duration) {
+    let start = std::time::Instant::now();
+    let mut last = (fixture.transport_mark(), std::time::Instant::now());
+    while start.elapsed() < bound {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let now = fixture.transport_mark();
+        if now != last.0 {
+            last = (now, std::time::Instant::now());
+        } else if last.1.elapsed() >= quiet {
+            return;
+        }
+    }
+}
+
+/// Any request that could create or advance a conversation, request, upload,
+/// membership or group transition. Plain reads are reported, not hidden.
+fn remote_effects(window: &[Value]) -> Vec<Value> {
+    const EFFECT_WORDS: [&str; 9] = [
+        "DirectRequest",
+        "Blob",
+        "Convo",
+        "Conversation",
+        "sendMessage",
+        "Welcome",
+        "Member",
+        "Commit",
+        "Group",
+    ];
+    window
+        .iter()
+        .filter(|row| {
+            let path = row["path"].as_str().unwrap_or("");
+            path.contains("uploadBlob")
+                || (row["method"] != "GET" && EFFECT_WORDS.iter().any(|w| path.contains(w)))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Authoritative server rows an actor could have created: request attempts,
+/// publications and conversation memberships.
+fn service_rows(did: &str) -> anyhow::Result<Value> {
+    ensure!(
+        did.starts_with("did:web:") && !did.contains('\''),
+        "synthetic DID required"
+    );
+    let query = format!(
+        r#"SELECT json_build_object(
+      'attempts',(SELECT count(*) FROM chat.direct_request_attempts WHERE actor_did='{did}'),
+      'publications',(SELECT count(*) FROM chat.direct_request_publications WHERE actor_did='{did}'),
+      'memberships',(SELECT count(*) FROM chat.member_devices WHERE user_did='{did}'))"#
+    );
+    let output = Command::new("psql")
+        .arg(std::env::var("REQUEST_TEST_DATABASE_URL")?)
+        .args(["-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", &query])
+        .output()?;
+    ensure!(output.status.success(), "guarded service row query failed");
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn find_draft<'a>(list: &'a Value, draft: &str) -> anyhow::Result<&'a Value> {
+    list["drafts"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["draftId"] == draft))
+        .with_context(|| format!("draft {draft} absent from actual CLI list"))
+}
+
+/// C29: the actual TUI's contact selection, composer and local draft, and the
+/// actual CLI's attachment-first upload on a pending request, produce no
+/// request/conversation/upload at the transport or in the service database.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires guarded shipping service, retained signed binaries and real OS keychain"]
+async fn actual_tui_draft_and_attachment_first_create_no_remote_effects() -> anyhow::Result<()> {
+    let fixture = start_fixture(false).await?;
+    let (binary, evidence, proxy) = (
+        fixture.binary.clone(),
+        fixture.evidence.clone(),
+        fixture.proxy.clone(),
+    );
+    let alice = &proxy.actors[0];
+    let bob = &proxy.actors[1];
+
+    eprintln!("C29: actual TUI startup");
+    let mut tui = Tui::start(&binary, alice).await?;
+    tui.expect("ready ·", 120).await?;
+    settle_transport(&fixture, Duration::from_secs(4), Duration::from_secs(45)).await;
+    let rows_before = service_rows(&alice.identity.did)?;
+    let mark = fixture.transport_mark();
+
+    eprintln!("C29: TUI contact selection, composer and local draft");
+    tui.keys("\u{12}").await?; // Ctrl-R: Requests
+    tui.expect("n new draft", 30).await?;
+    tui.keys("n").await?;
+    tui.expect("recipient DID", 30).await?;
+    tui.keys(&bob.identity.did).await?;
+    tui.keys("\r").await?;
+    tui.expect("One encrypted introduction", 30).await?;
+    tui.keys("Synthetic C29 TUI draft-only introduction").await?;
+    tui.expect("Draft is saved on this device", 30).await?;
+    tui.keys("\u{1b}").await?; // Esc: leave the composer without sending
+    // Deferred effects would have to happen inside this window.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let tui_window = fixture.transport_since(mark);
+    tui.quit().await?;
+    let rows_after = service_rows(&alice.identity.did)?;
+    ensure!(
+        remote_effects(&tui_window).is_empty(),
+        "TUI draft reached a remote effect: {:?}",
+        remote_effects(&tui_window)
+    );
+    ensure!(
+        rows_before == rows_after,
+        "TUI draft changed service rows: {rows_before} -> {rows_after}"
+    );
+    let local = json_command(&binary, alice, &["request", "list", "--offline"], b"").await?;
+    let drafts = local["drafts"]
+        .as_array()
+        .context("local drafts")?
+        .iter()
+        .filter(|row| row["recipientDid"] == bob.identity.did.as_str())
+        .cloned()
+        .collect::<Vec<_>>();
+    ensure!(
+        drafts.len() == 1 && drafts[0]["attempted"] == false && drafts[0]["outcome"].is_null(),
+        "TUI did not retain exactly one unattempted local draft: {drafts:?}"
+    );
+    let tui_draft = drafts[0]["draftId"].as_str().context("draft id")?.to_owned();
+
+    eprintln!("C29: attachment-first on a pending request");
+    let delivery = json_command(&binary, bob, &["request", "delivery", "--enable"], b"").await?;
+    ensure!(delivery["enabled"] == true, "delivery not acknowledged");
+    let sent = json_command(
+        &binary,
+        alice,
+        &["request", "send", &bob.identity.did, "--file", "-"],
+        b"Synthetic C29 introduction before attachment attempt",
+    )
+    .await?;
+    ensure!(
+        sent["outcome"]["type"] == "requestSent",
+        "request send: {sent}"
+    );
+    let conversation = sent["outcome"]["conversationId"]
+        .as_str()
+        .context("conversation")?
+        .to_owned();
+    let attachment = tempfile::NamedTempFile::new()?;
+    std::fs::write(attachment.path(), b"synthetic attachment bytes")?;
+    let attachment = attachment.path().to_str().context("attachment path")?;
+    let mark = fixture.transport_mark();
+    let mut attachment_rejections = Vec::new();
+    for actor in [bob, alice] {
+        let output = child(
+            &binary,
+            actor,
+            &["blob", "upload", &conversation, attachment],
+            b"",
+        )
+        .await?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(
+            !output.status.success()
+                && stderr.contains("Operation requires verified account consent and device readiness"),
+            "attachment-first upload was not rejected by the consent gate: {stderr}"
+        );
+        attachment_rejections.push(actor.identity.did.clone());
+    }
+    let upload_window = fixture.transport_since(mark);
+    ensure!(
+        remote_effects(&upload_window).is_empty(),
+        "attachment-first reached a remote effect: {:?}",
+        remote_effects(&upload_window)
+    );
+    let declined = json_command(&binary, bob, &["request", "decline", &conversation], b"").await?;
+    ensure!(declined["consent"] == "closed", "decline: {declined}");
+
+    std::fs::write(
+        evidence.join("c29-result.json"),
+        serde_json::to_vec_pretty(&json!({
+            "status": "passed",
+            "fixtureOnly": true,
+            "profiles": [alice.profile, bob.profile],
+            "tui": {
+                "entrypoint": "actual catmos TUI under a pseudo-terminal",
+                "keys": ["Ctrl-R", "n", "recipient DID", "Enter", "introduction text", "Esc"],
+                "transportRequestsInWindow": tui_window,
+                "remoteEffectsInWindow": 0,
+                "serviceRowsBefore": rows_before,
+                "serviceRowsAfter": rows_after,
+                "retainedLocalDraftId": tui_draft,
+            },
+            "attachmentFirst": {
+                "conversationId": conversation,
+                "rejectedActors": attachment_rejections,
+                "transportRequestsInWindow": upload_window,
+                "uploadRequestsAtTransport": 0,
+                "requestReleasedBy": "recipient decline",
+            },
+        }))?,
+    )?;
+    Ok(())
+}
+
+/// C35: an actual CLI process and the actual TUI start with an unresolved
+/// published-response-lost journal while the network refuses every request.
+/// Both reach Ready from offline hydration; the attempt stays owned and later
+/// resolves to the identical publication without a second candidate.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires guarded shipping service, retained signed binaries and real OS keychain"]
+async fn actual_offline_hydration_reaches_ready_and_holds_pending_ownership() -> anyhow::Result<()>
+{
+    let fixture = start_fixture(true).await?;
+    let (binary, evidence, proxy) = (
+        fixture.binary.clone(),
+        fixture.evidence.clone(),
+        fixture.proxy.clone(),
+    );
+    let alice = &proxy.actors[0];
+    let bob = &proxy.actors[1];
+    let delivery = json_command(&binary, bob, &["request", "delivery", "--enable"], b"").await?;
+    ensure!(delivery["enabled"] == true, "delivery not acknowledged");
+    let draft = uuid::Uuid::new_v4().to_string();
+    let introduction = b"Synthetic C35 introduction with lost publication response";
+    let sent = json_command(
+        &binary,
+        alice,
+        &["request", "send", &bob.identity.did, "--file", "-", "--draft-id", &draft],
+        introduction,
+    )
+    .await?;
+    ensure!(
+        sent["outcome"]["type"] == "outcomeUnknown",
+        "lost publication response was not retained as unknown: {sent}"
+    );
+    let request_id = sent["outcome"]["requestId"]
+        .as_str()
+        .context("unknown request id")?
+        .to_owned();
+    let graph_before = publication_graph(uuid::Uuid::parse_str(&request_id)?)?;
+
+    eprintln!("C35: network refuses every request; actual CLI offline start");
+    proxy.offline.store(true, Ordering::SeqCst);
+    let mark = fixture.transport_mark();
+    let started = std::time::Instant::now();
+    let listed = json_command(&binary, alice, &["request", "list", "--offline"], b"").await?;
+    let status = json_command(&binary, alice, &["request", "status", &draft], b"").await?;
+    let offline_elapsed = started.elapsed();
+    let cli_window = fixture.transport_since(mark);
+    ensure!(
+        cli_window.is_empty(),
+        "offline hydration contacted the transport: {cli_window:?}"
+    );
+    for row in [find_draft(&listed, &draft)?, &status] {
+        ensure!(
+            row["attempted"] == true
+                && row["outcome"]["type"] == "outcomeUnknown"
+                && row["outcome"]["requestId"] == request_id.as_str(),
+            "offline Ready lost the owned unknown attempt: {row}"
+        );
+    }
+    ensure!(
+        offline_elapsed < Duration::from_secs(30),
+        "offline hydration was blocked for {offline_elapsed:?}"
+    );
+
+    eprintln!("C35: actual interactive TUI start while the network refuses");
+    let mark = fixture.transport_mark();
+    let started = std::time::Instant::now();
+    let mut tui = Tui::start(&binary, alice).await?;
+    tui.expect("list unavailable", 90).await?;
+    let tui_ready_after = started.elapsed();
+    tui.keys("\u{12}").await?;
+    tui.expect(&request_id, 30).await?;
+    tui.quit().await?;
+    let tui_window = fixture.transport_since(mark);
+    ensure!(
+        !tui_window.is_empty()
+            && tui_window.iter().all(|row| row["refusedOffline"] == true),
+        "interactive start did not attempt the refused network: {tui_window:?}"
+    );
+    proxy.offline.store(false, Ordering::SeqCst);
+
+    eprintln!("C35: ownership fence after the network returns");
+    let publications = |proxy: &Proxy| {
+        proxy
+            .trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r["nsid"] == "blue.catbird.chat.publishDirectRequest"
+                    || r["nsid"] == "blue.catbird.chat.prepareDirectRequest"
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let before_conflict = publications(&proxy).len();
+    let conflict = child(
+        &binary,
+        alice,
+        &["request", "send", &bob.identity.did, "--file", "-", "--draft-id", &draft],
+        b"Different content must not replace the owned attempt",
+    )
+    .await?;
+    ensure!(
+        !conflict.status.success()
+            && String::from_utf8_lossy(&conflict.stderr)
+                .contains("Draft ID already binds different content"),
+        "changed content for an owned draft was not refused: {}",
+        String::from_utf8_lossy(&conflict.stderr)
+    );
+    ensure!(
+        publications(&proxy).len() == before_conflict,
+        "refused content change reached preparation/publication"
+    );
+    let resumed = json_command(&binary, alice, &["request", "resume", &draft], b"").await?;
+    ensure!(
+        resumed["outcome"]["type"] == "requestSent",
+        "resume did not recover the publication: {resumed}"
+    );
+    let graph_after = publication_graph(uuid::Uuid::parse_str(&request_id)?)?;
+    ensure!(
+        graph_before == graph_after,
+        "resume changed the authoritative publication graph"
+    );
+    let rows = publications(&proxy)
+        .into_iter()
+        .filter(|r| r["nsid"] == "blue.catbird.chat.publishDirectRequest")
+        .collect::<Vec<_>>();
+    ensure!(
+        rows.len() >= 2
+            && rows[0]["responseDropped"] == true
+            && rows.iter().skip(1).all(|row| row["responseDropped"] == false
+                && row["status"] == 200
+                && row["requestBodySha256"] == rows[0]["requestBodySha256"]
+                && row["responseBodySha256"] == rows[0]["responseBodySha256"]),
+        "resume did not replay the exact owned publication"
+    );
+    let conversation = resumed["outcome"]["conversationId"]
+        .as_str()
+        .context("conversation")?
+        .to_owned();
+    ensure!(
+        graph_after["conversationId"] == conversation.as_str(),
+        "resume adopted a different conversation"
+    );
+    let declined = json_command(&binary, bob, &["request", "decline", &conversation], b"").await?;
+    ensure!(declined["consent"] == "closed", "decline: {declined}");
+
+    std::fs::write(
+        evidence.join("c35-hydration-result.json"),
+        serde_json::to_vec_pretty(&json!({
+            "status": "passed",
+            "fixtureOnly": true,
+            "profiles": [alice.profile, bob.profile],
+            "draftId": draft,
+            "requestId": request_id,
+            "cliOffline": {
+                "commands": ["request list --offline", "request status"],
+                "transportRequests": cli_window.len(),
+                "elapsedMs": offline_elapsed.as_millis() as u64,
+                "outcome": "outcomeUnknown retained",
+            },
+            "tuiOffline": {
+                "readyStatusAfterMs": tui_ready_after.as_millis() as u64,
+                "refusedTransportRequests": tui_window.len(),
+                "requestsScreenShowedOwnedAttempt": true,
+            },
+            "ownership": {
+                "changedContentRefused": true,
+                "preparationsOrPublicationsDuringRefusal": 0,
+                "resumeOutcome": "requestSent",
+                "publicationGraphUnchanged": true,
+                "exactPublicationReplayed": rows.len(),
+            },
+            "conversationId": conversation,
+            "requestReleasedBy": "recipient decline",
+        }))?,
     )?;
     Ok(())
 }
