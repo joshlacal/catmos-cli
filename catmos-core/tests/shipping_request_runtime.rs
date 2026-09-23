@@ -243,10 +243,13 @@ async fn serve(State(proxy): State<Arc<Proxy>>, request: Request) -> Response {
                 .body(Body::from(body))
                 .unwrap()
         }
-        Err(_) => response(
-            StatusCode::BAD_GATEWAY,
-            json!({"error":"FixtureUpstreamFailed"}),
-        ),
+        Err(err) => {
+            eprintln!("forward_exact_service_request error for {nsid} (query: {query:?}): {err:#}");
+            response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error":"FixtureUpstreamFailed"}),
+            )
+        }
     }
 }
 
