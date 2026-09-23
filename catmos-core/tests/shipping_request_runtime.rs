@@ -13,8 +13,8 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use mls_e2e_tests::local_runtime_fixture::{
-    connect_guarded_request_database, seed_service_device, HttpsDidFixture, ServiceIdentity,
-    ShippingServerFixture,
+    connect_guarded_request_database, request_database_url, route_to_dedicated_database,
+    seed_service_device, HttpsDidFixture, ServiceIdentity, ShippingServerFixture,
 };
 use serde_json::{json, Value};
 use std::{
@@ -346,6 +346,47 @@ struct Fixture {
     tls: Option<TlsProcess>,
     _server: ShippingServerFixture,
     _https: HttpsDidFixture,
+    /// Dropped last: after the service process has stopped.
+    database: DedicatedDatabase,
+}
+
+/// Each run owns a `catbird_direct_requests_fault_<16 hex>` database on the
+/// loopback cluster, installed by the guard with the pinned ledger, so no run
+/// holds capacity or locks in the shared request database. Dropped even on
+/// failure; only backends of this uniquely named database are terminated.
+struct DedicatedDatabase(String);
+impl DedicatedDatabase {
+    fn create() -> anyhow::Result<Self> {
+        let name = format!(
+            "catbird_direct_requests_fault_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..16]
+        );
+        maintenance(&format!("CREATE DATABASE {name}"))?;
+        let database = Self(name);
+        route_to_dedicated_database(&format!("postgresql://127.0.0.1:5432/{}", database.0))?;
+        ensure!(request_database_url().ends_with(&database.0), "database routing");
+        Ok(database)
+    }
+}
+impl Drop for DedicatedDatabase {
+    fn drop(&mut self) {
+        let name = &self.0;
+        let _ = maintenance(&format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='{name}' AND pid<>pg_backend_pid()"
+        ));
+        let _ = maintenance(&format!("DROP DATABASE IF EXISTS {name}"));
+    }
+}
+fn maintenance(sql: &str) -> anyhow::Result<()> {
+    let output = Command::new("psql")
+        .args(["postgresql://127.0.0.1:5432/postgres", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "maintenance psql failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
 }
 impl Fixture {
     /// Close the socket and the request handler: later processes observe a
@@ -369,6 +410,8 @@ impl Drop for Fixture {
 }
 
 async fn start_fixture(lose_publication_response: bool) -> anyhow::Result<Fixture> {
+    let database = DedicatedDatabase::create()?;
+    eprintln!("dedicated request database {}", database.0);
     connect_guarded_request_database(4).await?;
     let binary = PathBuf::from(
         std::env::var("CATMOS_RUNTIME_CLI").context("retained fixture-only CLI path")?,
@@ -404,7 +447,7 @@ async fn start_fixture(lose_publication_response: bool) -> anyhow::Result<Fixtur
     std::fs::write(
         evidence.join("artifact-manifest.json"),
         serde_json::to_vec_pretty(
-            &json!({"fixtureOnly":true,"features":["local-runtime-fixture"],"binaries":binaries}),
+            &json!({"fixtureOnly":true,"features":["local-runtime-fixture"],"database":database.0,"binaries":binaries}),
         )?,
     )?;
     let run = uuid::Uuid::new_v4().simple().to_string();
@@ -597,6 +640,7 @@ async fn start_fixture(lose_publication_response: bool) -> anyhow::Result<Fixtur
         tls,
         _server: server,
         _https: https,
+        database,
     })
 }
 
@@ -880,7 +924,7 @@ fn service_rows(did: &str) -> anyhow::Result<Value> {
       'memberships',(SELECT count(*) FROM chat.member_devices WHERE user_did='{did}'))"#
     );
     let output = Command::new("psql")
-        .arg(std::env::var("REQUEST_TEST_DATABASE_URL")?)
+        .arg(request_database_url())
         .args(["-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", &query])
         .output()?;
     ensure!(output.status.success(), "guarded service row query failed");
@@ -1008,6 +1052,7 @@ async fn actual_tui_draft_and_attachment_first_create_no_remote_effects() -> any
         serde_json::to_vec_pretty(&json!({
             "status": "passed",
             "fixtureOnly": true,
+            "dedicatedDatabase": fixture.database.0,
             "profiles": [alice.profile, bob.profile],
             "tui": {
                 "entrypoint": "actual catmos TUI under a pseudo-terminal",
@@ -1181,6 +1226,7 @@ async fn actual_offline_hydration_reaches_ready_and_holds_pending_ownership() ->
         serde_json::to_vec_pretty(&json!({
             "status": "passed",
             "fixtureOnly": true,
+            "dedicatedDatabase": fixture.database.0,
             "profiles": [alice.profile, bob.profile],
             "draftId": draft,
             "requestId": request_id,
@@ -1232,7 +1278,7 @@ fn publication_graph(request: uuid::Uuid) -> anyhow::Result<Value> {
     ) FROM chat.direct_request_publications p WHERE p.request_id='{request}'::uuid"#
     );
     let output = Command::new("psql")
-        .arg(std::env::var("REQUEST_TEST_DATABASE_URL")?)
+        .arg(request_database_url())
         .args(["-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", &query])
         .output()?;
     ensure!(
