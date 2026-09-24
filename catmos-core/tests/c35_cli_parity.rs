@@ -164,6 +164,16 @@ fn test_c35_cli_parity() {
     println!("C35 CLI Stage A Digest: {digest_a}");
     assert_eq!(digest_a, EXPECTED_DIGEST_A, "CLI Stage A digest must match core reference");
 
+    // Counterfactual 1: mutate Request 1 text in Stage A and verify digest changes
+    let mut mutated_stage_a = projected_views.clone();
+    if let Some(RequestPreview::Ready { text, .. }) = &mut mutated_stage_a[0].preview {
+        text.push_str(" [MUTATED]");
+    }
+    let mutated_json_a = serde_json::to_value(&mutated_stage_a).unwrap();
+    let mutated_digest_a = sha256_hex(&canonical_json_bytes(&mutated_json_a));
+    println!("C35 CLI Counterfactual Stage A Mutated Digest: {mutated_digest_a}");
+    assert_ne!(mutated_digest_a, EXPECTED_DIGEST_A, "Mutated corpus must change Stage A digest");
+
     // =========================================================================
     // Stage B: Offline Hydration from Persisted State
     // =========================================================================
@@ -319,5 +329,17 @@ fn test_c35_cli_parity() {
     println!("C35 CLI Stage C Digest: {digest_c}");
     assert_eq!(digest_c, EXPECTED_DIGEST_C, "CLI Stage C digest must match core reference");
 
-    println!("C35 CLI PARITY: ALL STAGES PASS");
+    // Counterfactual 2: mutate Stage C (revert Request 2 Close) and verify digest changes
+    let mut mutated_stage_c = transition_views.clone();
+    let req2_mut = mutated_stage_c
+        .iter_mut()
+        .find(|v| v.conversation_id == "11111111-c35a-4000-8000-000000000002")
+        .unwrap();
+    req2_mut.consent = RequestConsent::OutgoingPending;
+    let mutated_json_c = serde_json::to_value(&mutated_stage_c).unwrap();
+    let mutated_digest_c = sha256_hex(&canonical_json_bytes(&mutated_json_c));
+    println!("C35 CLI Counterfactual Stage C Mutated Digest: {mutated_digest_c}");
+    assert_ne!(mutated_digest_c, EXPECTED_DIGEST_C, "Mutated transition must change Stage C digest");
+
+    println!("C35 CLI PARITY: ALL STAGES AND COUNTERFACTUALS PASS");
 }
