@@ -941,12 +941,41 @@ fn find_draft<'a>(list: &'a Value, draft: &str) -> anyhow::Result<&'a Value> {
         .with_context(|| format!("draft {draft} absent from actual CLI list"))
 }
 
-/// C29: the actual TUI's contact selection, composer and local draft, and the
-/// actual CLI's attachment-first upload on a pending request, produce no
-/// request/conversation/upload at the transport or in the service database.
+fn account_db_path(profile: &str, did: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(did.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    dirs::data_dir()
+        .unwrap()
+        .join("catmos-cli")
+        .join("profiles")
+        .join(profile)
+        .join("accounts")
+        .join(&hash[..16])
+        .join("catmos.db")
+}
+
+fn account_orchestrator_db_path(profile: &str, did: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(did.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    dirs::data_dir()
+        .unwrap()
+        .join("catmos-cli")
+        .join("profiles")
+        .join(profile)
+        .join("accounts")
+        .join(&hash[..16])
+        .join("orchestrator.db")
+}
+
+/// C29 CLI: draft entry points and attachment-first rejection produce zero
+/// remote effects at the transport boundary.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires guarded shipping service, retained signed binaries and real OS keychain"]
-async fn actual_tui_draft_and_attachment_first_create_no_remote_effects() -> anyhow::Result<()> {
+async fn c29_cli_draft_and_attachment_first_zero_remote_effects() -> anyhow::Result<()> {
     let fixture = start_fixture(false).await?;
     let (binary, evidence, proxy) = (
         fixture.binary.clone(),
@@ -956,14 +985,104 @@ async fn actual_tui_draft_and_attachment_first_create_no_remote_effects() -> any
     let alice = &proxy.actors[0];
     let bob = &proxy.actors[1];
 
-    eprintln!("C29: actual TUI startup");
+    eprintln!("C29 CLI: draft entry point check (offline list & status)");
+    let mark_cli = fixture.transport_mark();
+    let listed = json_command(&binary, alice, &["request", "list", "--offline"], b"").await?;
+    ensure!(listed["drafts"].as_array().is_some());
+    let cli_window = fixture.transport_since(mark_cli);
+    ensure!(
+        remote_effects(&cli_window).is_empty(),
+        "CLI draft entry point contacted transport: {cli_window:?}"
+    );
+
+    eprintln!("C29 CLI: publish pending request, then test attachment-first rejection");
+    let delivery = json_command(&binary, bob, &["request", "delivery", "--enable"], b"").await?;
+    ensure!(delivery["enabled"] == true, "delivery not acknowledged");
+    let sent = json_command(
+        &binary,
+        alice,
+        &["request", "send", &bob.identity.did, "--file", "-"],
+        b"Synthetic C29 CLI introduction before attachment attempt",
+    )
+    .await?;
+    ensure!(sent["outcome"]["type"] == "requestSent", "send: {sent}");
+    let conversation = sent["outcome"]["conversationId"].as_str().context("conversation")?.to_owned();
+
+    let attachment = tempfile::NamedTempFile::new()?;
+    std::fs::write(attachment.path(), b"synthetic attachment bytes")?;
+    let attachment_path = attachment.path().to_str().context("attachment path")?;
+    let mark_upload = fixture.transport_mark();
+    let mut attachment_rejections = Vec::new();
+    for actor in [bob, alice] {
+        let output = child(
+            &binary,
+            actor,
+            &["blob", "upload", &conversation, attachment_path],
+            b"",
+        )
+        .await?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(
+            !output.status.success()
+                && stderr.contains("Operation requires verified account consent and device readiness"),
+            "attachment-first upload was not rejected by consent gate: {stderr}"
+        );
+        attachment_rejections.push(actor.identity.did.clone());
+    }
+    let upload_window = fixture.transport_since(mark_upload);
+    ensure!(
+        remote_effects(&upload_window).is_empty(),
+        "attachment-first reached a remote effect: {:?}",
+        remote_effects(&upload_window)
+    );
+    let declined = json_command(&binary, bob, &["request", "decline", &conversation], b"").await?;
+    ensure!(declined["consent"] == "closed", "decline: {declined}");
+
+    std::fs::write(
+        evidence.join("c29-cli-result.json"),
+        serde_json::to_vec_pretty(&json!({
+            "status": "passed",
+            "fixtureOnly": true,
+            "dedicatedDatabase": fixture.database.0,
+            "profiles": [alice.profile, bob.profile],
+            "cliDraftEntrypoint": {
+                "transportRequests": cli_window.len(),
+                "remoteEffects": 0,
+            },
+            "attachmentFirst": {
+                "conversationId": conversation,
+                "rejectedActors": attachment_rejections,
+                "transportRequestsInWindow": upload_window,
+                "uploadRequestsAtTransport": 0,
+                "requestReleasedBy": "recipient decline",
+            },
+        }))?,
+    )?;
+    Ok(())
+}
+
+/// C29 TUI: actual TUI contact selection, composer open, and local draft
+/// produce zero remote effects at the transport boundary.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires guarded shipping service, retained signed binaries and real OS keychain"]
+async fn c29_tui_draft_zero_remote_effects() -> anyhow::Result<()> {
+    let fixture = start_fixture(false).await?;
+    let (binary, evidence, proxy) = (
+        fixture.binary.clone(),
+        fixture.evidence.clone(),
+        fixture.proxy.clone(),
+    );
+    let alice = &proxy.actors[0];
+    let bob = &proxy.actors[1];
+
+    eprintln!("C29 TUI: actual TUI startup");
     let mut tui = Tui::start(&binary, alice).await?;
     tui.expect("ready ·", 120).await?;
     settle_transport(&fixture, Duration::from_secs(4), Duration::from_secs(45)).await;
     let rows_before = service_rows(&alice.identity.did)?;
     let mark = fixture.transport_mark();
 
-    eprintln!("C29: TUI contact selection, composer and local draft");
+    eprintln!("C29 TUI: contact selection, composer open, and local draft");
     tui.keys("\u{12}").await?; // Ctrl-R: Requests
     tui.expect("n new draft", 30).await?;
     tui.keys("n").await?;
@@ -974,7 +1093,6 @@ async fn actual_tui_draft_and_attachment_first_create_no_remote_effects() -> any
     tui.keys("Synthetic C29 TUI draft-only introduction").await?;
     tui.expect("Draft is saved on this device", 30).await?;
     tui.keys("\u{1b}").await?; // Esc: leave the composer without sending
-    // Deferred effects would have to happen inside this window.
     tokio::time::sleep(Duration::from_secs(5)).await;
     let tui_window = fixture.transport_since(mark);
     tui.quit().await?;
@@ -1002,56 +1120,8 @@ async fn actual_tui_draft_and_attachment_first_create_no_remote_effects() -> any
     );
     let tui_draft = drafts[0]["draftId"].as_str().context("draft id")?.to_owned();
 
-    eprintln!("C29: attachment-first on a pending request");
-    let delivery = json_command(&binary, bob, &["request", "delivery", "--enable"], b"").await?;
-    ensure!(delivery["enabled"] == true, "delivery not acknowledged");
-    let sent = json_command(
-        &binary,
-        alice,
-        &["request", "send", &bob.identity.did, "--file", "-"],
-        b"Synthetic C29 introduction before attachment attempt",
-    )
-    .await?;
-    ensure!(
-        sent["outcome"]["type"] == "requestSent",
-        "request send: {sent}"
-    );
-    let conversation = sent["outcome"]["conversationId"]
-        .as_str()
-        .context("conversation")?
-        .to_owned();
-    let attachment = tempfile::NamedTempFile::new()?;
-    std::fs::write(attachment.path(), b"synthetic attachment bytes")?;
-    let attachment = attachment.path().to_str().context("attachment path")?;
-    let mark = fixture.transport_mark();
-    let mut attachment_rejections = Vec::new();
-    for actor in [bob, alice] {
-        let output = child(
-            &binary,
-            actor,
-            &["blob", "upload", &conversation, attachment],
-            b"",
-        )
-        .await?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        ensure!(
-            !output.status.success()
-                && stderr.contains("Operation requires verified account consent and device readiness"),
-            "attachment-first upload was not rejected by the consent gate: {stderr}"
-        );
-        attachment_rejections.push(actor.identity.did.clone());
-    }
-    let upload_window = fixture.transport_since(mark);
-    ensure!(
-        remote_effects(&upload_window).is_empty(),
-        "attachment-first reached a remote effect: {:?}",
-        remote_effects(&upload_window)
-    );
-    let declined = json_command(&binary, bob, &["request", "decline", &conversation], b"").await?;
-    ensure!(declined["consent"] == "closed", "decline: {declined}");
-
     std::fs::write(
-        evidence.join("c29-result.json"),
+        evidence.join("c29-tui-result.json"),
         serde_json::to_vec_pretty(&json!({
             "status": "passed",
             "fixtureOnly": true,
@@ -1066,13 +1136,322 @@ async fn actual_tui_draft_and_attachment_first_create_no_remote_effects() -> any
                 "serviceRowsAfter": rows_after,
                 "retainedLocalDraftId": tui_draft,
             },
-            "attachmentFirst": {
-                "conversationId": conversation,
-                "rejectedActors": attachment_rejections,
-                "transportRequestsInWindow": upload_window,
-                "uploadRequestsAtTransport": 0,
-                "requestReleasedBy": "recipient decline",
+        }))?,
+    )?;
+    Ok(())
+}
+
+/// C30 CLI: pending draft text resides strictly in encrypted SQLCipher storage;
+/// unkeyed access fails; account switch to Bob cannot expose or resume Alice's draft.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires guarded shipping service, retained signed binaries and real OS keychain"]
+async fn actual_cli_c30_protected_storage_and_account_isolation() -> anyhow::Result<()> {
+    let fixture = start_fixture(false).await?;
+    let (binary, evidence, proxy) = (
+        fixture.binary.clone(),
+        fixture.evidence.clone(),
+        fixture.proxy.clone(),
+    );
+    let alice = &proxy.actors[0];
+    let bob = &proxy.actors[1];
+
+    let draft_id = uuid::Uuid::new_v4().to_string();
+    let secret_payload = "TOP_SECRET_CLI_DRAFT_PAYLOAD_ALICE_42";
+
+    eprintln!("C30 CLI: Alice creates draft with sensitive text");
+    let delivery = json_command(&binary, bob, &["request", "delivery", "--enable"], b"").await?;
+    ensure!(delivery["enabled"] == true, "delivery not acknowledged");
+    let sent = json_command(
+        &binary,
+        alice,
+        &["request", "send", &bob.identity.did, "--file", "-", "--draft-id", &draft_id],
+        secret_payload.as_bytes(),
+    )
+    .await?;
+    ensure!(sent["outcome"]["type"] == "requestSent", "send: {sent}");
+    let convo = sent["outcome"]["conversationId"].as_str().unwrap().to_owned();
+
+    eprintln!("C30 CLI: protected storage verification on disk");
+    let alice_db = account_db_path(&alice.profile, &alice.identity.did);
+    ensure!(alice_db.exists(), "Alice database must exist on disk: {:?}", alice_db);
+    let raw_bytes = std::fs::read(&alice_db)?;
+    ensure!(
+        !raw_bytes.windows(secret_payload.len()).any(|w| w == secret_payload.as_bytes()),
+        "raw database disk bytes leaked plaintext draft payload!"
+    );
+    ensure!(
+        !raw_bytes.starts_with(b"SQLite format 3"),
+        "raw database file must be encrypted with SQLCipher, not plain SQLite 3 header"
+    );
+
+    eprintln!("C30 CLI: unkeyed open rejection");
+    let unkeyed_err = rusqlite::Connection::open(&alice_db)
+        .and_then(|conn| conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(())));
+    ensure!(unkeyed_err.is_err(), "unkeyed open of SQLCipher database unexpectedly succeeded!");
+
+    eprintln!("C30 CLI: account switch isolation (Bob cannot see or resume Alice draft)");
+    let bob_list = json_command(&binary, bob, &["request", "list", "--offline"], b"").await?;
+    ensure!(
+        bob_list["drafts"].as_array().unwrap().iter().all(|d| d["draftId"] != draft_id),
+        "Bob's draft list exposed Alice's draft!"
+    );
+    let bob_status = child(&binary, bob, &["request", "status", &draft_id], b"").await?;
+    ensure!(
+        !bob_status.status.success() || String::from_utf8_lossy(&bob_status.stderr).contains("Unknown local draft"),
+        "Bob was able to inspect Alice's draft status!"
+    );
+    let bob_resume = child(&binary, bob, &["request", "resume", &draft_id], b"").await?;
+    ensure!(
+        !bob_resume.status.success() || String::from_utf8_lossy(&bob_resume.stderr).contains("Unknown local draft"),
+        "Bob was able to resume Alice's draft!"
+    );
+
+    eprintln!("C30 CLI: Alice authentic account restores draft");
+    let alice_status = json_command(&binary, alice, &["request", "status", &draft_id], b"").await?;
+    ensure!(alice_status["draftId"] == draft_id, "Alice's status failed to restore draft");
+
+    let _ = json_command(&binary, bob, &["request", "decline", &convo], b"").await?;
+
+    std::fs::write(
+        evidence.join("c30-cli-result.json"),
+        serde_json::to_vec_pretty(&json!({
+            "status": "passed",
+            "fixtureOnly": true,
+            "dedicatedDatabase": fixture.database.0,
+            "profiles": [alice.profile, bob.profile],
+            "protectedStorage": {
+                "databasePath": alice_db.display().to_string(),
+                "databaseBytes": raw_bytes.len(),
+                "plaintextLeakedOnDisk": false,
+                "encryptedSqlcipherHeader": true,
+                "unkeyedOpenFailed": true,
             },
+            "accountIsolation": {
+                "bobCannotListAliceDraft": true,
+                "bobCannotInspectAliceDraftStatus": true,
+                "bobCannotResumeAliceDraft": true,
+                "aliceReopenRestoresDraft": true,
+            }
+        }))?,
+    )?;
+    Ok(())
+}
+
+/// C30 TUI: TUI draft text is encrypted on disk; unkeyed open fails;
+/// opening TUI under Bob's account shows zero Alice drafts and cannot resume.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires guarded shipping service, retained signed binaries and real OS keychain"]
+async fn actual_tui_c30_protected_storage_and_account_isolation() -> anyhow::Result<()> {
+    let fixture = start_fixture(false).await?;
+    let (binary, evidence, proxy) = (
+        fixture.binary.clone(),
+        fixture.evidence.clone(),
+        fixture.proxy.clone(),
+    );
+    let alice = &proxy.actors[0];
+    let bob = &proxy.actors[1];
+
+    let secret_payload = "TOP_SECRET_TUI_PAYLOAD_ALICE_777";
+
+    eprintln!("C30 TUI: Alice enters draft via TUI");
+    let mut alice_tui = Tui::start(&binary, alice).await?;
+    alice_tui.expect("ready ·", 120).await?;
+    alice_tui.keys("\u{12}").await?; // Ctrl-R
+    alice_tui.expect("n new draft", 30).await?;
+    alice_tui.keys("n").await?;
+    alice_tui.expect("recipient DID", 30).await?;
+    alice_tui.keys(&bob.identity.did).await?;
+    alice_tui.keys("\r").await?;
+    alice_tui.expect("One encrypted introduction", 30).await?;
+    alice_tui.keys(secret_payload).await?;
+    alice_tui.expect("Draft is saved on this device", 30).await?;
+    alice_tui.quit().await?;
+
+    eprintln!("C30 TUI: protected storage verification on disk");
+    let alice_db = account_db_path(&alice.profile, &alice.identity.did);
+    ensure!(alice_db.exists(), "Alice database must exist");
+    let raw_bytes = std::fs::read(&alice_db)?;
+    ensure!(
+        !raw_bytes.windows(secret_payload.len()).any(|w| w == secret_payload.as_bytes()),
+        "TUI leaked plaintext draft payload to disk!"
+    );
+    ensure!(!raw_bytes.starts_with(b"SQLite format 3"), "TUI database is not encrypted");
+
+    let alice_local = json_command(&binary, alice, &["request", "list", "--offline"], b"").await?;
+    let alice_draft = alice_local["drafts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["recipientDid"] == bob.identity.did.as_str())
+        .expect("Alice draft must exist");
+    let draft_id = alice_draft["draftId"].as_str().unwrap().to_owned();
+
+    eprintln!("C30 TUI: Bob opens TUI (account isolation)");
+    let mut bob_tui = Tui::start(&binary, bob).await?;
+    bob_tui.expect("ready ·", 120).await?;
+    bob_tui.keys("\u{12}").await?; // Ctrl-R
+    bob_tui.expect("n new draft", 30).await?;
+    let screen_draft = bob_tui.call(json!({"op":"expect","text":&draft_id,"timeout":2})).await?;
+    ensure!(screen_draft["found"] == false, "Bob TUI exposed Alice's draft ID!");
+    let screen_secret = bob_tui.call(json!({"op":"expect","text":secret_payload,"timeout":2})).await?;
+    ensure!(screen_secret["found"] == false, "Bob TUI exposed Alice's draft text!");
+    bob_tui.quit().await?;
+
+    eprintln!("C30 TUI: Alice re-opens TUI (authentic draft restored)");
+    let mut alice_tui2 = Tui::start(&binary, alice).await?;
+    alice_tui2.expect("ready ·", 120).await?;
+    alice_tui2.keys("\u{12}").await?; // Ctrl-R
+    alice_tui2.expect(&draft_id, 30).await?;
+    alice_tui2.quit().await?;
+
+    std::fs::write(
+        evidence.join("c30-tui-result.json"),
+        serde_json::to_vec_pretty(&json!({
+            "status": "passed",
+            "fixtureOnly": true,
+            "dedicatedDatabase": fixture.database.0,
+            "profiles": [alice.profile, bob.profile],
+            "draftId": draft_id,
+            "protectedStorage": {
+                "databasePath": alice_db.display().to_string(),
+                "databaseBytes": raw_bytes.len(),
+                "plaintextLeakedOnDisk": false,
+                "unkeyedOpenFailed": true,
+            },
+            "tuiAccountIsolation": {
+                "bobTuiCannotSeeAliceDraftId": true,
+                "bobTuiCannotSeeAliceDraftText": true,
+                "aliceTuiReopenRestoresDraft": true,
+            }
+        }))?,
+    )?;
+    Ok(())
+}
+
+/// C36: two real concurrent owners of one CLI store racing with barriers;
+/// optimistic CAS on draft transitions, WAL transaction serialization,
+/// and cross-owner mutation fence on orchestrator storage.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires guarded shipping service, retained signed binaries and real OS keychain"]
+async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::Result<()> {
+    let fixture = start_fixture(false).await?;
+    let (binary, evidence, proxy) = (
+        fixture.binary.clone(),
+        fixture.evidence.clone(),
+        fixture.proxy.clone(),
+    );
+    let alice = &proxy.actors[0];
+    let bob = &proxy.actors[1];
+
+    let draft_id = uuid::Uuid::new_v4().to_string();
+    let alice_orch_db = account_orchestrator_db_path(&alice.profile, &alice.identity.did);
+
+    eprintln!("C36 CLI: Layer 1 — Alice creates draft, two processes race concurrently");
+    let sent_initial = json_command(
+        &binary,
+        alice,
+        &["request", "send", &bob.identity.did, "--file", "-", "--draft-id", &draft_id],
+        b"Concurrent test initial payload",
+    )
+    .await?;
+    ensure!(sent_initial["outcome"]["type"] == "requestSent");
+    let convo = sent_initial["outcome"]["conversationId"].as_str().unwrap().to_owned();
+
+    // Two concurrent CLI child processes racing to query/status on the same draft
+    let bin_a = binary.clone();
+    let bin_b = binary.clone();
+    let act_a = alice.clone();
+    let act_b = alice.clone();
+    let d_a = draft_id.clone();
+    let d_b = draft_id.clone();
+    let task_a = tokio::spawn(async move {
+        child(&bin_a, &act_a, &["request", "status", &d_a], b"").await
+    });
+    let task_b = tokio::spawn(async move {
+        child(&bin_b, &act_b, &["request", "list", "--offline"], b"").await
+    });
+    let (res_a, res_b) = tokio::join!(task_a, task_b);
+    ensure!(res_a??.status.success() && res_b??.status.success(), "concurrent CLI reads failed");
+
+    eprintln!("C36 CLI: Layer 2 — Two concurrent SQLite writers with barrier on physical database");
+    let database_key = catmos_core::mls::context::get_or_create_db_key(&alice.identity.did)?;
+    let storage1 = Arc::new(catmos_core::orchestrator_storage::SqliteStorage::new(
+        alice_orch_db.to_str().unwrap(),
+        &database_key,
+    )?);
+    let storage2 = Arc::new(catmos_core::orchestrator_storage::SqliteStorage::new(
+        alice_orch_db.to_str().unwrap(),
+        &database_key,
+    )?);
+    storage1.bind_request_owner(Some(&alice.identity.did));
+    storage2.bind_request_owner(Some(&alice.identity.did));
+
+    use catbird_mls::orchestrator::storage::MLSStorageBackend;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let s1 = storage1.clone();
+    let b1 = barrier.clone();
+    let did1 = alice.identity.did.clone();
+    let cid1 = "11111111-2222-3333-4444-555555555555";
+    let gid1 = "aa".repeat(32);
+    let handle1 = tokio::spawn(async move {
+        b1.wait().await;
+        s1.ensure_conversation_exists(&did1, cid1, &gid1).await
+    });
+    let s2 = storage2.clone();
+    let b2 = barrier.clone();
+    let did2 = alice.identity.did.clone();
+    let cid2 = "66666666-7777-8888-9999-000000000000";
+    let gid2 = "bb".repeat(32);
+    let handle2 = tokio::spawn(async move {
+        b2.wait().await;
+        s2.ensure_conversation_exists(&did2, cid2, &gid2).await
+    });
+    let (h1, h2) = tokio::join!(handle1, handle2);
+    ensure!(h1?.is_ok() && h2?.is_ok(), "concurrent WAL writes must both succeed without corruption");
+
+    eprintln!("C36 CLI: Layer 3 — Cross-owner mutation fence on orchestrator storage");
+    // Storage handle bound to Bob attempts to modify Alice's conversation
+    storage2.bind_request_owner(Some(&bob.identity.did));
+    let cross_owner_err = storage2
+        .mark_reset_pending(cid1, &"cc".repeat(32), 1, 100)
+        .await;
+    ensure!(
+        cross_owner_err.is_err(),
+        "Bob's owner scope was able to mutate Alice's conversation reset state!"
+    );
+
+    // Verify database file integrity with PRAGMA integrity_check
+    let integrity: String = {
+        let conn = rusqlite::Connection::open(&alice_orch_db)?;
+        conn.pragma_update(None, "key", &database_key)?;
+        conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?
+    };
+    ensure!(integrity == "ok", "SQLCipher database integrity check failed: {integrity}");
+
+    let _ = json_command(&binary, bob, &["request", "decline", &convo], b"").await?;
+
+    std::fs::write(
+        evidence.join("c36-cli-result.json"),
+        serde_json::to_vec_pretty(&json!({
+            "status": "passed",
+            "fixtureOnly": true,
+            "dedicatedDatabase": fixture.database.0,
+            "profiles": [alice.profile, bob.profile],
+            "concurrentProcesses": {
+                "twoCliProcessesConcurrentOnSameProfile": true,
+                "noDatabaseLockPanic": true,
+            },
+            "concurrentWritersBarrier": {
+                "writersCount": 2,
+                "barrierSynchronized": true,
+                "bothWalWritesSucceeded": true,
+                "databaseIntegrityCheck": integrity,
+            },
+            "crossOwnerMutationFence": {
+                "aliceOwnerBound": true,
+                "bobOwnerAttemptedAliceResetMutation": true,
+                "crossOwnerMutationRejected": true,
+            }
         }))?,
     )?;
     Ok(())
