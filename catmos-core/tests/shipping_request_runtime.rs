@@ -1377,7 +1377,13 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
     ensure!(res_a??.status.success() && res_b??.status.success(), "concurrent CLI reads failed");
 
     eprintln!("C36 CLI: Layer 2 — Two concurrent SQLite writers with barrier on physical database");
-    let database_key = catmos_core::mls::context::get_or_create_db_key(&alice.identity.did)?;
+    let database_key = {
+        let service = format!("catmos-mls-db.profile.{}", alice.profile);
+        let entry = keyring::Entry::new(&service, &alice.identity.did)
+            .map_err(|e| anyhow::anyhow!("keyring entry error: {e}"))?;
+        entry.get_password()
+            .map_err(|e| anyhow::anyhow!("keyring get_password error: {e}"))?
+    };
     let storage1 = Arc::new(catmos_core::orchestrator_storage::SqliteStorage::new(
         alice_orch_db.to_str().unwrap(),
         &database_key,
