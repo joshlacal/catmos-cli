@@ -1200,10 +1200,11 @@ async fn actual_cli_c30_protected_storage_and_account_isolation() -> anyhow::Res
         !bob_status.status.success() || String::from_utf8_lossy(&bob_status.stderr).contains("Unknown local draft"),
         "Bob was able to inspect Alice's draft status!"
     );
-    let bob_resume = child(&binary, bob, &["request", "resume", &draft_id], b"").await?;
+    let bob_resume = json_command(&binary, bob, &["request", "resume", &draft_id], b"").await?;
     ensure!(
-        !bob_resume.status.success() || String::from_utf8_lossy(&bob_resume.stderr).contains("Unknown local draft"),
-        "Bob was able to resume Alice's draft!"
+        bob_resume["status"] == "unconfirmed"
+            && bob_resume["error"].as_str().is_some_and(|e| e.contains("Unknown local request draft")),
+        "Bob was able to resume Alice's draft: {bob_resume}"
     );
 
     eprintln!("C30 CLI: Alice authentic account restores draft");
@@ -1423,8 +1424,8 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
     // Verify database file integrity with PRAGMA integrity_check
     let integrity: String = {
         let conn = rusqlite::Connection::open(&alice_orch_db)?;
-        conn.pragma_update(None, "key", &database_key)?;
-        conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?
+        conn.execute_batch(&format!("PRAGMA key = '{database_key}';"))?;
+        conn.query_row("PRAGMA integrity_check;", [], |r| r.get(0))?
     };
     ensure!(integrity == "ok", "SQLCipher database integrity check failed: {integrity}");
 
