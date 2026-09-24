@@ -1471,6 +1471,7 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
     let did_same = alice.identity.did.clone();
     let cid_same = "11111111-2222-3333-4444-555555555555";
     let gid_same = "aa".repeat(32);
+    let target1 = "bb".repeat(32);
     s1.ensure_conversation_exists(&did_same, cid_same, &gid_same).await?;
     s1.mark_reset_pending(cid_same, &target1, 2, 200).await?;
 
