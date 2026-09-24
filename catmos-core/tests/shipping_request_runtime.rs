@@ -1347,6 +1347,8 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
     let draft_id = uuid::Uuid::new_v4().to_string();
     let alice_orch_db = account_orchestrator_db_path(&alice.profile, &alice.identity.did);
 
+    let delivery = json_command(&binary, bob, &["request", "delivery", "--enable"], b"").await?;
+    ensure!(delivery["enabled"] == true, "delivery not acknowledged");
     eprintln!("C36 CLI: Layer 1 — Alice creates draft, two processes race concurrently");
     let sent_initial = json_command(
         &binary,
