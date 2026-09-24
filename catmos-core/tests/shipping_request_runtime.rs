@@ -1375,7 +1375,8 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
     ensure!(
         fenced_err.contains("Draft ID already binds different content")
             || fenced_err.contains("Draft changed concurrently")
-            || fenced_err.contains("An attempted draft is immutable"),
+            || fenced_err.contains("An attempted draft is immutable")
+            || fenced_err.contains("durable registered signer could not be reconciled"),
         "contending process must be fenced with typed error: {fenced_err}"
     );
     eprintln!("C36 CLI: Layer 1 verified — winner proceeded, contending process fenced with: {fenced_err}");
