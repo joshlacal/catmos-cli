@@ -1472,27 +1472,27 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
     let cid_same = "11111111-2222-3333-4444-555555555555";
     let gid_same = "aa".repeat(32);
     s1.ensure_conversation_exists(&did_same, cid_same, &gid_same).await?;
+    s1.mark_reset_pending(cid_same, &target1, 2, 200).await?;
 
     // Both writers attempt to mutate the SAME conversation simultaneously across barrier
     let s1_clone = storage1.clone();
     let b1_clone = barrier.clone();
-    let target1 = "bb".repeat(32);
-    let target2 = "cc".repeat(32);
-    let target1_val = target1.clone();
+    let target3 = "dd".repeat(32);
+    let target_stale = "ee".repeat(32);
     let h1 = tokio::spawn(async move {
         b1_clone.wait().await;
-        s1_clone.mark_reset_pending(cid_same, &target1_val, 2, 200).await
+        s1_clone.mark_reset_pending(cid_same, &target3, 3, 300).await
     });
     let s2_clone = storage2.clone();
     let b2_clone = barrier.clone();
     let h2 = tokio::spawn(async move {
         b2_clone.wait().await;
-        s2_clone.mark_reset_pending(cid_same, &target2, 1, 100).await
+        s2_clone.mark_reset_pending(cid_same, &target_stale, 2, 200).await
     });
     let (res_h1, res_h2) = tokio::join!(h1, h2);
     let (out_h1, out_h2) = (res_h1?, res_h2?);
-    ensure!(out_h1.is_ok(), "Writer 1 (gen 2) must succeed");
-    ensure!(out_h2.is_err(), "Writer 2 (gen 1) must be fenced as stale authority: {out_h2:?}");
+    ensure!(out_h1.is_ok(), "Writer 1 (gen 3) must succeed");
+    ensure!(out_h2.is_err(), "Writer 2 (conflicting target at gen 2) must be fenced as stale authority: {out_h2:?}");
     let stale_msg = out_h2.unwrap_err().to_string();
     ensure!(stale_msg.contains("stale or conflicting reset authority"), "fenced with typed error: {stale_msg}");
 
