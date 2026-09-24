@@ -82,7 +82,7 @@ impl SqliteStorage {
         Ok(storage)
     }
 
-    pub(crate) fn bind_request_owner(&self, owner: Option<&str>) {
+    pub fn bind_request_owner(&self, owner: Option<&str>) {
         if let Ok(mut scope) = self.request_owner.write() {
             *scope = owner.map(str::to_owned);
         }
