@@ -1333,6 +1333,8 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
     let alice = &proxy.actors[0];
     let bob = &proxy.actors[1];
 
+    let delivery = json_command(&binary, bob, &["request", "delivery", "--enable"], b"").await?;
+    ensure!(delivery["enabled"] == true, "delivery not acknowledged");
     let draft_id = uuid::Uuid::new_v4().to_string();
     let args1 = [
         "request",
