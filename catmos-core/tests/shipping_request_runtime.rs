@@ -1391,6 +1391,7 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
             .map_err(|e| anyhow::anyhow!("keyring get_password error: {e}"))?
     };
     let db = catmos_core::storage::db::Database::open(&alice_db_path, &database_key).await?;
+    db.set_content_root_key(vec![0x42; 32]);
 
     let test_draft_id = uuid::Uuid::new_v4().to_string();
     let initial_draft = catmos_core::chat::requests::RequestDraft {
