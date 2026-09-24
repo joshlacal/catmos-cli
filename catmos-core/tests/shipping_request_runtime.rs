@@ -1277,6 +1277,10 @@ async fn actual_tui_c30_protected_storage_and_account_isolation() -> anyhow::Res
         "TUI leaked plaintext draft payload to disk!"
     );
     ensure!(!raw_bytes.starts_with(b"SQLite format 3"), "TUI database is not encrypted");
+    eprintln!("C30 TUI: unkeyed open rejection");
+    let unkeyed_err = rusqlite::Connection::open(&alice_db)
+        .and_then(|conn| conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(())));
+    ensure!(unkeyed_err.is_err(), "unkeyed open of SQLCipher database unexpectedly succeeded!");
 
     let alice_local = json_command(&binary, alice, &["request", "list", "--offline"], b"").await?;
     let alice_draft = alice_local["drafts"]
@@ -1349,34 +1353,111 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
 
     let delivery = json_command(&binary, bob, &["request", "delivery", "--enable"], b"").await?;
     ensure!(delivery["enabled"] == true, "delivery not acknowledged");
-    eprintln!("C36 CLI: Layer 1 — Alice creates draft, two processes race concurrently");
-    let sent_initial = json_command(
+    eprintln!("C36 CLI: Layer 1 — Two mutating CLI processes contend on ONE request state");
+    let sent_a_fut = child(
         &binary,
         alice,
         &["request", "send", &bob.identity.did, "--file", "-", "--draft-id", &draft_id],
-        b"Concurrent test initial payload",
-    )
-    .await?;
-    ensure!(sent_initial["outcome"]["type"] == "requestSent");
-    let convo = sent_initial["outcome"]["conversationId"].as_str().unwrap().to_owned();
+        b"Payload Alpha",
+    );
+    let sent_b_fut = child(
+        &binary,
+        alice,
+        &["request", "send", &bob.identity.did, "--file", "-", "--draft-id", &draft_id],
+        b"Payload Beta (contending conflict)",
+    );
+    let (res_a, res_b) = tokio::join!(sent_a_fut, sent_b_fut);
+    let out_a = res_a?;
+    let out_b = res_b?;
+    let (winner, fenced) = if out_a.status.success() {
+        (out_a, out_b)
+    } else {
+        (out_b, out_a)
+    };
+    ensure!(winner.status.success(), "one mutating CLI process must succeed");
+    let winner_json: Value = serde_json::from_slice(&winner.stdout)?;
+    ensure!(winner_json["outcome"]["type"] == "requestSent", "winner outcome: {winner_json}");
+    let convo = winner_json["outcome"]["conversationId"].as_str().unwrap().to_owned();
 
-    // Two concurrent CLI child processes racing to query/status on the same draft
-    let bin_a = binary.clone();
-    let bin_b = binary.clone();
-    let act_a = alice.clone();
-    let act_b = alice.clone();
-    let d_a = draft_id.clone();
-    let d_b = draft_id.clone();
-    let task_a = tokio::spawn(async move {
-        child(&bin_a, &act_a, &["request", "status", &d_a], b"").await
-    });
-    let task_b = tokio::spawn(async move {
-        child(&bin_b, &act_b, &["request", "list", "--offline"], b"").await
-    });
-    let (res_a, res_b) = tokio::join!(task_a, task_b);
-    ensure!(res_a??.status.success() && res_b??.status.success(), "concurrent CLI reads failed");
+    ensure!(!fenced.status.success(), "the contending mutating process must not succeed concurrently");
+    let fenced_err = String::from_utf8_lossy(&fenced.stderr).trim().to_string();
+    ensure!(
+        fenced_err.contains("Draft ID already binds different content")
+            || fenced_err.contains("Draft changed concurrently")
+            || fenced_err.contains("An attempted draft is immutable"),
+        "contending process must be fenced with typed error: {fenced_err}"
+    );
+    eprintln!("C36 CLI: Layer 1 verified — winner proceeded, contending process fenced with: {fenced_err}");
 
-    eprintln!("C36 CLI: Layer 2 — Two concurrent SQLite writers with barrier on physical database");
+    eprintln!("C36 CLI: Layer 2 — CAS draft mutation fence and counterfactual proof without fence");
+    let alice_db_path = account_db_path(&alice.profile, &alice.identity.did);
+    let database_key = {
+        let service = format!("catmos-mls-db.profile.{}", alice.profile);
+        let entry = keyring::Entry::new(&service, &alice.identity.did)
+            .map_err(|e| anyhow::anyhow!("keyring entry error: {e}"))?;
+        entry.get_password()
+            .map_err(|e| anyhow::anyhow!("keyring get_password error: {e}"))?
+    };
+    let db = catmos_core::storage::db::Database::open(&alice_db_path, &database_key).await?;
+
+    let test_draft_id = uuid::Uuid::new_v4().to_string();
+    let initial_draft = catmos_core::chat::requests::RequestDraft {
+        owner_did: alice.identity.did.clone(),
+        input: catbird_mls::DirectRequestInput {
+            draft_id: test_draft_id.clone(),
+            recipient_did: bob.identity.did.clone(),
+            text: "Initial draft text".into(),
+            invitation: None,
+        },
+        attempted: false,
+        outcome: None,
+        note_started: false,
+        note_message_id: None,
+    };
+    db.create_request_draft(&initial_draft).await?;
+    let (mut draft_v1, raw0) = db.read_request_draft(&alice.identity.did, &test_draft_id).await?.unwrap();
+    let mut draft_v2 = draft_v1.clone();
+
+    draft_v1.input.text = "Mutation from Worker 1".into();
+    draft_v2.input.text = "Mutation from Worker 2 (conflicting)".into();
+
+    // Worker 1 replaces draft with expected raw0 -> SUCCEEDS
+    let _raw1 = db.replace_request_draft(&draft_v1, &raw0).await?;
+
+    // Worker 2 attempts to replace draft with stale expected raw0 -> FENCED with typed error!
+    let fence_err = db.replace_request_draft(&draft_v2, &raw0).await;
+    ensure!(
+        matches!(&fence_err, Err(catmos_core::error::CatmosError::Storage(msg)) if msg.contains("Draft changed concurrently")),
+        "Worker 2 must be fenced with 'Draft changed concurrently': {fence_err:?}"
+    );
+
+    // Verify Worker 1's write is intact in the database
+    let (current, _) = db.read_request_draft(&alice.identity.did, &test_draft_id).await?.unwrap();
+    ensure!(current.input.text == "Mutation from Worker 1", "Worker 1's write must be preserved");
+
+    // Counterfactual proof: show it FAILS WITHOUT THE FENCE (lost update anomaly)
+    let temp_unfenced_id = uuid::Uuid::new_v4().to_string();
+    let mut temp_draft = draft_v2.clone();
+    temp_draft.input.draft_id = temp_unfenced_id.clone();
+    db.create_request_draft(&temp_draft).await?;
+    let (_, raw_v2_blind) = db.read_request_draft(&alice.identity.did, &temp_unfenced_id).await?.unwrap();
+
+    let pool = db.pool_for_test();
+    let changed = sqlx::query("UPDATE request_drafts SET protected=? WHERE owner_did=? AND draft_id=?")
+        .bind(&raw_v2_blind)
+        .bind(&alice.identity.did)
+        .bind(&test_draft_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    ensure!(changed == 1, "unfenced update succeeds blindly");
+
+    // Observe lost update: Worker 1's write was silently clobbered by the unfenced write!
+    let (clobbered, _) = db.read_request_draft(&alice.identity.did, &test_draft_id).await?.unwrap();
+    ensure!(clobbered.input.text == "Mutation from Worker 2 (conflicting)", "unfenced write blindly clobbered Worker 1");
+    eprintln!("C36 CLI: Layer 2 verified — CAS fence rejected Worker 2 with typed error; unfenced update caused lost update anomaly");
+
+    eprintln!("C36 CLI: Layer 3 — Two concurrent writers on the SAME conversation with barrier");
     let temp_storage_dir = tempfile::tempdir()?;
     let shared_orch_path = temp_storage_dir.path().join("concurrent_orch.db");
     let test_key = "c36-concurrent-storage-key-secret-32b!";
@@ -1394,38 +1475,43 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
     use catbird_mls::orchestrator::storage::MLSStorageBackend;
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let s1 = storage1.clone();
-    let b1 = barrier.clone();
-    let did1 = alice.identity.did.clone();
-    let cid1 = "11111111-2222-3333-4444-555555555555";
-    let gid1 = "aa".repeat(32);
-    let handle1 = tokio::spawn(async move {
-        b1.wait().await;
-        s1.ensure_conversation_exists(&did1, cid1, &gid1).await
-    });
-    let s2 = storage2.clone();
-    let b2 = barrier.clone();
-    let did2 = alice.identity.did.clone();
-    let cid2 = "66666666-7777-8888-9999-000000000000";
-    let gid2 = "bb".repeat(32);
-    let handle2 = tokio::spawn(async move {
-        b2.wait().await;
-        s2.ensure_conversation_exists(&did2, cid2, &gid2).await
-    });
-    let (h1, h2) = tokio::join!(handle1, handle2);
-    ensure!(h1?.is_ok() && h2?.is_ok(), "concurrent WAL writes must both succeed without corruption");
+    let did_same = alice.identity.did.clone();
+    let cid_same = "11111111-2222-3333-4444-555555555555";
+    let gid_same = "aa".repeat(32);
+    s1.ensure_conversation_exists(&did_same, cid_same, &gid_same).await?;
 
-    eprintln!("C36 CLI: Layer 3 — Cross-owner mutation fence on orchestrator storage");
-    // Storage handle bound to Bob attempts to modify Alice's conversation
+    // Both writers attempt to mutate the SAME conversation simultaneously across barrier
+    let s1_clone = storage1.clone();
+    let b1_clone = barrier.clone();
+    let target1 = "bb".repeat(32);
+    let target2 = "cc".repeat(32);
+    let h1 = tokio::spawn(async move {
+        b1_clone.wait().await;
+        s1_clone.mark_reset_pending(cid_same, &target1, 2, 200).await
+    });
+    let s2_clone = storage2.clone();
+    let b2_clone = barrier.clone();
+    let h2 = tokio::spawn(async move {
+        b2_clone.wait().await;
+        s2_clone.mark_reset_pending(cid_same, &target2, 1, 100).await
+    });
+    let (res_h1, res_h2) = tokio::join!(h1, h2);
+    let (out_h1, out_h2) = (res_h1?, res_h2?);
+    ensure!(out_h1.is_ok(), "Writer 1 (gen 2) must succeed");
+    ensure!(out_h2.is_err(), "Writer 2 (gen 1) must be fenced as stale authority: {out_h2:?}");
+    let stale_msg = out_h2.unwrap_err().to_string();
+    ensure!(stale_msg.contains("stale or conflicting reset authority"), "fenced with typed error: {stale_msg}");
+
+    eprintln!("C36 CLI: Layer 4 — Cross-owner mutation fence on orchestrator storage");
     storage2.bind_request_owner(Some(&bob.identity.did));
     let cross_owner_err = storage2
-        .mark_reset_pending(cid1, &"cc".repeat(32), 1, 100)
+        .mark_reset_pending(cid_same, &target1, 3, 300)
         .await;
     ensure!(
         cross_owner_err.is_err(),
         "Bob's owner scope was able to mutate Alice's conversation reset state!"
     );
 
-    // Verify database file integrity with PRAGMA integrity_check
     let integrity: String = {
         let conn = rusqlite::Connection::open(&shared_orch_path)?;
         conn.execute_batch(&format!("PRAGMA key = '{test_key}';"))?;
@@ -1442,17 +1528,25 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
             "fixtureOnly": true,
             "dedicatedDatabase": fixture.database.0,
             "profiles": [alice.profile, bob.profile],
-            "concurrentProcesses": {
-                "twoCliProcessesConcurrentOnSameProfile": true,
-                "noDatabaseLockPanic": true,
+            "layer1_concurrentMutatingProcesses": {
+                "process1": "request send draft_id Payload Alpha",
+                "process2": "request send draft_id Payload Beta",
+                "winner": "proceeded with requestSent",
+                "fencedError": fenced_err,
             },
-            "concurrentWritersBarrier": {
-                "writersCount": 2,
+            "layer2_casDraftFenceAndCounterfactual": {
+                "worker1Replace": "succeeded with rows_affected=1",
+                "worker2Fenced": "rejected with typed error Draft changed concurrently; reload before retry",
+                "counterfactualWithoutFence": "unfenced update silently clobbered committed state (lost update anomaly)",
+            },
+            "layer3_sameConversationBarrierWriters": {
+                "targetConversation": cid_same,
                 "barrierSynchronized": true,
-                "bothWalWritesSucceeded": true,
+                "writer1Gen2": "succeeded",
+                "writer2Gen1": "fenced with typed error stale or conflicting reset authority",
                 "databaseIntegrityCheck": integrity,
             },
-            "crossOwnerMutationFence": {
+            "layer4_crossOwnerMutationFence": {
                 "aliceOwnerBound": true,
                 "bobOwnerAttemptedAliceResetMutation": true,
                 "crossOwnerMutationRejected": true,
