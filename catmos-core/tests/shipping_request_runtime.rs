@@ -1429,12 +1429,12 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
     ensure!(current.input.text == "Mutation from Worker 1", "Worker 1's write must be preserved");
 
     // Counterfactual proof: show it FAILS WITHOUT THE FENCE (lost update anomaly)
-    let temp_unfenced_id = uuid::Uuid::new_v4().to_string();
-    let mut temp_draft = draft_v2.clone();
-    temp_draft.input.draft_id = temp_unfenced_id.clone();
-    db.create_request_draft(&temp_draft).await?;
-    let (_, raw_v2_blind) = db.read_request_draft(&alice.identity.did, &temp_unfenced_id).await?.unwrap();
-
+    let raw_v2_blind = {
+        let domain = format!("request-draft/v2/{}/{}", alice.identity.did, test_draft_id);
+        let serialized = serde_json::to_vec(&draft_v2)?;
+        catbird_mls::field_encryption::encrypt_payload(&[0x42; 32], &domain, &serialized)
+            .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?
+    };
     let pool = db.pool_for_test();
     let changed = sqlx::query("UPDATE request_drafts SET protected=? WHERE owner_did=? AND draft_id=?")
         .bind(&raw_v2_blind)
