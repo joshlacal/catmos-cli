@@ -956,21 +956,6 @@ fn account_db_path(profile: &str, did: &str) -> PathBuf {
         .join("catmos.db")
 }
 
-fn account_orchestrator_db_path(profile: &str, did: &str) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(did.as_bytes());
-    let hash = hex::encode(hasher.finalize());
-    dirs::data_dir()
-        .unwrap()
-        .join("catmos-cli")
-        .join("profiles")
-        .join(profile)
-        .join("accounts")
-        .join(&hash[..16])
-        .join("orchestrator.db")
-}
-
 /// C29 CLI: draft entry points and attachment-first rejection produce zero
 /// remote effects at the transport boundary.
 #[tokio::test(flavor = "multi_thread")]
@@ -1349,24 +1334,28 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
     let bob = &proxy.actors[1];
 
     let draft_id = uuid::Uuid::new_v4().to_string();
-    let alice_orch_db = account_orchestrator_db_path(&alice.profile, &alice.identity.did);
-
-    let delivery = json_command(&binary, bob, &["request", "delivery", "--enable"], b"").await?;
-    ensure!(delivery["enabled"] == true, "delivery not acknowledged");
-    eprintln!("C36 CLI: Layer 1 — Two mutating CLI processes contend on ONE request state");
-    let sent_a_fut = child(
-        &binary,
-        alice,
-        &["request", "send", &bob.identity.did, "--file", "-", "--draft-id", &draft_id],
-        b"Payload Alpha",
+    let args1 = [
+        "request",
+        "send",
+        bob.identity.did.as_str(),
+        "--file",
+        "-",
+        "--draft-id",
+        draft_id.as_str(),
+    ];
+    let args2 = [
+        "request",
+        "send",
+        bob.identity.did.as_str(),
+        "--file",
+        "-",
+        "--draft-id",
+        draft_id.as_str(),
+    ];
+    let (res_a, res_b) = tokio::join!(
+        child(&binary, alice, &args1, b"Payload Alpha"),
+        child(&binary, alice, &args2, b"Payload Beta (contending conflict)")
     );
-    let sent_b_fut = child(
-        &binary,
-        alice,
-        &["request", "send", &bob.identity.did, "--file", "-", "--draft-id", &draft_id],
-        b"Payload Beta (contending conflict)",
-    );
-    let (res_a, res_b) = tokio::join!(sent_a_fut, sent_b_fut);
     let out_a = res_a?;
     let out_b = res_b?;
     let (winner, fenced) = if out_a.status.success() {
@@ -1485,9 +1474,10 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
     let b1_clone = barrier.clone();
     let target1 = "bb".repeat(32);
     let target2 = "cc".repeat(32);
+    let target1_val = target1.clone();
     let h1 = tokio::spawn(async move {
         b1_clone.wait().await;
-        s1_clone.mark_reset_pending(cid_same, &target1, 2, 200).await
+        s1_clone.mark_reset_pending(cid_same, &target1_val, 2, 200).await
     });
     let s2_clone = storage2.clone();
     let b2_clone = barrier.clone();
