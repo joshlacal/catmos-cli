@@ -81,7 +81,7 @@ cp "$runner" "$out/shipping_request_runtime"
 cp "$build_root/mls-ds/target/debug/encrypted_request_server_fixture" "$out/encrypted_request_server_fixture"
 # The CLI and seeder share one designated requirement so the seeded OS-keychain
 # items are readable by the CLI without changing any keychain ACL.
-for binary in catmos seed_local_request_profile; do
+for binary in catmos seed_local_request_profile shipping_request_runtime; do
   codesign --force --sign "Apple Development" --identifier "$identifier" "$out/$binary" >>"$log" 2>&1
 done
 

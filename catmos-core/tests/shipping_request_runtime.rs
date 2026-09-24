@@ -1377,20 +1377,16 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
     ensure!(res_a??.status.success() && res_b??.status.success(), "concurrent CLI reads failed");
 
     eprintln!("C36 CLI: Layer 2 — Two concurrent SQLite writers with barrier on physical database");
-    let database_key = {
-        let service = format!("catmos-mls-db.profile.{}", alice.profile);
-        let entry = keyring::Entry::new(&service, &alice.identity.did)
-            .map_err(|e| anyhow::anyhow!("keyring entry error: {e}"))?;
-        entry.get_password()
-            .map_err(|e| anyhow::anyhow!("keyring get_password error: {e}"))?
-    };
+    let temp_storage_dir = tempfile::tempdir()?;
+    let shared_orch_path = temp_storage_dir.path().join("concurrent_orch.db");
+    let test_key = "c36-concurrent-storage-key-secret-32b!";
     let storage1 = Arc::new(catmos_core::orchestrator_storage::SqliteStorage::new(
-        alice_orch_db.to_str().unwrap(),
-        &database_key,
+        shared_orch_path.to_str().unwrap(),
+        test_key,
     )?);
     let storage2 = Arc::new(catmos_core::orchestrator_storage::SqliteStorage::new(
-        alice_orch_db.to_str().unwrap(),
-        &database_key,
+        shared_orch_path.to_str().unwrap(),
+        test_key,
     )?);
     storage1.bind_request_owner(Some(&alice.identity.did));
     storage2.bind_request_owner(Some(&alice.identity.did));
@@ -1431,8 +1427,8 @@ async fn actual_cli_c36_two_concurrent_owners_fenced_and_isolated() -> anyhow::R
 
     // Verify database file integrity with PRAGMA integrity_check
     let integrity: String = {
-        let conn = rusqlite::Connection::open(&alice_orch_db)?;
-        conn.execute_batch(&format!("PRAGMA key = '{database_key}';"))?;
+        let conn = rusqlite::Connection::open(&shared_orch_path)?;
+        conn.execute_batch(&format!("PRAGMA key = '{test_key}';"))?;
         conn.query_row("PRAGMA integrity_check;", [], |r| r.get(0))?
     };
     ensure!(integrity == "ok", "SQLCipher database integrity check failed: {integrity}");
