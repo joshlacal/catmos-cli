@@ -61,8 +61,8 @@ fn test_c35_cli_parity() {
         println!("Loaded catmos release binary sha256: {hash}");
         assert_eq!(
             hash,
-            "efa026d740a1f0f3794544084aebb96423ed2ac37ad1c3b94f1f86fc940a89bc",
-            "catmos release binary sha256 must match frozen recapture"
+            "64048ecea2c2f82421d5bb1264f1a47591aefdfd3716967c8bf4deb886f92e78",
+            "catmos release binary sha256 must match freeze-2"
         );
     }
 
