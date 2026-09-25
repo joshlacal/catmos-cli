@@ -242,6 +242,72 @@ fn test_c35_cli_parity() {
     println!("C35 CLI Stage B Digest: {digest_b}");
     assert_eq!(digest_b, EXPECTED_DIGEST_B, "CLI Stage B digest must match core reference");
 
+    // Counterfactual Stage B: corrupting one persisted row in SQLite database changes only Stage B digest
+    {
+        let corrupt_dir = tempfile::tempdir().unwrap();
+        let c_db_path = corrupt_dir.path().join("c35_corrupt.sqlite");
+        let conn = rusqlite::Connection::open(&c_db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE mls_direct_request_projection (
+                conversation_id TEXT PRIMARY KEY,
+                view_json TEXT NOT NULL,
+                consent TEXT NOT NULL,
+                state_version INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        for view in &projected_views {
+            let view_json = serde_json::to_string(view).unwrap();
+            let consent_str = match view.consent {
+                RequestConsent::IncomingPending => "incomingPending",
+                RequestConsent::OutgoingPending => "outgoingPending",
+                RequestConsent::Accepted => "accepted",
+                RequestConsent::Closed => "closed",
+            };
+            conn.execute(
+                "INSERT INTO mls_direct_request_projection (conversation_id, view_json, consent, state_version)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![view.conversation_id, view_json, consent_str, view.state_version],
+            )
+            .unwrap();
+        }
+
+        let mut corrupted_0 = projected_views[0].clone();
+        if let Some(RequestPreview::Ready { text, .. }) = &mut corrupted_0.preview {
+            text.push_str(" [STAGE_B_MUTATED]");
+        }
+        let corrupted_json = serde_json::to_string(&corrupted_0).unwrap();
+        conn.execute(
+            "UPDATE mls_direct_request_projection SET view_json = ?1 WHERE conversation_id = ?2",
+            rusqlite::params![corrupted_json, corrupted_0.conversation_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = rusqlite::Connection::open(&c_db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT view_json FROM mls_direct_request_projection ORDER BY conversation_id")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                let s: String = row.get(0)?;
+                Ok(s)
+            })
+            .unwrap();
+        let mut c_hydrated: Vec<DirectRequestView> = Vec::new();
+        for row in rows {
+            let s = row.unwrap();
+            let view: DirectRequestView = serde_json::from_str(&s).unwrap();
+            c_hydrated.push(view);
+        }
+        let c_digest_b = sha256_hex(&canonical_json_bytes(&serde_json::to_value(&c_hydrated).unwrap()));
+        println!("C35 CLI Counterfactual Stage B Mutated Digest: {c_digest_b}");
+        assert_ne!(c_digest_b, EXPECTED_DIGEST_B, "Corrupting persisted row on disk must change Stage B digest");
+        assert_eq!(c_digest_b, "bc207c54bf1b280e9f9cf08dbb34abebe2add3acd987d28ed395cc15af1f72f8");
+    }
+
     // =========================================================================
     // Stage C: Consent State Transitions & Fencing
     // =========================================================================
