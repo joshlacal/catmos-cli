@@ -1118,41 +1118,55 @@ impl ChatService {
 
         Ok(())
     }
+    async fn canonical_local_messages(
+        &self,
+        stable_convo_id: &str,
+        limit: u32,
+    ) -> Result<Vec<Message>> {
+        let authority = self
+            .orchestrator()
+            .await
+            .ok_or_else(|| CatmosError::Other("MLS orchestrator unavailable".into()))?;
+        use catbird_mls::orchestrator::storage::MLSStorageBackend;
+        let orch_msgs = authority
+            .storage()
+            .get_messages(stable_convo_id, limit, None)
+            .await
+            .map_err(|error| CatmosError::Other(error.to_string()))?;
+        let own_did = self.did().to_string();
+        let own_device_id = self.actor_device_id().await?;
+        let terminal = matches!(
+            self.canonical_conversation_state(stable_convo_id).await?,
+            Some(
+                catbird_mls::orchestrator::types::ConversationState::DeviceRemoved
+                    | catbird_mls::orchestrator::types::ConversationState::Closed
+            )
+        );
+        let msgs = orch_msgs
+            .into_iter()
+            .map(|m| Message {
+                id: m.id.clone(),
+                convo_id: stable_convo_id.to_string(),
+                sender_did: Some(m.sender_did.clone()),
+                content: crate::types::canonical_message_content(
+                    &m,
+                    &own_did,
+                    &own_device_id,
+                    terminal,
+                ),
+                epoch: m.epoch,
+                seq: m.sequence_number,
+                created_at: m.timestamp,
+            })
+            .collect();
+        Ok(msgs)
+    }
 
     /// Load messages from the local SQLCipher database (no server round-trip).
     pub async fn load_local_messages(&self, convo_id: &str, limit: u32) -> Result<Vec<Message>> {
         let (stable_convo_id, group_id) = self.resolve_conversation_ids(convo_id).await?;
         if self.orchestrator().await.is_some() {
-            let orch_msgs = self
-                .load_canonical_message_history(&stable_convo_id, limit)
-                .await?;
-            let own_did = self.did().to_string();
-            let own_device_id = self.actor_device_id().await.unwrap_or_default();
-            let terminal = matches!(
-                self.canonical_conversation_state(&stable_convo_id).await?,
-                Some(
-                    catbird_mls::orchestrator::types::ConversationState::DeviceRemoved
-                        | catbird_mls::orchestrator::types::ConversationState::Closed
-                )
-            );
-            let msgs: Vec<Message> = orch_msgs
-                .into_iter()
-                .map(|m| Message {
-                    id: m.id.clone(),
-                    convo_id: stable_convo_id.clone(),
-                    sender_did: Some(m.sender_did.clone()),
-                    content: crate::types::canonical_message_content(
-                        &m,
-                        &own_did,
-                        &own_device_id,
-                        terminal,
-                    ),
-                    epoch: m.epoch,
-                    seq: m.sequence_number,
-                    created_at: m.timestamp,
-                })
-                .collect();
-            return Ok(msgs);
+            return self.canonical_local_messages(&stable_convo_id, limit).await;
         }
         let mut source_ids = self
             .db
@@ -1183,27 +1197,7 @@ impl ChatService {
                 .fetch_messages(&stable_convo_id, None, limit, None, None, None)
                 .await
                 .map_err(|e| CatmosError::Other(e.to_string()))?;
-            use catbird_mls::orchestrator::MLSStorageBackend;
-            let messages = authority
-                .storage()
-                .get_messages(&stable_convo_id, limit, None)
-                .await
-                .map_err(|e| CatmosError::Other(e.to_string()))?;
-            for message in messages {
-                let host = Message {
-                    id: message.id,
-                    convo_id: stable_convo_id.clone(),
-                    sender_did: Some(message.sender_did),
-                    content: parse_message_content(
-                        message.payload_json.as_deref().unwrap_or(&message.text),
-                    ),
-                    epoch: message.epoch,
-                    seq: message.sequence_number,
-                    created_at: message.timestamp,
-                };
-                self.db.store_message(&host).await?;
-            }
-            return self.load_local_messages(&stable_convo_id, limit).await;
+            return self.canonical_local_messages(&stable_convo_id, limit).await;
         }
 
         if let Err(e) = self.sync_conversation(&stable_convo_id).await {
@@ -2736,6 +2730,202 @@ mod tests {
             MessageContent::System("Conversation status changed.".to_string())
         );
         assert_eq!(cli_content, *tui_content, "CLI and TUI paths must render conversation.closed identically");
+    }
+
+    #[tokio::test]
+    async fn f78_load_local_messages_returns_history_when_xrpc_server_unreachable() {
+        use crate::orchestrator_credentials::KeyringCredentialStore;
+        use crate::orchestrator_storage::SqliteStorage;
+        use catbird_mls::orchestrator::storage::MLSStorageBackend;
+        use catbird_mls::orchestrator::{CredentialStore, MLSOrchestrator, OrchestratorConfig};
+
+        std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
+        let mut service = test_service().await;
+        // Point nest_url at a closed port to simulate unreachable XRPC server
+        service.auth = AuthMethod::OAuth {
+            session_cookie: "test-cookie".to_string(),
+            did: service.did().to_string(),
+            nest_url: "http://127.0.0.1:1".to_string(),
+        };
+
+        let convo_id = "550e8400-e29b-41d4-a716-446655440000";
+        let group_id = "000102030405060708090a0b0c0d0e0f";
+        let conversation = fixture_conversation(convo_id, group_id);
+        service
+            .db
+            .store_conversation(&conversation)
+            .await
+            .expect("store conversation");
+
+        let temporary = tempfile::tempdir().unwrap();
+        let mls_dir = temporary.path().to_path_buf();
+        let mls = Arc::new(crate::mls::MlsManager::new(&mls_dir, service.did()).unwrap());
+        let db_path = temporary.path().join("orchestrator.db");
+        let storage = Arc::new(
+            SqliteStorage::new(db_path.to_str().unwrap(), service.did()).unwrap(),
+        );
+        storage.set_mls_context(mls.context().clone());
+
+        storage
+            .store_message(&catbird_mls::orchestrator::types::Message {
+                id: "msg-offline".into(),
+                conversation_id: convo_id.into(),
+                sender_did: "did:web:alice".into(),
+                text: "Offline cached message".into(),
+                timestamp: Utc::now(),
+                epoch: 1,
+                sequence_number: 1,
+                is_own: true,
+                delivery_status: None,
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+
+        let credentials = Arc::new(KeyringCredentialStore::new());
+        let device = "b0b00000-0000-4000-8000-000000000001";
+        credentials
+            .store_device_uuid(service.did(), device)
+            .await
+            .unwrap();
+        credentials
+            .store_signing_key(service.did(), &[31; 32])
+            .await
+            .unwrap();
+        KeyringCredentialStore::retain_generation(
+            service.did(),
+            device,
+            "synthetic-history-key",
+            1,
+        )
+        .await
+        .unwrap();
+        let orchestrator = Arc::new(MLSOrchestrator::new(
+            mls.context().clone(),
+            storage.clone(),
+            Arc::new(crate::orchestrator_api::CliApiClient::new(Arc::new(service.clone()))),
+            credentials,
+            OrchestratorConfig::default(),
+        ));
+        orchestrator.initialize(service.did()).await.unwrap();
+        service.set_orchestrator(orchestrator).await;
+
+        // load_local_messages must succeed without server round-trip even when XRPC server is unreachable
+        let messages = service
+            .load_local_messages(convo_id, 50)
+            .await
+            .expect("load_local_messages must succeed offline without server round-trip");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "msg-offline");
+    }
+
+    #[tokio::test]
+    async fn f78_fetch_messages_with_orchestrator_does_not_mutate_self_db() {
+        use crate::orchestrator_credentials::KeyringCredentialStore;
+        use crate::orchestrator_storage::SqliteStorage;
+        use catbird_mls::orchestrator::storage::MLSStorageBackend;
+        use catbird_mls::orchestrator::{CredentialStore, MLSOrchestrator, OrchestratorConfig};
+
+        std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
+        let mut service = test_service().await;
+        let router = axum::Router::new().route(
+            "/xrpc/blue.catbird.chat.getEntries",
+            axum::routing::get(mock_get_entries),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind mock XRPC server");
+        let address = listener.local_addr().expect("mock server address");
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve mock XRPC");
+        });
+        service.auth = AuthMethod::OAuth {
+            session_cookie: "test-cookie".to_string(),
+            did: service.did().to_string(),
+            nest_url: format!("http://{address}"),
+        };
+
+        let convo_id = "550e8400-e29b-41d4-a716-446655440000";
+        let group_id = "000102030405060708090a0b0c0d0e0f";
+        let conversation = fixture_conversation(convo_id, group_id);
+        service
+            .db
+            .store_conversation(&conversation)
+            .await
+            .expect("store conversation");
+
+        let temporary = tempfile::tempdir().unwrap();
+        let mls_dir = temporary.path().to_path_buf();
+        let mls = Arc::new(crate::mls::MlsManager::new(&mls_dir, service.did()).unwrap());
+        let db_path = temporary.path().join("orchestrator.db");
+        let storage = Arc::new(
+            SqliteStorage::new(db_path.to_str().unwrap(), service.did()).unwrap(),
+        );
+        storage.set_mls_context(mls.context().clone());
+
+        storage
+            .store_message(&catbird_mls::orchestrator::types::Message {
+                id: "msg-fetch".into(),
+                conversation_id: convo_id.into(),
+                sender_did: "did:web:alice".into(),
+                text: "Fetched message".into(),
+                timestamp: Utc::now(),
+                epoch: 1,
+                sequence_number: 1,
+                is_own: true,
+                delivery_status: None,
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+
+        let credentials = Arc::new(KeyringCredentialStore::new());
+        let device = "b0b00000-0000-4000-8000-000000000001";
+        credentials
+            .store_device_uuid(service.did(), device)
+            .await
+            .unwrap();
+        credentials
+            .store_signing_key(service.did(), &[31; 32])
+            .await
+            .unwrap();
+        KeyringCredentialStore::retain_generation(
+            service.did(),
+            device,
+            "synthetic-history-key",
+            1,
+        )
+        .await
+        .unwrap();
+        let orchestrator = Arc::new(MLSOrchestrator::new(
+            mls.context().clone(),
+            storage.clone(),
+            Arc::new(crate::orchestrator_api::CliApiClient::new(Arc::new(service.clone()))),
+            credentials,
+            OrchestratorConfig::default(),
+        ));
+        orchestrator.initialize(service.did()).await.unwrap();
+        service.set_orchestrator(orchestrator).await;
+
+        // self.db has 0 messages before fetch_messages
+        assert_eq!(
+            service.db.get_messages(convo_id, 10, None).await.unwrap().len(),
+            0
+        );
+
+        let messages = service
+            .fetch_messages(convo_id, 50)
+            .await
+            .expect("fetch_messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "msg-fetch");
+
+        // After fetch_messages with orchestrator present, self.db's message count must be unchanged (0)
+        assert_eq!(
+            service.db.get_messages(convo_id, 10, None).await.unwrap().len(),
+            0,
+            "self.db message count must be completely unchanged after fetch_messages"
+        );
     }
 
     #[tokio::test]
