@@ -1122,29 +1122,37 @@ impl ChatService {
     /// Load messages from the local SQLCipher database (no server round-trip).
     pub async fn load_local_messages(&self, convo_id: &str, limit: u32) -> Result<Vec<Message>> {
         let (stable_convo_id, group_id) = self.resolve_conversation_ids(convo_id).await?;
-        if let Some(authority) = self.orchestrator().await {
-            use catbird_mls::orchestrator::storage::MLSStorageBackend;
-            for id in [&stable_convo_id, &group_id] {
-                if let Ok(orch_msgs) = authority.storage().get_messages(id, limit, None).await {
-                    if !orch_msgs.is_empty() {
-                        let msgs: Vec<Message> = orch_msgs
-                            .into_iter()
-                            .map(|m| Message {
-                                id: m.id,
-                                convo_id: stable_convo_id.clone(),
-                                sender_did: Some(m.sender_did),
-                                content: parse_message_content(
-                                    m.payload_json.as_deref().unwrap_or(&m.text),
-                                ),
-                                epoch: m.epoch,
-                                seq: m.sequence_number,
-                                created_at: m.timestamp,
-                            })
-                            .collect();
-                        return Ok(msgs);
-                    }
-                }
-            }
+        if self.orchestrator().await.is_some() {
+            let orch_msgs = self
+                .load_canonical_message_history(&stable_convo_id, limit)
+                .await?;
+            let own_did = self.did().to_string();
+            let own_device_id = self.actor_device_id().await.unwrap_or_default();
+            let terminal = matches!(
+                self.canonical_conversation_state(&stable_convo_id).await?,
+                Some(
+                    catbird_mls::orchestrator::types::ConversationState::DeviceRemoved
+                        | catbird_mls::orchestrator::types::ConversationState::Closed
+                )
+            );
+            let msgs: Vec<Message> = orch_msgs
+                .into_iter()
+                .map(|m| Message {
+                    id: m.id.clone(),
+                    convo_id: stable_convo_id.clone(),
+                    sender_did: Some(m.sender_did.clone()),
+                    content: crate::types::canonical_message_content(
+                        &m,
+                        &own_did,
+                        &own_device_id,
+                        terminal,
+                    ),
+                    epoch: m.epoch,
+                    seq: m.sequence_number,
+                    created_at: m.timestamp,
+                })
+                .collect();
+            return Ok(msgs);
         }
         let mut source_ids = self
             .db
@@ -2463,10 +2471,25 @@ mod tests {
         use crate::orchestrator_credentials::KeyringCredentialStore;
         use crate::orchestrator_storage::SqliteStorage;
         use catbird_mls::orchestrator::storage::MLSStorageBackend;
-        use catbird_mls::orchestrator::{MLSOrchestrator, OrchestratorConfig};
-
+        use catbird_mls::orchestrator::{CredentialStore, MLSOrchestrator, OrchestratorConfig};
         std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
-        let service = test_service().await;
+        let mut service = test_service().await;
+        let router = axum::Router::new().route(
+            "/xrpc/blue.catbird.chat.getEntries",
+            axum::routing::get(mock_get_entries),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind mock XRPC server");
+        let address = listener.local_addr().expect("mock server address");
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve mock XRPC");
+        });
+        service.auth = AuthMethod::OAuth {
+            session_cookie: "test-cookie".to_string(),
+            did: service.did().to_string(),
+            nest_url: format!("http://{address}"),
+        };
         let convo_id = "550e8400-e29b-41d4-a716-446655440000";
         let group_id = "000102030405060708090a0b0c0d0e0f";
         let conversation = fixture_conversation(convo_id, group_id);
@@ -2535,6 +2558,23 @@ mod tests {
             .unwrap();
 
         let credentials = Arc::new(KeyringCredentialStore::new());
+        let device = "b0b00000-0000-4000-8000-000000000001";
+        credentials
+            .store_device_uuid(service.did(), device)
+            .await
+            .unwrap();
+        credentials
+            .store_signing_key(service.did(), &[31; 32])
+            .await
+            .unwrap();
+        KeyringCredentialStore::retain_generation(
+            service.did(),
+            device,
+            "synthetic-history-key",
+            1,
+        )
+        .await
+        .unwrap();
         let orchestrator = Arc::new(MLSOrchestrator::new(
             mls.context().clone(),
             storage.clone(),
@@ -2542,6 +2582,7 @@ mod tests {
             credentials,
             OrchestratorConfig::default(),
         ));
+        orchestrator.initialize(service.did()).await.unwrap();
         service.set_orchestrator(orchestrator).await;
 
         // self.db already holds msg-2 (seq 2, Bob's peer reply) from the live run.
@@ -2586,6 +2627,115 @@ mod tests {
             "self.db must be completely unchanged by load_local_messages read"
         );
         assert_eq!(db_messages[0].id, "msg-2-peer-reply");
+    }
+
+    #[tokio::test]
+    async fn f78_conversation_closed_renders_identically_through_cli_and_tui() {
+        use crate::orchestrator_credentials::KeyringCredentialStore;
+        use crate::orchestrator_storage::SqliteStorage;
+        use catbird_mls::orchestrator::storage::MLSStorageBackend;
+        use catbird_mls::orchestrator::{CredentialStore, MLSOrchestrator, OrchestratorConfig};
+
+        std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
+        let mut service = test_service().await;
+        let router = axum::Router::new().route(
+            "/xrpc/blue.catbird.chat.getEntries",
+            axum::routing::get(mock_get_entries),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind mock XRPC server");
+        let address = listener.local_addr().expect("mock server address");
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve mock XRPC");
+        });
+        service.auth = AuthMethod::OAuth {
+            session_cookie: "test-cookie".to_string(),
+            did: service.did().to_string(),
+            nest_url: format!("http://{address}"),
+        };
+        let convo_id = "550e8400-e29b-41d4-a716-446655440000";
+        let group_id = "000102030405060708090a0b0c0d0e0f";
+        let conversation = fixture_conversation(convo_id, group_id);
+        service
+            .db
+            .store_conversation(&conversation)
+            .await
+            .expect("store conversation");
+
+        let temporary = tempfile::tempdir().unwrap();
+        let mls_dir = temporary.path().to_path_buf();
+        let mls = Arc::new(crate::mls::MlsManager::new(&mls_dir, service.did()).unwrap());
+        let db_path = temporary.path().join("orchestrator.db");
+        let storage = Arc::new(
+            SqliteStorage::new(db_path.to_str().unwrap(), service.did()).unwrap(),
+        );
+        storage.set_mls_context(mls.context().clone());
+
+        let payload = catbird_mls::orchestrator::MLSMessagePayload::system("conversation.closed");
+        storage
+            .store_message(&catbird_mls::orchestrator::types::Message {
+                id: "msg-closed".into(),
+                conversation_id: convo_id.into(),
+                sender_did: service.did().to_string(),
+                text: "conversation.closed".into(),
+                timestamp: Utc::now(),
+                epoch: 1,
+                sequence_number: 1,
+                is_own: true,
+                delivery_status: None,
+                payload_json: Some(serde_json::to_string(&payload).unwrap()),
+            })
+            .await
+            .unwrap();
+
+        let credentials = Arc::new(KeyringCredentialStore::new());
+        let device = "b0b00000-0000-4000-8000-000000000001";
+        credentials
+            .store_device_uuid(service.did(), device)
+            .await
+            .unwrap();
+        credentials
+            .store_signing_key(service.did(), &[31; 32])
+            .await
+            .unwrap();
+        KeyringCredentialStore::retain_generation(
+            service.did(),
+            device,
+            "synthetic-history-key",
+            1,
+        )
+        .await
+        .unwrap();
+        let orchestrator = Arc::new(MLSOrchestrator::new(
+            mls.context().clone(),
+            storage.clone(),
+            Arc::new(crate::orchestrator_api::CliApiClient::new(Arc::new(service.clone()))),
+            credentials,
+            OrchestratorConfig::default(),
+        ));
+        orchestrator.initialize(service.did()).await.unwrap();
+        service.set_orchestrator(orchestrator).await;
+
+        let cli_history = service
+            .load_canonical_message_history(convo_id, 50)
+            .await
+            .expect("load canonical message history");
+        assert_eq!(cli_history.len(), 1);
+        let cli_content = crate::types::canonical_message_content(&cli_history[0], service.did(), "", false);
+
+        let tui_messages = service
+            .load_local_messages(convo_id, 50)
+            .await
+            .expect("load local messages");
+        assert_eq!(tui_messages.len(), 1);
+        let tui_content = &tui_messages[0].content;
+
+        assert_eq!(
+            cli_content,
+            MessageContent::System("Conversation status changed.".to_string())
+        );
+        assert_eq!(cli_content, *tui_content, "CLI and TUI paths must render conversation.closed identically");
     }
 
     #[tokio::test]

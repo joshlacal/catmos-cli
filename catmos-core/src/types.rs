@@ -72,7 +72,7 @@ pub struct Message {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageContent {
     GroupInvitation {
         text: String,
@@ -88,7 +88,7 @@ pub enum MessageContent {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReactionAction {
     Add,
     Remove,
@@ -147,4 +147,44 @@ pub fn is_local_membership_left_marker(
                 && payload.message_type == MLSMessageType::System
                 && payload.text.as_deref() == Some("membership.left")
         })
+}
+
+pub fn canonical_message_content(
+    message: &catbird_mls::orchestrator::types::Message,
+    own_did: &str,
+    own_device_id: &str,
+    has_durable_terminal_state: bool,
+) -> MessageContent {
+    use catbird_mls::orchestrator::types::MLSMessageType;
+    if let Some(payload) = message.payload() {
+        if payload.version == 1 && payload.message_type == MLSMessageType::System {
+            let label = match payload.text.as_deref() {
+                Some("history_boundary.new_member") => {
+                    Some("You joined this conversation. Earlier messages are not available on this device.")
+                }
+                Some("history_boundary.device_rejoined") => {
+                    Some("This device rejoined the conversation. Earlier messages may not be available.")
+                }
+                Some("conversation.closed") => Some("Conversation status changed."),
+                Some("membership.left") => {
+                    Some(if is_local_membership_left_marker(
+                        message,
+                        own_did,
+                        own_device_id,
+                        has_durable_terminal_state,
+                    ) {
+                        "You left this conversation."
+                    } else {
+                        "Membership update"
+                    })
+                }
+                _ => None,
+            };
+            if let Some(label) = label {
+                return MessageContent::System(label.to_owned());
+            }
+        }
+    }
+    // Literal marker keys and JSON in ordinary text are still user messages.
+    MessageContent::Text(message.text.clone())
 }
