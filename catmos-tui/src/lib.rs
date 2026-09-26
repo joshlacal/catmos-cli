@@ -37,6 +37,7 @@ pub async fn run() -> anyhow::Result<()> {
         config.ui.sidebar_visible,
         config.ui.member_panel_visible,
     );
+    let (mut events, event_tx) = EventLoop::new(250);
 
     info!("Fetching conversations...");
     match service.fetch_conversations().await {
@@ -65,12 +66,21 @@ pub async fn run() -> anyhow::Result<()> {
                 .collect();
             for convo_id in conversation_ids {
                 let svc = Arc::clone(&service);
+                let tx = event_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = svc.fetch_messages(&convo_id, 50).await {
-                        debug!(
-                            "Pre-fetch failed for {}: {e}",
-                            &convo_id[..12.min(convo_id.len())]
-                        );
+                    match svc.fetch_messages(&convo_id, 50).await {
+                        Ok(messages) => {
+                            let _ = tx.send(AppEvent::MessagesPrefetched {
+                                convo_id,
+                                messages,
+                            });
+                        }
+                        Err(e) => {
+                            debug!(
+                                "Pre-fetch failed for {}: {e}",
+                                &convo_id[..12.min(convo_id.len())]
+                            );
+                        }
                     }
                 });
             }
@@ -90,8 +100,6 @@ pub async fn run() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    // ── 7. Event loop ──────────────────────────────────────────────────
-    let (mut events, event_tx) = EventLoop::new(250);
 
     // ── 7a. Start WebSocket subscription ──────────────────────────────
     // Call subscribe() on the current task, then hand only the receiver
@@ -372,6 +380,14 @@ async fn main_loop(
                     if let Some(convo) = app.active_conversation() {
                         if msg.convo_id == convo.conversation_id {
                             app.messages.push(msg);
+                        }
+                    }
+                }
+                AppEvent::MessagesPrefetched { convo_id, messages } => {
+                    if let Some(convo) = app.active_conversation() {
+                        if convo.conversation_id == convo_id {
+                            app.messages = messages;
+                            app.set_status(format!("read · {} messages", app.messages.len()));
                         }
                     }
                 }

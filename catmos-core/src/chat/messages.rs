@@ -1122,6 +1122,27 @@ impl ChatService {
     /// Load messages from the local SQLCipher database (no server round-trip).
     pub async fn load_local_messages(&self, convo_id: &str, limit: u32) -> Result<Vec<Message>> {
         let (stable_convo_id, group_id) = self.resolve_conversation_ids(convo_id).await?;
+        if let Some(authority) = self.orchestrator().await {
+            use catbird_mls::orchestrator::storage::MLSStorageBackend;
+            for id in [&stable_convo_id, &group_id] {
+                if let Ok(messages) = authority.storage().get_messages(id, limit, None).await {
+                    for message in messages {
+                        let host = Message {
+                            id: message.id,
+                            convo_id: stable_convo_id.clone(),
+                            sender_did: Some(message.sender_did),
+                            content: parse_message_content(
+                                message.payload_json.as_deref().unwrap_or(&message.text),
+                            ),
+                            epoch: message.epoch,
+                            seq: message.sequence_number,
+                            created_at: message.timestamp,
+                        };
+                        let _ = self.db.store_message(&host).await;
+                    }
+                }
+            }
+        }
         let mut source_ids = self
             .db
             .list_conversation_group_ids(&stable_convo_id)
@@ -2432,6 +2453,109 @@ mod tests {
         assert!(legacy_stored
             .iter()
             .all(|message| message.convo_id == group_id));
+    }
+
+    #[tokio::test]
+    async fn f78_load_local_messages_mirrors_orchestrator_history_on_restart() {
+        use crate::orchestrator_credentials::KeyringCredentialStore;
+        use crate::orchestrator_storage::SqliteStorage;
+        use catbird_mls::orchestrator::storage::MLSStorageBackend;
+        use catbird_mls::orchestrator::{MLSOrchestrator, OrchestratorConfig};
+
+        std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
+        let service = test_service().await;
+        let convo_id = "550e8400-e29b-41d4-a716-446655440000";
+        let group_id = "000102030405060708090a0b0c0d0e0f";
+        let conversation = fixture_conversation(convo_id, group_id);
+        service
+            .db
+            .store_conversation(&conversation)
+            .await
+            .expect("store conversation");
+
+        let temporary = tempfile::tempdir().unwrap();
+        let mls_dir = temporary.path().to_path_buf();
+        let mls = Arc::new(crate::mls::MlsManager::new(&mls_dir, service.did()).unwrap());
+        let db_path = temporary.path().join("orchestrator.db");
+        let storage = Arc::new(
+            SqliteStorage::new(db_path.to_str().unwrap(), service.did()).unwrap(),
+        );
+        storage.set_mls_context(mls.context().clone());
+
+        let now = Utc::now();
+        storage
+            .store_message(&catbird_mls::orchestrator::types::Message {
+                id: "msg-1-intro".into(),
+                conversation_id: convo_id.into(),
+                sender_did: "did:web:alice".into(),
+                text: "Hello from Alice direct request introduction".into(),
+                timestamp: now - chrono::Duration::minutes(5),
+                epoch: 1,
+                sequence_number: 1,
+                is_own: true,
+                delivery_status: None,
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+
+        storage
+            .store_message(&catbird_mls::orchestrator::types::Message {
+                id: "msg-2-peer-reply".into(),
+                conversation_id: convo_id.into(),
+                sender_did: "did:web:bob".into(),
+                text: "Hello from Bob accepted peer reply".into(),
+                timestamp: now - chrono::Duration::minutes(3),
+                epoch: 1,
+                sequence_number: 2,
+                is_own: false,
+                delivery_status: None,
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+
+        storage
+            .store_message(&catbird_mls::orchestrator::types::Message {
+                id: "msg-3-own-reply".into(),
+                conversation_id: convo_id.into(),
+                sender_did: "did:web:alice".into(),
+                text: "Glad to connect Bob!".into(),
+                timestamp: now - chrono::Duration::minutes(1),
+                epoch: 1,
+                sequence_number: 3,
+                is_own: true,
+                delivery_status: None,
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+
+        let credentials = Arc::new(KeyringCredentialStore::new());
+        let orchestrator = Arc::new(MLSOrchestrator::new(
+            mls.context().clone(),
+            storage.clone(),
+            Arc::new(crate::orchestrator_api::CliApiClient::new(Arc::new(service.clone()))),
+            credentials,
+            OrchestratorConfig::default(),
+        ));
+        service.set_orchestrator(orchestrator).await;
+
+        assert_eq!(
+            service.db.get_messages(convo_id, 10, None).await.unwrap().len(),
+            0,
+            "precondition: local self.db has no messages before load_local_messages"
+        );
+
+        let messages = service
+            .load_local_messages(convo_id, 50)
+            .await
+            .expect("load local messages");
+
+        assert_eq!(messages.len(), 3, "restarted TUI must show all 3 messages");
+        assert_eq!(messages[0].id, "msg-1-intro");
+        assert_eq!(messages[1].id, "msg-2-peer-reply");
+        assert_eq!(messages[2].id, "msg-3-own-reply");
     }
 
     #[tokio::test]

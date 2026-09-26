@@ -14,6 +14,11 @@ pub enum AppEvent {
     Tick,
     /// An incoming chat message (from WebSocket).
     ChatMessage(Message),
+    /// Messages were prefetched in the background — refresh active conversation if matched.
+    MessagesPrefetched {
+        convo_id: String,
+        messages: Vec<Message>,
+    },
     /// The MLS epoch advanced for a conversation — re-fetch messages.
     EpochAdvanced {
         convo_id: String,
