@@ -1125,20 +1125,23 @@ impl ChatService {
         if let Some(authority) = self.orchestrator().await {
             use catbird_mls::orchestrator::storage::MLSStorageBackend;
             for id in [&stable_convo_id, &group_id] {
-                if let Ok(messages) = authority.storage().get_messages(id, limit, None).await {
-                    for message in messages {
-                        let host = Message {
-                            id: message.id,
-                            convo_id: stable_convo_id.clone(),
-                            sender_did: Some(message.sender_did),
-                            content: parse_message_content(
-                                message.payload_json.as_deref().unwrap_or(&message.text),
-                            ),
-                            epoch: message.epoch,
-                            seq: message.sequence_number,
-                            created_at: message.timestamp,
-                        };
-                        let _ = self.db.store_message(&host).await;
+                if let Ok(orch_msgs) = authority.storage().get_messages(id, limit, None).await {
+                    if !orch_msgs.is_empty() {
+                        let msgs: Vec<Message> = orch_msgs
+                            .into_iter()
+                            .map(|m| Message {
+                                id: m.id,
+                                convo_id: stable_convo_id.clone(),
+                                sender_did: Some(m.sender_did),
+                                content: parse_message_content(
+                                    m.payload_json.as_deref().unwrap_or(&m.text),
+                                ),
+                                epoch: m.epoch,
+                                seq: m.sequence_number,
+                                created_at: m.timestamp,
+                            })
+                            .collect();
+                        return Ok(msgs);
                     }
                 }
             }
@@ -2541,10 +2544,25 @@ mod tests {
         ));
         service.set_orchestrator(orchestrator).await;
 
+        // self.db already holds msg-2 (seq 2, Bob's peer reply) from the live run.
+        service
+            .db
+            .store_message(&Message {
+                id: "msg-2-peer-reply".into(),
+                convo_id: convo_id.into(),
+                sender_did: Some("did:web:bob".into()),
+                content: MessageContent::Text("Hello from Bob accepted peer reply".into()),
+                epoch: 1,
+                seq: 2,
+                created_at: now - chrono::Duration::minutes(3),
+            })
+            .await
+            .unwrap();
+
         assert_eq!(
             service.db.get_messages(convo_id, 10, None).await.unwrap().len(),
-            0,
-            "precondition: local self.db has no messages before load_local_messages"
+            1,
+            "precondition: local self.db has exactly msg-2 before load_local_messages"
         );
 
         let messages = service
@@ -2556,6 +2574,18 @@ mod tests {
         assert_eq!(messages[0].id, "msg-1-intro");
         assert_eq!(messages[1].id, "msg-2-peer-reply");
         assert_eq!(messages[2].id, "msg-3-own-reply");
+
+        let db_messages = service
+            .db
+            .get_messages(convo_id, 10, None)
+            .await
+            .expect("self.db must pass HMAC verification without error");
+        assert_eq!(
+            db_messages.len(),
+            1,
+            "self.db must be completely unchanged by load_local_messages read"
+        );
+        assert_eq!(db_messages[0].id, "msg-2-peer-reply");
     }
 
     #[tokio::test]
