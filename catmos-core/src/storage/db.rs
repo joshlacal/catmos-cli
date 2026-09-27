@@ -257,6 +257,28 @@ impl Database {
         }
         Ok(next)
     }
+    pub async fn delete_request_draft(
+        &self,
+        owner: &str,
+        id: &str,
+        expected: &[u8],
+    ) -> Result<()> {
+        let deleted = sqlx::query(
+            "DELETE FROM request_drafts WHERE owner_did=? AND draft_id=? AND protected=?",
+        )
+        .bind(owner)
+        .bind(id)
+        .bind(expected)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if deleted != 1 {
+            return Err(CatmosError::Storage(
+                "Draft changed concurrently; reload before retry".into(),
+            ));
+        }
+        Ok(())
+    }
 
     /// Test-only accessor for the underlying `SqlitePool`. Integration
     /// tests in `tests/` need to issue raw `PRAGMA` / `SELECT` queries to

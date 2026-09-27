@@ -20,6 +20,11 @@ pub struct RequestDraft {
     #[serde(default)]
     pub note_message_id: Option<String>,
 }
+#[derive(Clone, Debug)]
+pub enum RequestDraftCancellation {
+    LocalDraftDeleted { draft_id: String },
+    Native(DirectRequestOutcome),
+}
 pub fn new_draft_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -107,12 +112,20 @@ impl ChatService {
         self.db.replace_request_draft(&draft, &raw).await?;
         Ok(result)
     }
-    pub async fn cancel_request_draft(&self, id: &str) -> Result<DirectRequestOutcome> {
+    pub async fn cancel_request_draft(&self, id: &str) -> Result<RequestDraftCancellation> {
         let (mut draft, raw) = self
             .db
             .read_request_draft(self.did(), id)
             .await?
             .ok_or_else(|| CatmosError::Other("Unknown local draft".into()))?;
+        if !draft.attempted {
+            self.db
+                .delete_request_draft(&draft.owner_did, &draft.input.draft_id, &raw)
+                .await?;
+            return Ok(RequestDraftCancellation::LocalDraftDeleted {
+                draft_id: id.to_owned(),
+            });
+        }
         let outcome = self
             .request_authority()
             .await?
@@ -121,7 +134,7 @@ impl ChatService {
             .map_err(|e| CatmosError::Other(e.to_string()))?;
         draft.outcome = Some(outcome.clone());
         self.db.replace_request_draft(&draft, &raw).await?;
-        Ok(outcome)
+        Ok(RequestDraftCancellation::Native(outcome))
     }
     pub async fn send_accepted_invitation_note(
         &self,
