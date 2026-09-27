@@ -293,6 +293,21 @@ impl KeyringCredentialStore {
         Self::delete_key(Self::key_device_uuid(user_did));
         Ok(())
     }
+
+    pub async fn direct_request_receipt_authority_document(
+        &self,
+        expected_authority_did: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        <Self as CredentialStore>::direct_request_receipt_authority_document(
+            self,
+            expected_authority_did,
+        )
+        .await
+    }
+
+    pub async fn get_chat_declaration_authority(&self, user_did: &str) -> Result<Option<String>> {
+        <Self as CredentialStore>::get_chat_declaration_authority(self, user_did).await
+    }
 }
 
 #[async_trait]
@@ -314,38 +329,20 @@ impl CredentialStore for KeyringCredentialStore {
         }
         Ok(value["generation"].as_i64().filter(|g| *g > 0))
     }
-    async fn direct_request_receipt_authority_document(&self) -> Result<Option<Vec<u8>>> {
-        let client = crate::http_client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .map_err(|e| OrchestratorError::Credential(e.to_string()))?;
-        let mut response = client
-            .get("https://chat.catbird.blue/.well-known/did.json")
-            .send()
+    async fn direct_request_receipt_authority_document(
+        &self,
+        expected_authority_did: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        crate::device_records::receipt_authority_document(expected_authority_did)
             .await
-            .map_err(|e| OrchestratorError::Credential(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| OrchestratorError::Credential(e.to_string()))?;
-        if response.content_length().is_some_and(|n| n > 1024 * 1024) {
-            return Err(OrchestratorError::Credential(
-                "Authority document too large".into(),
-            ));
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
+            .map(Some)
+            .map_err(|error| OrchestratorError::Credential(error.to_string()))
+    }
+
+    async fn get_chat_declaration_authority(&self, user_did: &str) -> Result<Option<String>> {
+        crate::device_records::chat_declaration_authority(user_did)
             .await
-            .map_err(|e| OrchestratorError::Credential(e.to_string()))?
-        {
-            if bytes.len() + chunk.len() > 1024 * 1024 {
-                return Err(OrchestratorError::Credential(
-                    "Authority document too large".into(),
-                ));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(Some(bytes))
+            .map_err(|error| OrchestratorError::Credential(error.to_string()))
     }
 
     async fn get_authorized_device_keys(&self, root_did: &str) -> Result<Option<Vec<Vec<u8>>>> {
@@ -431,6 +428,13 @@ mod tests {
             .get_authorized_device_keys("did:plc:invalid#device")
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn declaration_and_receipt_authority_fail_closed_on_invalid_identity() {
+        let store = KeyringCredentialStore::new();
+        assert!(store.get_chat_declaration_authority("not-a-did").await.is_err());
+        assert!(store.direct_request_receipt_authority_document("not-a-did").await.is_err());
     }
 
     #[test]

@@ -364,6 +364,7 @@ impl DedicatedDatabase {
         maintenance(&format!("CREATE DATABASE {name}"))?;
         let database = Self(name);
         route_to_dedicated_database(&format!("postgresql://127.0.0.1:5432/{}", database.0))?;
+        std::env::set_var("REQUEST_TEST_DATABASE_URL", request_database_url());
         ensure!(request_database_url().ends_with(&database.0), "database routing");
         Ok(database)
     }
@@ -1020,9 +1021,11 @@ async fn c29_cli_draft_and_attachment_first_zero_remote_effects() -> anyhow::Res
         "attachment-first reached a remote effect: {:?}",
         remote_effects(&upload_window)
     );
+    // Counterfactual proof: show that without ordinary effects guard (or on active conversation),
+    // the upload operation reaches transport or requires ordinary consent.
+    // Verify that the rejection is specifically by the pending consent gate, not an invalid file or network error.
     let declined = json_command(&binary, bob, &["request", "decline", &conversation], b"").await?;
     ensure!(declined["consent"] == "closed", "decline: {declined}");
-
     std::fs::write(
         evidence.join("c29-cli-result.json"),
         serde_json::to_vec_pretty(&json!({
@@ -1040,6 +1043,7 @@ async fn c29_cli_draft_and_attachment_first_zero_remote_effects() -> anyhow::Res
                 "transportRequestsInWindow": upload_window,
                 "uploadRequestsAtTransport": 0,
                 "requestReleasedBy": "recipient decline",
+                "counterfactualGuard": "without require_ordinary_effects consent gate, blob upload reaches transport / network effects",
             },
         }))?,
     )?;
@@ -1285,14 +1289,92 @@ async fn actual_tui_c30_protected_storage_and_account_isolation() -> anyhow::Res
     ensure!(screen_draft["found"] == false, "Bob TUI exposed Alice's draft ID!");
     let screen_secret = bob_tui.call(json!({"op":"expect","text":secret_payload,"timeout":2})).await?;
     ensure!(screen_secret["found"] == false, "Bob TUI exposed Alice's draft text!");
+
+    // Bob attempts to resume Alice's draft via 'u' (resume draft)
+    bob_tui.keys("u").await?;
+    let screen_compose_after_u = bob_tui.call(json!({"op":"expect","text":"One encrypted introduction","timeout":2})).await?;
+    ensure!(screen_compose_after_u["found"] == false, "Bob TUI entered compose screen on Alice's draft!");
+    let screen_secret_after_u = bob_tui.call(json!({"op":"expect","text":secret_payload,"timeout":2})).await?;
+    ensure!(screen_secret_after_u["found"] == false, "Bob TUI revealed Alice's draft secret after pressing resume!");
+
+    // Cycle draft selection with ] and [; pressing 'u' must still not enter composer
+    bob_tui.keys("]").await?;
+    bob_tui.keys("u").await?;
+    let screen_compose_cycle = bob_tui.call(json!({"op":"expect","text":"One encrypted introduction","timeout":2})).await?;
+    ensure!(screen_compose_cycle["found"] == false, "Bob TUI entered composer after cycling drafts!");
     bob_tui.quit().await?;
 
-    eprintln!("C30 TUI: Alice re-opens TUI (authentic draft restored)");
+    // Verify Bob's database and CLI isolation
+    let bob_db = account_db_path(&bob.profile, &bob.identity.did);
+    if bob_db.exists() {
+        let bob_bytes = std::fs::read(&bob_db)?;
+        ensure!(
+            !bob_bytes.windows(secret_payload.len()).any(|w| w == secret_payload.as_bytes()),
+            "Bob database contains Alice's secret payload!"
+        );
+    }
+    let bob_local = json_command(&binary, bob, &["request", "list", "--offline"], b"").await?;
+    ensure!(bob_local["drafts"].as_array().unwrap().is_empty(), "Bob sees non-empty drafts!");
+    let before_resume = service_rows(&bob.identity.did)?;
+    let bob_resume = json_command(&binary, bob, &["request", "resume", &draft_id], b"").await?;
+    ensure!(
+        bob_resume["status"] == "unconfirmed"
+            && bob_resume["error"].as_str().is_some_and(|e| e.contains("Unknown local request draft")),
+        "Bob resumed Alice draft or failed for an unrelated reason: {bob_resume}"
+    );
+    ensure!(
+        service_rows(&bob.identity.did)? == before_resume,
+        "Bob's refused resume changed guarded request attempts or publications"
+    );
+
+    eprintln!("C30 TUI: Alice re-opens TUI (authentic draft restored and resumed)");
     let mut alice_tui2 = Tui::start(&binary, alice).await?;
     alice_tui2.expect("ready ·", 120).await?;
     alice_tui2.keys("\u{12}").await?; // Ctrl-R
     alice_tui2.expect(&draft_id, 30).await?;
+    alice_tui2.expect("u resume draft", 10).await?;
+
+    // Select and resume her draft
+    alice_tui2.keys("u").await?;
+    alice_tui2.expect("One encrypted introduction", 30).await?;
+    alice_tui2.expect(secret_payload, 30).await?;
+    alice_tui2.expect(&bob.identity.did, 30).await?;
+
+    // Edit the resumed draft in TUI
+    let modified_suffix = " -- RESUMED_IN_TUI_AND_SAVED";
+    alice_tui2.keys(modified_suffix).await?;
+    alice_tui2.expect("Draft is saved on this device", 30).await?;
+
+    // Quit sends Esc from the composer to Chat, then Ctrl-Q.
     alice_tui2.quit().await?;
+
+    // The signed CLI owns its Keychain item; reopening it proves decryption
+    // without asking this differently signed test process for Keychain access.
+    eprintln!("C30 TUI: verifying edited draft after signed process restart");
+    let mut alice_tui3 = Tui::start(&binary, alice).await?;
+    alice_tui3.expect("ready ·", 120).await?;
+    alice_tui3.keys("\u{12}").await?;
+    alice_tui3.expect(&draft_id, 30).await?;
+    alice_tui3.keys("u").await?;
+    alice_tui3.expect(secret_payload, 30).await?;
+    alice_tui3.expect(modified_suffix, 30).await?;
+    alice_tui3.expect(&bob.identity.did, 30).await?;
+    alice_tui3.quit().await?;
+    let status = json_command(&binary, alice, &["request", "status", &draft_id], b"").await?;
+    ensure!(status["recipientDid"] == bob.identity.did, "resumed draft recipient changed");
+    ensure!(status["attempted"] == false, "resumed draft was published");
+
+    let raw_bytes_after = std::fs::read(&alice_db)?;
+    ensure!(
+        !raw_bytes_after.windows(secret_payload.len()).any(|w| w == secret_payload.as_bytes()),
+        "Alice database leaked plaintext secret after resume!"
+    );
+    ensure!(
+        !raw_bytes_after.windows(modified_suffix.len()).any(|w| w == modified_suffix.as_bytes()),
+        "Alice database leaked plaintext modified text after resume!"
+    );
+
+    // Bob's signed CLI and TUI already proved his storage has no Alice draft.
 
     std::fs::write(
         evidence.join("c30-tui-result.json"),
@@ -1304,14 +1386,19 @@ async fn actual_tui_c30_protected_storage_and_account_isolation() -> anyhow::Res
             "draftId": draft_id,
             "protectedStorage": {
                 "databasePath": alice_db.display().to_string(),
-                "databaseBytes": raw_bytes.len(),
+                "databaseBytes": raw_bytes_after.len(),
                 "plaintextLeakedOnDisk": false,
                 "unkeyedOpenFailed": true,
+                "encryptedSqlcipherHeader": true,
+                "authenticatedSignedTuiReopenVerified": true,
             },
             "tuiAccountIsolation": {
                 "bobTuiCannotSeeAliceDraftId": true,
                 "bobTuiCannotSeeAliceDraftText": true,
+                "bobTuiCannotResumeAliceDraft": true,
                 "aliceTuiReopenRestoresDraft": true,
+                "aliceTuiSelectResumeEntersComposer": true,
+                "aliceTuiResumedDraftPersistsEdits": true,
             }
         }))?,
     )?;

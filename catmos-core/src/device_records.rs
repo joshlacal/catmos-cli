@@ -9,15 +9,17 @@ use base64::{
     Engine,
 };
 use catbird_mls::chat_v2::ids::BareDid;
-use reqwest::{Client, Response};
+use reqwest::{Client, Response, StatusCode};
 use serde_json::Value;
 use url::Url;
 
 use crate::error::{CatmosError, Result};
 
 pub(crate) const COLLECTION: &str = "blue.catbird.chat.device";
+pub(crate) const CHAT_DECLARATION_COLLECTION: &str = "blue.catbird.chat.declaration";
+pub(crate) const DECLARATION_RKEY: &str = "self";
 const MAX_PAGES: usize = 20;
-const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 fn invalid(detail: &str) -> CatmosError {
     CatmosError::Other(format!("Could not verify repository device keys: {detail}"))
@@ -31,7 +33,10 @@ pub(crate) fn public_client() -> Result<Client> {
         .map_err(|_| invalid("HTTP client initialization failed"))
 }
 
-pub(crate) async fn response_json(mut response: Response) -> Result<Value> {
+pub(crate) async fn response_bytes(mut response: Response) -> Result<Vec<u8>> {
+    if response.status().is_redirection() {
+        return Err(invalid("redirect response rejected"));
+    }
     if response
         .content_length()
         .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
@@ -49,6 +54,11 @@ pub(crate) async fn response_json(mut response: Response) -> Result<Value> {
         }
         body.extend_from_slice(&chunk);
     }
+    Ok(body)
+}
+
+pub(crate) async fn response_json(response: Response) -> Result<Value> {
+    let body = response_bytes(response).await?;
     serde_json::from_slice(&body).map_err(|_| invalid("invalid JSON response"))
 }
 
@@ -77,7 +87,7 @@ pub(crate) fn xrpc_url(base: &Url, method: &str) -> Url {
     url
 }
 
-fn did_document_url(did: &str) -> Result<Url> {
+pub(crate) fn did_document_url(did: &str) -> Result<Url> {
     BareDid::parse(did).map_err(|_| invalid("invalid bare DID"))?;
     let url = if let Some(host) = did.strip_prefix("did:web:") {
         format!("https://{host}/.well-known/did.json")
@@ -87,7 +97,7 @@ fn did_document_url(did: &str) -> Result<Url> {
     Url::parse(&url).map_err(|_| invalid("invalid DID document URL"))
 }
 
-fn pds_from_document(did: &str, document: &Value) -> Result<Url> {
+pub(crate) fn pds_from_document(did: &str, document: &Value) -> Result<Url> {
     if document.get("id").and_then(Value::as_str) != Some(did) {
         return Err(invalid("DID document identity does not match"));
     }
@@ -265,6 +275,105 @@ pub(crate) async fn authorized_keys(did: &str) -> Result<Vec<Vec<u8>>> {
     keys.sort();
     keys.dedup();
     Ok(keys)
+}
+
+pub(crate) fn parse_chat_declaration(did: &str, record_value: &Value) -> Result<String> {
+    let expected_uri = format!("at://{did}/{CHAT_DECLARATION_COLLECTION}/{DECLARATION_RKEY}");
+    if record_value.get("uri").and_then(Value::as_str) != Some(&expected_uri) {
+        return Err(invalid("declaration record URI does not match expected identity"));
+    }
+    let record = record_value
+        .get("value")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("declaration record has no value"))?;
+    if let Some(record_type) = record.get("$type").and_then(Value::as_str) {
+        if record_type != CHAT_DECLARATION_COLLECTION {
+            return Err(invalid("declaration record has an unsupported type"));
+        }
+    }
+    let delivery_service = record
+        .get("deliveryService")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("declaration record has no deliveryService"))?;
+    BareDid::parse(delivery_service)
+        .map_err(|_| invalid("declaration deliveryService is not a valid bare DID"))?;
+    Ok(delivery_service.to_owned())
+}
+
+pub(crate) async fn read_chat_declaration(
+    client: &Client,
+    pds: &Url,
+    did: &str,
+) -> Result<Option<String>> {
+    BareDid::parse(did).map_err(|_| invalid("invalid bare DID"))?;
+    let mut url = xrpc_url(pds, "com.atproto.repo.getRecord");
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("repo", did)
+            .append_pair("collection", CHAT_DECLARATION_COLLECTION)
+            .append_pair("rkey", DECLARATION_RKEY);
+    }
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| invalid("PDS read failed; please retry"))?;
+    if response.status().is_redirection() {
+        return Err(invalid("PDS redirected declaration getRecord request"));
+    }
+    let status = response.status();
+    let bytes = response_bytes(response).await?;
+    if status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND {
+        let error_body: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| invalid("invalid error JSON from PDS"))?;
+        if error_body.get("error").and_then(Value::as_str) == Some("RecordNotFound") {
+            return Ok(None);
+        }
+        return Err(invalid(&format!(
+            "PDS returned error: {:?}",
+            error_body.get("error")
+        )));
+    }
+    if !status.is_success() {
+        return Err(invalid(&format!("PDS returned status {}", status)));
+    }
+    let record = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid("invalid declaration JSON response"))?;
+    parse_chat_declaration(did, &record).map(Some)
+}
+
+pub(crate) async fn chat_declaration_authority(did: &str) -> Result<Option<String>> {
+    let client = public_client()?;
+    let pds = resolve_pds(&client, did).await?;
+    read_chat_declaration(&client, &pds, did).await
+}
+
+pub(crate) async fn receipt_authority_document(expected_did: &str) -> Result<Vec<u8>> {
+    BareDid::parse(expected_did).map_err(|_| invalid("invalid bare DID"))?;
+    let client = public_client()?;
+    let url = did_document_url(expected_did)?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| invalid("authority DID resolution failed; please retry"))?;
+    if response.status().is_redirection() {
+        return Err(invalid("authority DID resolution redirected"));
+    }
+    if !response.status().is_success() {
+        return Err(invalid(&format!(
+            "authority DID resolution returned {}",
+            response.status()
+        )));
+    }
+    let bytes = response_bytes(response).await?;
+    let doc: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid("invalid authority DID document JSON"))?;
+    if doc.get("id").and_then(Value::as_str) != Some(expected_did) {
+        return Err(invalid("authority DID document identity does not match"));
+    }
+    Ok(bytes)
 }
 
 /// Publish only an absent UUID record. A concurrent writer or a lost write ACK

@@ -113,6 +113,21 @@ struct Fixture {
     pages: VecDeque<(StatusCode, Value)>,
     queries: Vec<HashMap<String, String>>,
 }
+async fn pds_handler(
+    State(state): State<Arc<Mutex<Fixture>>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> (StatusCode, Json<Value>) {
+    assert!(
+        headers.get("authorization").is_none(),
+        "public PDS read carried credentials"
+    );
+    let mut state = state.lock().unwrap();
+    state.queries.push(query);
+    let (status, body) = state.pages.pop_front().expect("unexpected PDS request");
+    (status, Json(body))
+}
+
 async fn server(
     pages: Vec<(StatusCode, Value)>,
 ) -> (Url, Arc<Mutex<Fixture>>, tokio::task::JoinHandle<()>) {
@@ -123,20 +138,11 @@ async fn server(
     let app = Router::new()
         .route(
             "/base/xrpc/com.atproto.repo.listRecords",
-            get(
-                |State(state): State<Arc<Mutex<Fixture>>>,
-                 headers: HeaderMap,
-                 Query(query): Query<HashMap<String, String>>| async move {
-                    assert!(
-                        headers.get("authorization").is_none(),
-                        "public PDS read carried credentials"
-                    );
-                    let mut state = state.lock().unwrap();
-                    state.queries.push(query);
-                    let (status, body) = state.pages.pop_front().expect("unexpected PDS request");
-                    (status, Json(body))
-                },
-            ),
+            get(pds_handler),
+        )
+        .route(
+            "/base/xrpc/com.atproto.repo.getRecord",
+            get(pds_handler),
         )
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -329,4 +335,98 @@ async fn publication_failure_or_concurrent_conflict_requires_exact_readback() {
         assert_eq!(state.lock().unwrap().queries.len(), 2);
         handle.abort();
     }
+}
+
+#[test]
+fn chat_declaration_requires_exact_scope_uri_and_valid_authority_did() {
+    let valid = json!({
+        "uri": format!("at://{DID}/{CHAT_DECLARATION_COLLECTION}/{DECLARATION_RKEY}"),
+        "value": {
+            "$type": CHAT_DECLARATION_COLLECTION,
+            "deliveryService": "did:web:chat.catbird.blue",
+            "protocolVersion": "1",
+            "allowIncoming": "all",
+            "createdAt": "2026-09-01T00:00:00Z"
+        }
+    });
+    assert_eq!(
+        parse_chat_declaration(DID, &valid).unwrap(),
+        "did:web:chat.catbird.blue"
+    );
+
+    let mut wrong_repo = valid.clone();
+    wrong_repo["uri"] = json!(format!(
+        "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/{CHAT_DECLARATION_COLLECTION}/{DECLARATION_RKEY}"
+    ));
+    assert!(parse_chat_declaration(DID, &wrong_repo).is_err());
+
+    let mut wrong_rkey = valid.clone();
+    wrong_rkey["uri"] = json!(format!("at://{DID}/{CHAT_DECLARATION_COLLECTION}/other"));
+    assert!(parse_chat_declaration(DID, &wrong_rkey).is_err());
+
+    let mut wrong_type = valid.clone();
+    wrong_type["value"]["$type"] = json!("blue.catbird.chat.other");
+    assert!(parse_chat_declaration(DID, &wrong_type).is_err());
+
+    for invalid_did in [
+        "not-a-did",
+        "did:web:chat.catbird.blue:folder",
+        "did:web:chat.catbird.blue%3A444",
+        "did:plc:invalid#frag",
+    ] {
+        let mut bad_auth = valid.clone();
+        bad_auth["value"]["deliveryService"] = json!(invalid_did);
+        assert!(parse_chat_declaration(DID, &bad_auth).is_err());
+    }
+}
+
+#[tokio::test]
+async fn chat_declaration_get_record_distinguishes_record_not_found_from_unavailability() {
+    let (url, state, handle) = server(vec![
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"error": "RecordNotFound", "message": "Record not found"}),
+        ),
+        (
+            StatusCode::OK,
+            json!({
+                "uri": format!("at://{DID}/{CHAT_DECLARATION_COLLECTION}/{DECLARATION_RKEY}"),
+                "value": {
+                    "$type": CHAT_DECLARATION_COLLECTION,
+                    "deliveryService": "did:web:chat.catbird.blue",
+                    "protocolVersion": "1",
+                    "allowIncoming": "all",
+                    "createdAt": "2026-09-01T00:00:00Z"
+                }
+            }),
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"error": "InvalidRequest", "message": "Bad request"}),
+        ),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "InternalServerError"}),
+        ),
+    ])
+    .await;
+
+    let client = public_client().unwrap();
+
+    let res1 = read_chat_declaration(&client, &url, DID).await.unwrap();
+    assert_eq!(res1, None);
+
+    let res2 = read_chat_declaration(&client, &url, DID).await.unwrap();
+    assert_eq!(res2.as_deref(), Some("did:web:chat.catbird.blue"));
+
+    assert!(read_chat_declaration(&client, &url, DID).await.is_err());
+
+    assert!(read_chat_declaration(&client, &url, DID).await.is_err());
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.queries[0]["repo"], DID);
+    assert_eq!(state.queries[0]["collection"], CHAT_DECLARATION_COLLECTION);
+    assert_eq!(state.queries[0]["rkey"], DECLARATION_RKEY);
+    drop(state);
+    handle.abort();
 }
