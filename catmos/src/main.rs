@@ -883,7 +883,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     }
                 }
             }
-            DeviceCommands::Register { name } => {
+            DeviceCommands::Register { name: _ } => {
                 let svc = init_service().await?;
                 let orch = svc
                     .orchestrator()
