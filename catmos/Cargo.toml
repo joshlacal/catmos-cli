@@ -11,13 +11,13 @@ path = "src/main.rs"
 catmos-core = { workspace = true }
 catmos-tui = { workspace = true }
 catbird-mls = { workspace = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tracing-log = "0.2"
+tracing-log = "0.2.0"
 anyhow = { workspace = true }
-rpassword = "7"
-hex = "0.4"
-rand = "0.8"
+rpassword = "7.5.4"
+hex = "0.4.3"
+rand = "0.10.3"
 serde_json = { workspace = true }

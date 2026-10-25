@@ -23,7 +23,7 @@ impl SystemKeychain {
         let service = service.into();
         // Probe the system keychain to decide whether to use fallback
         let needs_fallback = std::env::var_os("CATMOS_TEST_KEYCHAIN_FALLBACK").is_some() || {
-            let entry = keyring::Entry::new(&service, "__probe__");
+            let entry = crate::native_keyring::entry(&service, "__probe__");
             match entry {
                 Ok(e) => {
                     // Try a read; NoEntry is fine, a platform error means fallback
@@ -60,7 +60,7 @@ impl KeychainAccess for SystemKeychain {
         }
         drop(fb);
 
-        let entry = keyring::Entry::new(&self.service, &key)
+        let entry = crate::native_keyring::entry(&self.service, &key)
             .map_err(|e| MLSError::Internal(format!("Keyring entry error: {e}")))?;
         match entry.get_password() {
             Ok(val) => Ok(Some(val.into_bytes())),
@@ -83,7 +83,7 @@ impl KeychainAccess for SystemKeychain {
 
         let password = String::from_utf8(value)
             .map_err(|e| MLSError::Internal(format!("Non-UTF8 keychain value: {e}")))?;
-        let entry = keyring::Entry::new(&self.service, &key)
+        let entry = crate::native_keyring::entry(&self.service, &key)
             .map_err(|e| MLSError::Internal(format!("Keyring entry error: {e}")))?;
         entry
             .set_password(&password)
@@ -102,7 +102,7 @@ impl KeychainAccess for SystemKeychain {
         }
         drop(fb);
 
-        let entry = keyring::Entry::new(&self.service, &key)
+        let entry = crate::native_keyring::entry(&self.service, &key)
             .map_err(|e| MLSError::Internal(format!("Keyring entry error: {e}")))?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -124,7 +124,7 @@ pub fn get_or_create_db_key(did: &str) -> Result<String> {
         return Ok(derive_key_from_did(did));
     }
     let service = "catmos-mls-db";
-    let entry = keyring::Entry::new(service, did);
+    let entry = crate::native_keyring::entry(service, did);
 
     match entry {
         Ok(e) => {
@@ -171,9 +171,9 @@ pub fn get_or_create_db_key(did: &str) -> Result<String> {
 }
 
 fn generate_random_hex_key() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let bytes: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
     hex::encode(bytes)
 }
 

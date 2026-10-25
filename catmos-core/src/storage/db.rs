@@ -63,7 +63,7 @@ impl Database {
         let options = SqliteConnectOptions::from_str(&url)
             .map_err(|e| CatmosError::Storage(format!("Invalid DB path: {e}")))?
             .create_if_missing(true)
-            .pragma("key", format!("'{encryption_key}'"))
+            .pragma("key", format!("'{}'", encryption_key.replace('\'', "''")))
             .pragma("cipher_page_size", "4096".to_string())
             .pragma("journal_mode", "WAL".to_string());
 
@@ -213,7 +213,7 @@ impl Database {
         ];
 
         for (name, sql) in &statements {
-            sqlx::query(sql)
+            sqlx::query(*sql)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| CatmosError::Storage(format!("Migration '{name}' failed: {e}")))?;
@@ -266,7 +266,9 @@ impl Database {
                 continue;
             }
             let stmt = format!("ALTER TABLE conversations ADD COLUMN {col} {decl}");
-            sqlx::query(&stmt)
+            // Both identifiers and declarations come only from the fixed
+            // migration array above; no request/user values enter this SQL.
+            sqlx::query(sqlx::AssertSqlSafe(stmt))
                 .execute(&self.pool)
                 .await
                 .map_err(|e| CatmosError::Storage(format!("Add column '{col}' failed: {e}")))?;
@@ -309,9 +311,14 @@ impl Database {
                 continue;
             }
             let stmt = format!("ALTER TABLE messages ADD COLUMN {col} {decl}");
-            sqlx::query(&stmt).execute(&self.pool).await.map_err(|e| {
-                CatmosError::Storage(format!("Add messages column '{col}' failed: {e}"))
-            })?;
+            // Both identifiers and declarations come only from the fixed
+            // migration array above; no request/user values enter this SQL.
+            sqlx::query(sqlx::AssertSqlSafe(stmt))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    CatmosError::Storage(format!("Add messages column '{col}' failed: {e}"))
+                })?;
         }
 
         // ── MLSMessageFieldMigrationV1: drop pre-cutover plaintext rows ──

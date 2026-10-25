@@ -6,15 +6,19 @@ resolver = "2"
 catmos-core = { path = "catmos-core" }
 catmos-tui = { path = "catmos-tui" }
 catbird-mls = { path = "../catbird-mls", package = "catbird_mls" }
-catbird-atproto = { path = "../catbird-atproto", features = ["streaming"] }
-jacquard = "0.9"
-jacquard-common = { version = "0.9", features = ["websocket"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = "1"
-anyhow = "1"
-bytes = { version = "1", features = ["serde"] }
-ulid = "1"
+catbird-atproto = { git = "https://github.com/joshlacal/catbird-atproto", rev = "d3da6f7f4fce482e3255c74128a05a40001af671", features = ["streaming"] }
+jacquard = { version = "0.13.0", git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d" }
+jacquard-common = { version = "0.13.0", git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d", features = ["websocket"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+bytes = { version = "1.12.1", features = ["serde"] }
+ulid = "3.0.0"
+
+[patch.crates-io]
+# Keep SQLx and the shared MLS provider linked to one maintained SQLite ABI.
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }

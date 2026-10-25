@@ -11,9 +11,9 @@ use tracing::{debug, info, warn};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::orchestrator_bridge::FFICommitKind;
 use catbird_mls::{GroupConfig, KeyPackageData};
-use catbird_mls::orchestrator::credentials::CredentialStore;
 
 use crate::auth::{AuthMethod, TokenSession};
 use crate::error::{CatmosError, Result};
@@ -53,7 +53,8 @@ pub(crate) fn is_expired_token_response(status: StatusCode, body: &[u8]) -> bool
         return false;
     }
     if let Ok(text) = std::str::from_utf8(body) {
-        return text.contains(r#""error":"ExpiredToken"#) || text.contains(r#""error": "ExpiredToken"#);
+        return text.contains(r#""error":"ExpiredToken"#)
+            || text.contains(r#""error": "ExpiredToken"#);
     }
     false
 }
@@ -99,11 +100,9 @@ mod serde_bytes_wrapper {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         match BytesEnvelope::deserialize(d)? {
-            BytesEnvelope::DollarBytes { bytes } | BytesEnvelope::Base64String(bytes) => {
-                BASE64
-                    .decode(&bytes)
-                    .map_err(|e| D::Error::custom(format!("invalid $bytes base64: {e}")))
-            }
+            BytesEnvelope::DollarBytes { bytes } | BytesEnvelope::Base64String(bytes) => BASE64
+                .decode(&bytes)
+                .map_err(|e| D::Error::custom(format!("invalid $bytes base64: {e}"))),
             BytesEnvelope::ByteArray(vec) => Ok(vec),
         }
     }
@@ -225,7 +224,10 @@ impl ChatService {
         };
         let resp = self
             .http
-            .get(format!("{}/xrpc/app.bsky.actor.getProfile", base_url.trim_end_matches('/')))
+            .get(format!(
+                "{}/xrpc/app.bsky.actor.getProfile",
+                base_url.trim_end_matches('/')
+            ))
             .query(&[("actor", did)])
             .send()
             .await
@@ -460,7 +462,10 @@ impl ChatService {
 
         if !is_sensitive_device_endpoint {
             let sample_len = body_bytes.len().min(500);
-            tracing::debug!("XRPC {nsid} raw: {}", String::from_utf8_lossy(&body_bytes[..sample_len]));
+            tracing::debug!(
+                "XRPC {nsid} raw: {}",
+                String::from_utf8_lossy(&body_bytes[..sample_len])
+            );
         }
         serde_json::from_slice::<R>(&body_bytes).map_err(|e| {
             if is_sensitive_device_endpoint {
@@ -548,19 +553,30 @@ Body: {}",
 
                 // 2. If pds_base was bsky.social or direct failed, resolve actual PDS from plc.directory
                 let did = self.did();
-                if let Ok(plc_resp) = self.http.get(&format!("https://plc.directory/{did}")).send().await {
+                if let Ok(plc_resp) = self
+                    .http
+                    .get(&format!("https://plc.directory/{did}"))
+                    .send()
+                    .await
+                {
                     if let Ok(doc) = plc_resp.json::<serde_json::Value>().await {
                         if let Some(services) = doc.get("service").and_then(|v| v.as_array()) {
                             for svc in services {
-                                if let Some(endpoint) = svc.get("serviceEndpoint").and_then(|v| v.as_str()) {
+                                if let Some(endpoint) =
+                                    svc.get("serviceEndpoint").and_then(|v| v.as_str())
+                                {
                                     let ep_clean = endpoint.trim_end_matches('/');
-                                    if let Ok(Some(tok)) = try_get_service_auth(ep_clean, &access_jwt).await {
+                                    if let Ok(Some(tok)) =
+                                        try_get_service_auth(ep_clean, &access_jwt).await
+                                    {
                                         return Ok(tok);
                                     }
                                     // Try refreshing access_jwt and retrying
                                     if let Ok(new_jwt) = sess.refresh(&self.db).await {
                                         access_jwt = new_jwt;
-                                        if let Ok(Some(tok)) = try_get_service_auth(ep_clean, &access_jwt).await {
+                                        if let Ok(Some(tok)) =
+                                            try_get_service_auth(ep_clean, &access_jwt).await
+                                        {
                                             return Ok(tok);
                                         }
                                     }
@@ -957,7 +973,7 @@ Body: {}",
             None,
             None,
             None,
-            Some(ulid::Ulid::new().to_string()),
+            Some(ulid::Ulid::generate().to_string()),
         );
 
         match self
@@ -1028,7 +1044,7 @@ Body: {}",
             None,
             None,
             Some(vec![member_did.to_string()]),
-            Some(ulid::Ulid::new().to_string()),
+            Some(ulid::Ulid::generate().to_string()),
         );
 
         self.track_own_commit(&plan.commit_bytes).await;
@@ -1096,7 +1112,7 @@ Body: {}",
             None,
             None,
             Some(vec![member_did.to_string()]),
-            Some(ulid::Ulid::new().to_string()),
+            Some(ulid::Ulid::generate().to_string()),
         );
 
         self.track_own_commit(&plan.commit_bytes).await;
@@ -1211,7 +1227,7 @@ Body: {}",
             .with_context(|ctx| ctx.encrypt_message(group_id_bytes.clone(), plaintext))?;
 
         let epoch = self.get_epoch(convo_id).unwrap_or(0);
-        let msg_id = ulid::Ulid::new().to_string();
+        let msg_id = ulid::Ulid::generate().to_string();
         let padded_size = encrypt_result.ciphertext.len() as i64;
         let confirmation_tag = self.get_confirmation_tag_b64(&group_id_bytes);
 
@@ -1435,9 +1451,18 @@ Body: {}",
             .xrpc_procedure("blue.catbird.chat.revokeDevice", &req)
             .await?;
 
-        let deleted = resp.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false);
-        let kp_deleted = resp.get("keyPackagesDeleted").and_then(|v| v.as_i64()).unwrap_or(0);
-        let convos_left = resp.get("conversationsLeft").and_then(|v| v.as_i64()).unwrap_or(0);
+        let deleted = resp
+            .get("deleted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let kp_deleted = resp
+            .get("keyPackagesDeleted")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let convos_left = resp
+            .get("conversationsLeft")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
 
         Ok((deleted, kp_deleted, convos_left))
     }
@@ -1483,7 +1508,9 @@ Body: {}",
         let url = match &self.auth {
             AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
             AuthMethod::AppPassword { pds_url, .. } => {
-                if nsid.starts_with("blue.catbird.chat.") || nsid.starts_with("blue.catbird.mlsChat.") {
+                if nsid.starts_with("blue.catbird.chat.")
+                    || nsid.starts_with("blue.catbird.mlsChat.")
+                {
                     let proxy_val = crate::mls::atproto_proxy_header_value();
                     if let Ok(hv) = HeaderValue::from_str(&proxy_val) {
                         headers.insert(

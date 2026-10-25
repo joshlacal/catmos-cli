@@ -10,7 +10,7 @@ use jacquard::client::credential_session::{CredentialSession, SessionKey};
 use jacquard::client::{AtpSession, MemoryCredentialSession};
 use jacquard_common::session::{MemorySessionStore, SessionStore};
 use jacquard_common::types::string::{Did, Handle};
-use jacquard_common::{AuthorizationToken, CowStr};
+use jacquard_common::AuthorizationToken;
 use jacquard_identity::PublicResolver;
 
 use crate::error::{CatmosError, Result};
@@ -27,7 +27,7 @@ const SESSION_ID: &str = "catmos";
 pub struct TokenSession {
     session: Arc<MemoryCredentialSession>,
     store: Arc<MemorySessionStore<SessionKey, AtpSession>>,
-    did: Did<'static>,
+    did: Did,
     handle: String,
     pds_url: String,
 }
@@ -53,14 +53,7 @@ impl TokenSession {
         let session: MemoryCredentialSession = CredentialSession::new(store.clone(), resolver);
 
         session
-            .login(
-                CowStr::from(handle.to_string()),
-                CowStr::from(app_password.to_string()),
-                Some(CowStr::new_static(SESSION_ID)),
-                None,
-                None,
-                None,
-            )
+            .login(handle, app_password, Some(SESSION_ID), None, None, None)
             .await
             .map_err(|e| CatmosError::AuthFailed(format!("login failed: {e}")))?;
 
@@ -68,11 +61,16 @@ impl TokenSession {
             .session_info()
             .await
             .ok_or_else(|| CatmosError::AuthFailed("no session after login".into()))?;
-        let did = key.0.clone();
+        let did = key.did.clone();
         let atp = store.get(&key).await.ok_or_else(|| {
             CatmosError::AuthFailed("session missing from store after login".into())
         })?;
-        let pds_url = session.endpoint().await.trim_end_matches('/').to_string();
+        let pds_url = session
+            .endpoint()
+            .await
+            .as_str()
+            .trim_end_matches('/')
+            .to_string();
 
         Ok(Self {
             session: Arc::new(session),
@@ -103,15 +101,20 @@ impl TokenSession {
         })?;
 
         let atp = AtpSession {
-            access_jwt: CowStr::from(access_jwt),
-            refresh_jwt: CowStr::from(refresh_jwt),
+            access_jwt: access_jwt.into(),
+            refresh_jwt: refresh_jwt.into(),
             did: did.clone(),
             handle: handle_parsed,
+            pds: Some(
+                jacquard::deps::fluent_uri::Uri::parse(pds_url.clone()).map_err(|(e, _)| {
+                    CatmosError::AuthFailed(format!("invalid PDS URL in stored session: {e}"))
+                })?,
+            ),
         };
 
         let store: Arc<MemorySessionStore<SessionKey, AtpSession>> =
             Arc::new(MemorySessionStore::default());
-        let key = SessionKey(did.clone(), CowStr::new_static(SESSION_ID));
+        let key = SessionKey::new(did.clone(), SESSION_ID);
         store
             .set(key.clone(), atp)
             .await
@@ -121,15 +124,12 @@ impl TokenSession {
         let session: MemoryCredentialSession = CredentialSession::new(store.clone(), resolver);
 
         session
-            .restore(did.clone(), CowStr::new_static(SESSION_ID))
+            .restore(did.clone(), SESSION_ID)
             .await
             .map_err(|e| CatmosError::AuthFailed(format!("restore failed: {e}")))?;
 
-        // `restore` may resolve the PDS via DID doc; override with the cached
-        // value to save a round-trip when we already know it.
-        if let Ok(url) = url::Url::parse(&pds_url) {
-            session.set_endpoint(url).await;
-        }
+        // The cached PDS is part of AtpSession, so activation needs no DID
+        // resolution and preserves the previously persisted endpoint.
 
         Ok(Self {
             session: Arc::new(session),
@@ -147,7 +147,7 @@ impl TokenSession {
             .access_token()
             .await
             .ok_or_else(|| CatmosError::AuthFailed("no access token in session".into()))?;
-        Ok(bearer_string(token))
+        bearer_string(token)
     }
 
     /// Force a `com.atproto.server.refreshSession` call and return the new bearer.
@@ -158,14 +158,14 @@ impl TokenSession {
             .refresh()
             .await
             .map_err(|e| CatmosError::AuthFailed(format!("refresh failed: {e}")))?;
-        let bearer = bearer_string(token);
+        let bearer = bearer_string(token)?;
         self.persist(db).await?;
         Ok(bearer)
     }
 
     /// Write the session's current access/refresh JWTs into the DB session table.
     pub async fn persist(&self, db: &Database) -> Result<()> {
-        let key = SessionKey(self.did.clone(), CowStr::new_static(SESSION_ID));
+        let key = SessionKey::new(self.did.clone(), SESSION_ID);
         let atp = self
             .store
             .get(&key)
@@ -185,9 +185,30 @@ impl TokenSession {
     }
 }
 
-fn bearer_string(token: AuthorizationToken<'_>) -> String {
+fn bearer_string(token: AuthorizationToken) -> Result<String> {
     match token {
-        AuthorizationToken::Bearer(s) => s.to_string(),
-        AuthorizationToken::Dpop(s) => s.to_string(),
+        AuthorizationToken::Bearer(s) => Ok(s.to_string()),
+        // This adapter is exclusively an app-password credential session.
+        // Proof-bound OAuth/delegation tokens require their own request signer.
+        AuthorizationToken::Dpop(_) | AuthorizationToken::Delegation(_) => {
+            Err(CatmosError::AuthFailed(
+                "credential session returned a token requiring a proof signer".into(),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn credential_adapter_never_downgrades_proof_bound_tokens() {
+        assert_eq!(
+            bearer_string(AuthorizationToken::Bearer("fixture".into())).unwrap(),
+            "fixture"
+        );
+        assert!(bearer_string(AuthorizationToken::Dpop("fixture".into())).is_err());
+        assert!(bearer_string(AuthorizationToken::Delegation("fixture".into())).is_err());
     }
 }

@@ -5,7 +5,7 @@ use axum::response::Html;
 use axum::routing::get;
 use axum::Router;
 use base64::Engine as _;
-use rand::RngCore;
+use rand::TryRng;
 use tokio::sync::oneshot;
 use url::Url;
 
@@ -95,10 +95,12 @@ impl CallbackState {
 
 const MAX_OAUTH_RESPONSE_BYTES: usize = 16 * 1024;
 
-fn generate_browser_nonce() -> String {
+fn generate_browser_nonce() -> Result<String> {
     let mut bytes = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|e| CatmosError::AuthFailed(format!("OS randomness unavailable: {e}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn build_login_url(
@@ -231,7 +233,7 @@ impl OAuthAuth {
         let redirect_url = Url::parse(&redirect_to)
             .map_err(|e| CatmosError::Network(format!("invalid loopback redirect: {e}")))?;
         let redirect_origin = redirect_url.origin().ascii_serialization();
-        let browser_nonce = generate_browser_nonce();
+        let browser_nonce = generate_browser_nonce()?;
         let auth_url = build_login_url(nest_url, handle, &redirect_to, &browser_nonce)?;
 
         let (tx, rx) = oneshot::channel::<PendingExchange>();

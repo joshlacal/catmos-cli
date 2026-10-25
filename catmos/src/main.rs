@@ -9,14 +9,14 @@ use catmos_core::auth::oauth::OAuthAuth;
 use catmos_core::auth::restore_saved_auth;
 use catmos_core::chat::ChatService;
 use catmos_core::mls::{MlsManager, MLS_CIPHER_SUITE};
-use catmos_core::storage::aliases::AliasStore;
-use catmos_core::storage::config::Config;
-use catmos_core::storage::db::Database;
 use catmos_core::orchestrator_api::CliApiClient;
 use catmos_core::orchestrator_credentials::KeyringCredentialStore;
 use catmos_core::orchestrator_storage::SqliteStorage;
-use catmos_core::CliOrchestrator;
+use catmos_core::storage::aliases::AliasStore;
+use catmos_core::storage::config::Config;
+use catmos_core::storage::db::Database;
 use catmos_core::types::MessageContent;
+use catmos_core::CliOrchestrator;
 
 #[derive(Parser)]
 #[command(name = "catmos", about = "MLS group chat in your terminal")]
@@ -154,20 +154,9 @@ enum ConvoCommands {
     JoinWelcome {
         convo: String,
     },
+    /// Recover this device using the current server coordinate and any retained Welcome.
     RequestRecovery {
         convo: String,
-        #[arg(long)]
-        group_id: String,
-        #[arg(long)]
-        confirmation_tag: String,
-        #[arg(long)]
-        group_context_hash: String,
-        #[arg(long, default_value = "0")]
-        epoch: u64,
-        #[arg(long, default_value = "1")]
-        state_version: i64,
-        #[arg(long)]
-        kind: Option<String>,
     },
     Leave {
         convo: String,
@@ -290,23 +279,22 @@ async fn init_service() -> anyhow::Result<Arc<ChatService>> {
     ));
 
     let orchestrator_db = account_dir.join("orchestrator.db");
-    let orchestrator_storage = Arc::new(
-        SqliteStorage::new(
-            orchestrator_db.to_string_lossy().as_ref(),
-            &db_key,
-        )?,
-    );
+    let orchestrator_storage = Arc::new(SqliteStorage::new(
+        orchestrator_db.to_string_lossy().as_ref(),
+        &db_key,
+    )?);
     orchestrator_storage.set_mls_context(mls.context().clone());
     let orchestrator_api = Arc::new(CliApiClient::new(service.clone()));
-    let credentials = Arc::new(KeyringCredentialStore::try_new()
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?);
-    let orchestrator: Arc<CliOrchestrator> = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
-        mls.context().clone(),
-        orchestrator_storage,
-        orchestrator_api,
-        credentials,
-        catbird_mls::orchestrator::OrchestratorConfig::default(),
-    ));
+    let credentials =
+        Arc::new(KeyringCredentialStore::try_new().map_err(|e| anyhow::anyhow!(e.to_string()))?);
+    let orchestrator: Arc<CliOrchestrator> =
+        Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+            mls.context().clone(),
+            orchestrator_storage,
+            orchestrator_api,
+            credentials,
+            catbird_mls::orchestrator::OrchestratorConfig::default(),
+        ));
     service.set_orchestrator(orchestrator.clone()).await;
     if let Err(e) = orchestrator.initialize(&did).await {
         tracing::warn!("orchestrator initialization failed: {e}");
@@ -324,8 +312,7 @@ async fn init_service() -> anyhow::Result<Arc<ChatService>> {
             // catmos-cli last ran.
             match service.list_own_blocks().await {
                 Ok(blocks) if !blocks.is_empty() => {
-                    let blocked: std::collections::HashSet<String> =
-                        blocks.into_iter().collect();
+                    let blocked: std::collections::HashSet<String> = blocks.into_iter().collect();
                     let convos_to_leave: Vec<String> = service
                         .conversations()
                         .await
@@ -343,9 +330,7 @@ async fn init_service() -> anyhow::Result<Arc<ChatService>> {
                         }
                     }
                     if left > 0 {
-                        println!(
-                            "Reconciled: left {left} group(s) containing blocked users."
-                        );
+                        println!("Reconciled: left {left} group(s) containing blocked users.");
                     }
                 }
                 Ok(_) => {}
@@ -482,25 +467,30 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             let svc = init_service().await?;
             svc.fetch_conversations().await?;
             let convo_id = svc.resolve_convo(&convo).await?;
-            let messages: Vec<catmos_core::types::Message> = if let Some(orch) = svc.orchestrator().await {
-                if let Ok((orch_msgs, _)) = orch.fetch_messages(&convo_id, None, 50, None, None, None).await {
-                    orch_msgs.into_iter().map(|om| {
-                        catmos_core::types::Message {
-                            id: om.id,
-                            convo_id: om.conversation_id,
-                            sender_did: Some(om.sender_did),
-                            content: MessageContent::Text(om.text),
-                            epoch: om.epoch,
-                            seq: om.sequence_number,
-                            created_at: om.timestamp,
-                        }
-                    }).collect()
+            let messages: Vec<catmos_core::types::Message> =
+                if let Some(orch) = svc.orchestrator().await {
+                    if let Ok((orch_msgs, _)) = orch
+                        .fetch_messages(&convo_id, None, 50, None, None, None)
+                        .await
+                    {
+                        orch_msgs
+                            .into_iter()
+                            .map(|om| catmos_core::types::Message {
+                                id: om.id,
+                                convo_id: om.conversation_id,
+                                sender_did: Some(om.sender_did),
+                                content: MessageContent::Text(om.text),
+                                epoch: om.epoch,
+                                seq: om.sequence_number,
+                                created_at: om.timestamp,
+                            })
+                            .collect()
+                    } else {
+                        svc.fetch_messages(&convo_id, 50).await.unwrap_or_default()
+                    }
                 } else {
-                    svc.fetch_messages(&convo_id, 50).await.unwrap_or_default()
-                }
-            } else {
-                svc.fetch_messages(&convo_id, 50).await?
-            };
+                    svc.fetch_messages(&convo_id, 50).await?
+                };
             let handle_cache = svc.handle_cache().await;
             let my_did = svc.did().to_string();
 
@@ -557,9 +547,13 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             let svc = init_service().await?;
             svc.fetch_conversations().await?;
             let convo_id = svc.resolve_convo(&convo).await?;
-            let orch = svc.orchestrator().await
+            let orch = svc
+                .orchestrator()
+                .await
                 .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-            let msg = orch.send_message(&convo_id, &message).await
+            let msg = orch
+                .send_message(&convo_id, &message)
+                .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             println!("Sent (epoch={})", msg.epoch);
         }
@@ -610,9 +604,13 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             } => {
                 let svc = init_service().await?;
                 let member_list = members.unwrap_or_default();
-                let orch = svc.orchestrator().await
+                let orch = svc
+                    .orchestrator()
+                    .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                let convo = orch.create_group(&name, Some(&member_list), description.as_deref()).await
+                let convo = orch
+                    .create_group(&name, Some(&member_list), description.as_deref())
+                    .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Created conversation: {}", convo.group_id);
             }
@@ -621,9 +619,12 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let svc = init_service().await?;
                 svc.fetch_conversations().await?;
                 let convo_id = svc.resolve_convo(&convo).await?;
-                let orch = svc.orchestrator().await
+                let orch = svc
+                    .orchestrator()
+                    .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                orch.leave_via_self_remove(&convo_id).await
+                orch.leave_via_self_remove(&convo_id)
+                    .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Left conversation {convo}");
             }
@@ -680,9 +681,18 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 group_context_hash,
             } => {
                 let svc = init_service().await?;
-                let orch = svc.orchestrator().await
+                let orch = svc
+                    .orchestrator()
+                    .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                let res = if let (Some(inv_trans), Some(inv_did), Some(inv_dev), Some(gid), Some(tag), Some(gch)) = (
+                let res = if let (
+                    Some(inv_trans),
+                    Some(inv_did),
+                    Some(inv_dev),
+                    Some(gid),
+                    Some(tag),
+                    Some(gch),
+                ) = (
                     invitation_transition_id,
                     inviter_did,
                     inviter_device_id,
@@ -700,13 +710,20 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                         "confirmationTag": tag,
                         "lifecycle": "active"
                     });
-                    orch.accept_conversation_with_invitation(&convo, &inv_trans, &inv_did, &inv_dev, prior).await
-                        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                    orch.accept_conversation_with_invitation(
+                        &convo, &inv_trans, &inv_did, &inv_dev, prior,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?
                 } else {
-                    orch.accept_conversation(&convo).await
+                    orch.accept_conversation(&convo)
+                        .await
                         .map_err(|e| anyhow::anyhow!(e.to_string()))?
                 };
-                println!("Accepted conversation {convo}: {}", serde_json::to_string(&res)?);
+                println!(
+                    "Accepted conversation {convo}: {}",
+                    serde_json::to_string(&res)?
+                );
             }
 
             ConvoCommands::Fulfill {
@@ -722,45 +739,57 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     convo.clone()
                 } else {
                     let _ = svc.fetch_conversations().await;
-                    svc.resolve_convo(&convo).await.unwrap_or_else(|_| convo.clone())
+                    svc.resolve_convo(&convo)
+                        .await
+                        .unwrap_or_else(|_| convo.clone())
                 };
-                let orch = svc.orchestrator().await
+                let orch = svc
+                    .orchestrator()
+                    .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                let res = orch.fulfill_leaf_recovery_with_target(
-                    &convo_id,
-                    recovery_request_id.as_deref(),
-                    requester_did.as_deref(),
-                    requester_device_id.as_deref(),
-                    key_package_base64.as_deref(),
-                    key_package_ref_base64.as_deref(),
-                ).await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                println!("Fulfilled leaf recovery for {convo}: {}", serde_json::to_string(&res)?);
+                let res = orch
+                    .fulfill_leaf_recovery_with_target(
+                        &convo_id,
+                        recovery_request_id.as_deref(),
+                        requester_did.as_deref(),
+                        requester_device_id.as_deref(),
+                        key_package_base64.as_deref(),
+                        key_package_ref_base64.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!(
+                    "Fulfilled leaf recovery for {convo}: {}",
+                    serde_json::to_string(&res)?
+                );
             }
 
             ConvoCommands::JoinWelcome { convo } => {
                 let svc = init_service().await?;
-                let orch = svc.orchestrator().await
+                let orch = svc
+                    .orchestrator()
+                    .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                let view = orch.join_conversation_from_entries(&convo).await
+                let view = orch
+                    .join_conversation_from_entries(&convo)
+                    .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                println!("Joined conversation via Welcome: {} (epoch={})", view.group_id, view.epoch);
+                println!(
+                    "Joined conversation via Welcome: {} (epoch={})",
+                    view.group_id, view.epoch
+                );
             }
-            ConvoCommands::RequestRecovery {
-                convo,
-                group_id,
-                confirmation_tag,
-                group_context_hash,
-                epoch,
-                state_version,
-                kind,
-            } => {
+            ConvoCommands::RequestRecovery { convo } => {
                 let svc = init_service().await?;
-                let orch = svc.orchestrator().await
+                let orch = svc
+                    .orchestrator()
+                    .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                let res = orch.request_leaf_recovery(&convo, kind.as_deref(), &group_id, &group_context_hash, &confirmation_tag, epoch, state_version).await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                println!("Requested leaf recovery for {convo}: {}", serde_json::to_string(&res)?);
+                let convo_id = svc.resolve_convo(&convo).await?;
+                let epoch = orch.join_or_rejoin(&convo_id).await.map_err(|error| {
+                    anyhow::anyhow!("Recovery has not completed for {convo_id}: {error}")
+                })?;
+                println!("Rejoined {convo_id} (epoch={epoch})");
             }
 
             ConvoCommands::Update {
@@ -771,10 +800,20 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let svc = init_service().await?;
                 svc.fetch_conversations().await?;
                 let convo_id = svc.resolve_convo(&convo).await?;
-                let orch = svc.orchestrator().await
+                let orch = svc
+                    .orchestrator()
+                    .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                orch.update_group_metadata_encrypted(&convo_id, name.as_deref(), description.as_deref(), None, None, None).await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                orch.update_group_metadata_encrypted(
+                    &convo_id,
+                    name.as_deref(),
+                    description.as_deref(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Updated conversation {convo}");
             }
 
@@ -782,9 +821,12 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let svc = init_service().await?;
                 svc.fetch_conversations().await?;
                 let convo_id = svc.resolve_convo(&convo).await?;
-                let orch = svc.orchestrator().await
+                let orch = svc
+                    .orchestrator()
+                    .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                orch.add_members(&convo_id, &[did.clone()]).await
+                orch.add_members(&convo_id, &[did.clone()])
+                    .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Invited {did} to {convo} (pending acceptance)");
             }
@@ -793,9 +835,12 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 let svc = init_service().await?;
                 svc.fetch_conversations().await?;
                 let convo_id = svc.resolve_convo(&convo).await?;
-                let orch = svc.orchestrator().await
+                let orch = svc
+                    .orchestrator()
+                    .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                orch.remove_members(&convo_id, &[did.clone()]).await
+                orch.remove_members(&convo_id, &[did.clone()])
+                    .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Removed {did} from {convo}");
             }
@@ -840,17 +885,24 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             }
             DeviceCommands::Register { name } => {
                 let svc = init_service().await?;
-                let orch = svc.orchestrator().await
+                let orch = svc
+                    .orchestrator()
+                    .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                let device_id = orch.ensure_device_registered().await
+                let device_id = orch
+                    .ensure_device_registered()
+                    .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Registered device: id={device_id}");
             }
             DeviceCommands::Remove { device_id } => {
                 let svc = init_service().await?;
-                let orch = svc.orchestrator().await
+                let orch = svc
+                    .orchestrator()
+                    .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                orch.remove_device(&device_id).await
+                orch.remove_device(&device_id)
+                    .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Removed device {device_id}");
             }
@@ -860,13 +912,19 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             KeyPackageCommands::Status => {
                 let svc = init_service().await?;
                 let status = svc.get_key_package_status().await?;
-                println!("Key packages: {}/{} (replenish={})", status.available, status.target, status.needs_replenish);
+                println!(
+                    "Key packages: {}/{} (replenish={})",
+                    status.available, status.target, status.needs_replenish
+                );
             }
             KeyPackageCommands::Replenish => {
                 let svc = init_service().await?;
-                let orch = svc.orchestrator().await
+                let orch = svc
+                    .orchestrator()
+                    .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                orch.replenish_if_needed().await
+                orch.replenish_if_needed()
+                    .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Key packages replenished");
             }

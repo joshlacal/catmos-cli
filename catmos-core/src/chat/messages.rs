@@ -203,7 +203,7 @@ fn extract_application_ciphertext(entry: &ApplicationEntryResp) -> Option<Vec<u8
 
 fn is_replayed_or_own_commit_error(err: &CatmosError) -> bool {
     if let CatmosError::Mls(mls_err) = err {
-        if mls_err.is_wrong_epoch() || mls_err.is_cannot_decrypt_own_message() {
+        if mls_err.is_wrong_epoch() {
             return true;
         }
         if let catbird_mls::MLSError::InvalidInput { message } = mls_err {
@@ -320,7 +320,7 @@ impl ChatService {
         }
 
         let epoch = self.get_epoch(convo_id).unwrap_or(0);
-        let msg_id = ulid::Ulid::new().to_string();
+        let msg_id = ulid::Ulid::generate().to_string();
         let padded_size = encrypt_result.ciphertext.len() as i64;
         let confirmation_tag = self.get_confirmation_tag_b64(&group_id_bytes);
 
@@ -372,13 +372,16 @@ impl ChatService {
                     "convoId": convo_id,
                     "ciphertext": BASE64.encode(&new_encrypt.ciphertext),
                     "epoch": new_epoch,
-                    "msgId": ulid::Ulid::new().to_string(),
+                    "msgId": ulid::Ulid::generate().to_string(),
                     "paddedSize": new_padded,
                     "confirmationTag": new_tag,
                 });
 
                 match self
-                    .xrpc_procedure::<_, SendMessageResp>("blue.catbird.chat.sendMessage", &retry_req)
+                    .xrpc_procedure::<_, SendMessageResp>(
+                        "blue.catbird.chat.sendMessage",
+                        &retry_req,
+                    )
                     .await
                 {
                     Ok(resp) => {
@@ -417,7 +420,7 @@ impl ChatService {
                     .mls
                     .with_context(|ctx| ctx.encrypt_message(group_id_bytes.clone(), plaintext))?;
 
-                let retry_msg_id = ulid::Ulid::new().to_string();
+                let retry_msg_id = ulid::Ulid::generate().to_string();
                 let retry_padded = retry_encrypt.ciphertext.len() as i64;
                 let retry_tag = self.get_confirmation_tag_b64(&group_id_bytes);
 
@@ -501,7 +504,7 @@ impl ChatService {
     pub async fn send_typing(&self, convo_id: &str, is_typing: bool) -> Result<()> {
         let action = if is_typing { "typing" } else { "typingStop" };
         let noop = vec![0u8; 512];
-        let msg_id = ulid::Ulid::new().to_string();
+        let msg_id = ulid::Ulid::generate().to_string();
 
         let req = serde_json::json!({
             "convoId": convo_id,
@@ -522,15 +525,26 @@ impl ChatService {
 
     /// Fetch all conversations from the server, decrypt metadata, and cache locally.
     pub async fn fetch_conversations(&self) -> Result<Vec<Conversation>> {
+        self.fetch_conversations_with_states()
+            .await
+            .map(|(conversations, _)| conversations)
+    }
+
+    /// Retain each exact server snapshot for the shared invitation consent gates.
+    /// Local and legacy presentation rows never invent canonical authority.
+    pub(crate) async fn fetch_conversations_with_states(
+        &self,
+    ) -> Result<(
+        Vec<Conversation>,
+        HashMap<String, catbird_atproto::blue_catbird::chat::ConversationState>,
+    )> {
         let actor_device_id = self.actor_device_id().await?;
         let mut convos: Vec<Conversation> = Vec::new();
+        let mut canonical_states = HashMap::new();
         let mut page_cursor: Option<String> = None;
 
         loop {
-            let mut params = vec![
-                ("actorDeviceId", actor_device_id.as_str()),
-                ("limit", "50"),
-            ];
+            let mut params = vec![("actorDeviceId", actor_device_id.as_str()), ("limit", "50")];
             let cursor_holder;
             if let Some(ref c) = page_cursor {
                 cursor_holder = c.clone();
@@ -578,7 +592,10 @@ impl ChatService {
                                 b_obj.to_string()
                             }
                         } else if let Some(arr) = gid_val.as_array() {
-                            let bytes: Vec<u8> = arr.iter().filter_map(|b| b.as_u64().map(|n| n as u8)).collect();
+                            let bytes: Vec<u8> = arr
+                                .iter()
+                                .filter_map(|b| b.as_u64().map(|n| n as u8))
+                                .collect();
                             hex::encode(bytes)
                         } else {
                             convo_id.clone()
@@ -586,6 +603,23 @@ impl ChatService {
                     } else {
                         convo_id.clone()
                     };
+                    let canonical_state =
+                        catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+                            state_obj.to_string().as_bytes(),
+                        )
+                        .map_err(|error| {
+                            CatmosError::Xrpc(format!(
+                                "invalid canonical conversation state: {error}"
+                            ))
+                        })?;
+                    if canonical_states
+                        .insert(convo_id.clone(), canonical_state)
+                        .is_some()
+                    {
+                        return Err(CatmosError::Xrpc(
+                            "duplicate canonical conversation state".into(),
+                        ));
+                    }
                     let cipher_suite = state_obj
                         .get("cipherSuite")
                         .and_then(|v| v.as_str())
@@ -593,9 +627,15 @@ impl ChatService {
                         .to_string();
                     let mut members = Vec::new();
                     let mut creator = String::new();
-                    if let Some(participants) = state_obj.get("participants").and_then(|v| v.as_array()) {
+                    if let Some(participants) =
+                        state_obj.get("participants").and_then(|v| v.as_array())
+                    {
                         for (idx, p) in participants.iter().enumerate() {
-                            let user_did = p.get("userDid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let user_did = p
+                                .get("userDid")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             let role = p.get("role").and_then(|v| v.as_str()).unwrap_or("member");
                             let is_admin = role == "admin";
                             if is_admin && creator.is_empty() {
@@ -642,8 +682,14 @@ impl ChatService {
                 }
             }
 
-            let has_more = resp.get("hasMore").and_then(|v| v.as_bool()).unwrap_or(false);
-            let next_cursor = resp.get("nextPageCursor").and_then(|v| v.as_str()).map(String::from);
+            let has_more = resp
+                .get("hasMore")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let next_cursor = resp
+                .get("nextPageCursor")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             if has_more && next_cursor.is_some() {
                 page_cursor = next_cursor;
             } else {
@@ -787,7 +833,7 @@ impl ChatService {
             }
         }
 
-        Ok(convos)
+        Ok((convos, canonical_states))
     }
 
     /// Sync MLS state for a conversation by processing all commit messages
@@ -838,7 +884,13 @@ impl ChatService {
             .flatten()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
-        let max_msg_seq = self.db.get_max_seq(convo_id).await.ok().flatten().unwrap_or(0);
+        let max_msg_seq = self
+            .db
+            .get_max_seq(convo_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
         let mut after_seq = max_synced.max(max_msg_seq);
         let mut total_processed = 0u32;
 
@@ -912,16 +964,18 @@ impl ChatService {
                                     commit_entry.entry_id
                                 );
                                 if metadata_updated {
-                                    if let Err(e) = self
-                                        .bootstrap_group_metadata(&convo_uuid, convo_id)
-                                        .await
+                                    if let Err(e) =
+                                        self.bootstrap_group_metadata(&convo_uuid, convo_id).await
                                     {
                                         warn!("sync: bootstrap_group_metadata failed for {convo_label}: {e}");
                                     }
                                 }
                             }
                             Err(e) => {
-                                warn!("sync: merge_incoming_commit failed for {} epoch={}: {e}", commit_entry.entry_id, new_epoch);
+                                warn!(
+                                    "sync: merge_incoming_commit failed for {} epoch={}: {e}",
+                                    commit_entry.entry_id, new_epoch
+                                );
                                 let _ = self.mls.with_context(|ctx| {
                                     ctx.discard_incoming_commit(gid_bytes.clone(), new_epoch)
                                 });
@@ -936,12 +990,18 @@ impl ChatService {
                     Ok(_) => {}
                     Err(e) => {
                         if !is_replayed_or_own_commit_error(&e) {
-                            warn!("sync: process_message failed for {}: {e}", commit_entry.entry_id);
+                            warn!(
+                                "sync: process_message failed for {}: {e}",
+                                commit_entry.entry_id
+                            );
                             if self.note_epoch_divergence(convo_id).await {
                                 return Ok(());
                             }
                         } else {
-                            debug!("sync: silent skip for already-applied/own commit {} ({e})", commit_entry.entry_id);
+                            debug!(
+                                "sync: silent skip for already-applied/own commit {} ({e})",
+                                commit_entry.entry_id
+                            );
                         }
                     }
                 }
@@ -1006,7 +1066,13 @@ impl ChatService {
             .flatten()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
-        let max_msg_seq = self.db.get_max_seq(convo_id).await.ok().flatten().unwrap_or(0);
+        let max_msg_seq = self
+            .db
+            .get_max_seq(convo_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
         let after_seq = max_synced.max(max_msg_seq);
         let after_seq_str = after_seq.to_string();
         let limit_str = limit.to_string();

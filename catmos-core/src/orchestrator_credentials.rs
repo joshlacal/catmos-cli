@@ -33,7 +33,7 @@ impl KeyringCredentialStore {
     }
 
     fn entry(key: &str) -> std::result::Result<Entry, keyring::Error> {
-        Entry::new(SERVICE_NAME, key)
+        crate::native_keyring::entry(SERVICE_NAME, key)
     }
 
     fn key_signing(user_did: &str) -> String {
@@ -67,7 +67,9 @@ impl KeyringCredentialStore {
         let mut hasher = sha2::Sha256::new();
         hasher.update(key.as_bytes());
         let hash = hex::encode(hasher.finalize());
-        let dir = crate::storage::config::Config::data_dir().ok()?.join("credentials");
+        let dir = crate::storage::config::Config::data_dir()
+            .ok()?
+            .join("credentials");
         let _ = std::fs::create_dir_all(&dir);
         Some(dir.join(format!("{hash}.key")))
     }

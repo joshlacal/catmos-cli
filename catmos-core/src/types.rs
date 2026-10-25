@@ -1,6 +1,16 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Canonical sequence owns confirmed display order. Zero represents an
+/// unconfirmed or legacy row, retained at the end in timestamp/ID order.
+pub(crate) fn message_order_key<'a>(
+    sequence: u64,
+    timestamp: &'a DateTime<Utc>,
+    id: &'a str,
+) -> (bool, u64, &'a DateTime<Utc>, &'a str) {
+    (sequence == 0, sequence, timestamp, id)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub conversation_id: String,
