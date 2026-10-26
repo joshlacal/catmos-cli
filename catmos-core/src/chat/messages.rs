@@ -73,6 +73,7 @@ pub(crate) struct SendMessageResp {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub(crate) struct GetConvosResp {
     #[serde(default)]
     pub conversations: Vec<ConvoViewResp>,
@@ -147,6 +148,7 @@ pub(crate) enum ConversationEntryResp {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub(crate) struct CommitEntryResp {
     #[serde(default)]
     pub conversation_id: String,
@@ -159,6 +161,7 @@ pub(crate) struct CommitEntryResp {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub(crate) struct ApplicationEntryResp {
     #[serde(default)]
     pub conversation_id: String,
@@ -674,7 +677,7 @@ impl ChatService {
                         avatar_content_type: None,
                     });
                 }
-            } else if let Some(convo_arr) = resp.get("conversations").and_then(|v| v.as_array()) {
+            } else if let Some(_convo_arr) = resp.get("conversations").and_then(|v| v.as_array()) {
                 if let Ok(legacy_resp) = serde_json::from_value::<GetConvosResp>(resp.clone()) {
                     for c_resp in &legacy_resp.conversations {
                         convos.push(convo_resp_to_conversation(c_resp));

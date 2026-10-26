@@ -35,6 +35,7 @@ pub struct GroupMetadata {
 /// Response shape for registerDevice (owned, DeserializeOwned-compatible).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct RegisterDeviceResp {
     device_id: String,
     mls_did: String,
@@ -46,6 +47,7 @@ struct RegisterDeviceResp {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct WelcomeMessageResp {
     convo_id: String,
     welcome: String, // base64-encoded

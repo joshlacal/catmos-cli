@@ -44,6 +44,7 @@ pub struct CanonicalSessionAuthority {
     dpop_jkt: String,
     auth_generation: i64,
     key_id: String,
+    #[allow(dead_code)]
     signer: NonExportingSignerHandle,
 }
 
@@ -101,6 +102,7 @@ impl CanonicalSessionAuthority {
     /// Build a non-exporting signer capability for an already-admitted
     /// authority. The capability returns signatures only; private key bytes
     /// remain inside `MLSContext`.
+    #[allow(dead_code)]
     pub(crate) fn signer(&self) -> &NonExportingSignerHandle {
         &self.signer
     }
@@ -165,6 +167,7 @@ impl fmt::Debug for NonExportingSignerHandle {
 }
 
 impl NonExportingSignerHandle {
+    #[allow(dead_code)]
     fn new(mls: Arc<MlsManager>, identity: String) -> Self {
         Self { mls, identity }
     }
@@ -346,12 +349,14 @@ struct OwnDevicesResponse {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct OwnDeviceItem {
     device: OwnDeviceRecord,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct OwnDeviceRecord {
     device_id: String,
     dpop_jkt: String,
@@ -363,11 +368,13 @@ struct OwnDeviceRecord {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct ByteEnvelope {
     #[serde(rename = "$bytes")]
     bytes: String,
 }
 
+#[allow(dead_code)]
 fn select_clean_chat_device(
     items: &[OwnDeviceItem],
     expected_device_id: &str,
@@ -435,6 +442,7 @@ fn admit_device(mls: &Arc<MlsManager>, identity: &str, record: &AdmittedDevice) 
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct AdmittedDevice {
     device_id: String,
     #[allow(dead_code)]

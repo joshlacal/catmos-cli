@@ -143,6 +143,7 @@ impl ChatService {
     /// Classify a commit-processing error as peer-bad (Layer 3 Signal A/B).
     /// If local state is behind the message context, treat it as catch-up
     /// instead of peer poisoning.
+    #[allow(dead_code)]
     pub(crate) fn classify_peer_bad_error(
         err: &CatmosError,
         local_epoch: Option<u64>,
@@ -179,6 +180,7 @@ impl ChatService {
 
     /// Record a peer-bad commit observation. Returns true when this call put
     /// the conversation into quarantine.
+    #[allow(dead_code)]
     pub(crate) async fn note_peer_bad_commit(
         &self,
         convo_id: &str,
@@ -201,6 +203,7 @@ impl ChatService {
         true
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn enter_quarantine(
         &self,
         convo_id: &str,
@@ -312,6 +315,7 @@ impl ChatService {
     /// Bump the per-convo decrypt-failure counter and, on threshold, flag
     /// `NEEDS_REJOIN`. Returns `true` if the threshold was hit (caller can
     /// then bail out of the current decrypt loop).
+    #[allow(dead_code)]
     pub(crate) async fn note_decrypt_failure(&self, convo_id: &str) -> bool {
         if self.is_quarantined(convo_id).await {
             return false;

@@ -25,6 +25,7 @@ impl CliApiClient {
         Self { service }
     }
 
+    #[allow(dead_code)]
     fn unsupported<T>(&self, operation: &str) -> Result<T> {
         Err(OrchestratorError::Api(format!(
             "CLI API operation {operation} is not implemented"

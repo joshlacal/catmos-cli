@@ -338,7 +338,7 @@ impl ChatService {
             .await
             .map_err(|e| CatmosError::Network(e.to_string()))?;
 
-        let is_sensitive_device_endpoint = nsid.contains("enrollDevice")
+        let _is_sensitive_device_endpoint = nsid.contains("enrollDevice")
             || nsid.contains("getOwnDevices")
             || nsid.contains("rebindDeviceAuthentication")
             || nsid.contains("revokeDevice");

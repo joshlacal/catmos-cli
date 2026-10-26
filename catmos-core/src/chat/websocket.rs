@@ -378,13 +378,12 @@ async fn get_subscription_ticket_standalone(
     auth: &crate::auth::AuthMethod,
     token_session: Option<&crate::auth::TokenSession>,
     db: &crate::storage::db::Database,
-    config: &crate::storage::config::Config,
+    _config: &crate::storage::config::Config,
     actor_device_id: &str,
     inventory_session_id: &str,
     event_cursor: &str,
 ) -> std::result::Result<SubscriptionTicketResponse, String> {
     use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-    use reqwest::StatusCode;
 
     let nsid = "blue.catbird.chat.getSubscriptionTicket";
 
