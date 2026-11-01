@@ -20,13 +20,6 @@ pub(crate) const GET_ENTRIES: &str =
     catbird_atproto::blue_catbird::chat::get_entries::GetEntriesResponse::NSID;
 pub(crate) const SEND_MESSAGE: &str =
     catbird_atproto::blue_catbird::chat::send_message::SendMessageResponse::NSID;
-#[allow(dead_code)]
-pub(crate) const DELETE_BLOB: &str =
-    catbird_atproto::blue_catbird::chat::delete_blob::DeleteBlobResponse::NSID;
-pub(crate) const GET_BLOB: &str =
-    catbird_atproto::blue_catbird::chat::get_blob::GetBlobResponse::NSID;
-pub(crate) const GET_BLOB_USAGE: &str =
-    catbird_atproto::blue_catbird::chat::get_blob_usage::GetBlobUsageResponse::NSID;
 pub(crate) const GET_CONVERSATION_STATE: &str =
     catbird_atproto::blue_catbird::chat::get_conversation_state::GetConversationStateResponse::NSID;
 pub(crate) const REQUEST_RESET: &str =
@@ -51,8 +44,6 @@ pub(crate) const REVOKE_DEVICE: &str =
     catbird_atproto::blue_catbird::chat::revoke_device::RevokeDeviceResponse::NSID;
 pub(crate) const REPLENISH_KEY_PACKAGES: &str =
     catbird_atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesResponse::NSID;
-pub(crate) const UPLOAD_BLOB: &str =
-    catbird_atproto::blue_catbird::chat::upload_blob::UploadBlobResponse::NSID;
 
 #[cfg(test)]
 mod tests {
@@ -65,9 +56,6 @@ mod tests {
             GET_CONVERSATIONS,
             GET_ENTRIES,
             SEND_MESSAGE,
-            DELETE_BLOB,
-            GET_BLOB,
-            GET_BLOB_USAGE,
             GET_CONVERSATION_STATE,
             REQUEST_RESET,
             REQUEST_LEAF_RECOVERY,
@@ -80,7 +68,6 @@ mod tests {
             GET_DEVICES,
             REVOKE_DEVICE,
             REPLENISH_KEY_PACKAGES,
-            UPLOAD_BLOB,
         ];
         assert!(routes
             .iter()
@@ -113,6 +100,6 @@ mod tests {
 
     #[test]
     fn inventory_is_not_enabled_for_runtime_transport() {
-        assert!(!RUNTIME_MIGRATION_ENABLED);
+        const { assert!(!RUNTIME_MIGRATION_ENABLED) };
     }
 }

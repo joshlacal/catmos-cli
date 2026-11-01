@@ -641,9 +641,7 @@ impl ChatService {
                                 .to_string();
                             let role = p.get("role").and_then(|v| v.as_str()).unwrap_or("member");
                             let is_admin = role == "admin";
-                            if is_admin && creator.is_empty() {
-                                creator = user_did.clone();
-                            } else if idx == 0 && creator.is_empty() {
+                            if (is_admin || idx == 0) && creator.is_empty() {
                                 creator = user_did.clone();
                             }
                             members.push(Member {
@@ -982,10 +980,10 @@ impl ChatService {
                                 let _ = self.mls.with_context(|ctx| {
                                     ctx.discard_incoming_commit(gid_bytes.clone(), new_epoch)
                                 });
-                                if !is_replayed_or_own_commit_error(&e) {
-                                    if self.note_epoch_divergence(convo_id).await {
-                                        return Ok(());
-                                    }
+                                if !is_replayed_or_own_commit_error(&e)
+                                    && self.note_epoch_divergence(convo_id).await
+                                {
+                                    return Ok(());
                                 }
                             }
                         }

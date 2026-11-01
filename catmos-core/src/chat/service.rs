@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use catbird_mls::orchestrator::credentials::CredentialStore;
-use catbird_mls::orchestrator_bridge::FFICommitKind;
+use catbird_mls::orchestrator::types::CommitKind;
 use catbird_mls::{GroupConfig, KeyPackageData};
 
 use crate::auth::{AuthMethod, TokenSession};
@@ -555,7 +555,7 @@ Body: {}",
                 let did = self.did();
                 if let Ok(plc_resp) = self
                     .http
-                    .get(&format!("https://plc.directory/{did}"))
+                    .get(format!("https://plc.directory/{did}"))
                     .send()
                     .await
                 {
@@ -776,6 +776,7 @@ Body: {}",
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn bootstrap_reset_group(
         &self,
         original_convo_id: &str,
@@ -1018,13 +1019,18 @@ Body: {}",
                 "No key packages available for {member_did}"
             )));
         }
-        let key_packages: Vec<Vec<u8>> = kp_refs.iter().map(|k| k.key_package.clone()).collect();
+        let key_packages: Vec<KeyPackageData> = kp_refs
+            .iter()
+            .map(|k| KeyPackageData {
+                data: k.key_package.clone(),
+            })
+            .collect();
 
         let did = self.did().to_string();
         let plan = self.mls.with_commit_context(|ctx| {
             ctx.stage_commit(
                 convo_id.to_string(),
-                FFICommitKind::AddMembers {
+                CommitKind::AddMembers {
                     member_dids: vec![member_did.to_string()],
                     key_packages: key_packages.clone(),
                 },
@@ -1097,7 +1103,7 @@ Body: {}",
         let plan = self.mls.with_commit_context(|ctx| {
             ctx.stage_commit(
                 convo_id.to_string(),
-                FFICommitKind::RemoveMembers {
+                CommitKind::RemoveMembers {
                     member_dids: vec![member_did.to_string()],
                 },
                 did.as_bytes().to_vec(),
@@ -1563,6 +1569,7 @@ pub(crate) fn build_create_convo_request(
     req
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_commit_group_change(
     convo_id: &str,
     action: &str,

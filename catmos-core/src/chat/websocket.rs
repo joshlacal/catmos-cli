@@ -187,12 +187,9 @@ impl ChatService {
         let actor_device_id = self.actor_device_id().await?;
         let (inventory_session_id, event_cursor) = {
             let guard = self.inventory_session.read().await;
-            guard.clone().unwrap_or_else(|| {
-                (
-                    "catmos-cli-session".to_string(),
-                    "0".to_string(),
-                )
-            })
+            guard
+                .clone()
+                .unwrap_or_else(|| ("catmos-cli-session".to_string(), "0".to_string()))
         };
 
         // 1. Get a subscription ticket for the initial connection
@@ -261,8 +258,9 @@ impl ChatService {
                                 } else if let Ok((_header, body)) =
                                     jacquard_common::xrpc::subscription::parse_event_header(&data)
                                 {
-                                    if let Ok(event) =
-                                        serde_ipld_dagcbor::from_slice::<SubscribeEventsMessage>(&body)
+                                    if let Ok(event) = serde_ipld_dagcbor::from_slice::<
+                                        SubscribeEventsMessage,
+                                    >(body)
                                     {
                                         let ws_event =
                                             convert_event(event, &mls, &own_commits).await;
@@ -271,7 +269,7 @@ impl ChatService {
                                             return;
                                         }
                                     } else if let Ok(event) =
-                                        serde_json::from_slice::<SubscribeEventsMessage>(&body)
+                                        serde_json::from_slice::<SubscribeEventsMessage>(body)
                                     {
                                         let ws_event =
                                             convert_event(event, &mls, &own_commits).await;
@@ -373,6 +371,7 @@ impl ChatService {
 /// Avoids needing a `&ChatService` reference across the spawn boundary.
 /// On 401/400 with an AppPassword session, refreshes tokens via jacquard
 /// and retries once.
+#[allow(clippy::too_many_arguments)]
 async fn get_subscription_ticket_standalone(
     http: &reqwest::Client,
     auth: &crate::auth::AuthMethod,
@@ -388,10 +387,13 @@ async fn get_subscription_ticket_standalone(
     let nsid = "blue.catbird.chat.getSubscriptionTicket";
 
     let (base_url, is_proxy) = match auth {
-        crate::auth::AuthMethod::OAuth { nest_url, .. } => (format!("{nest_url}/xrpc/{nsid}"), false),
-        crate::auth::AuthMethod::AppPassword { pds_url, .. } => {
-            (format!("{}/xrpc/{nsid}", pds_url.trim_end_matches('/')), true)
+        crate::auth::AuthMethod::OAuth { nest_url, .. } => {
+            (format!("{nest_url}/xrpc/{nsid}"), false)
         }
+        crate::auth::AuthMethod::AppPassword { pds_url, .. } => (
+            format!("{}/xrpc/{nsid}", pds_url.trim_end_matches('/')),
+            true,
+        ),
     };
 
     // Resolve the bearer token for this attempt — OAuth uses the cookie;
@@ -446,8 +448,9 @@ async fn get_subscription_ticket_standalone(
         .map_err(|e| format!("Network error: {e}"))?;
 
     // Retry once after token refresh only if AppPassword + ExpiredToken
-    let body_bytes = if token_session.is_some() && crate::chat::service::is_expired_token_response(status, &body_bytes) {
-        let sess = token_session.expect("checked above");
+    let body_bytes = if let Some(sess) = token_session
+        .filter(|_| crate::chat::service::is_expired_token_response(status, &body_bytes))
+    {
         let new_bearer = sess
             .refresh(db)
             .await
@@ -492,7 +495,9 @@ async fn convert_event(
 ) -> WsEvent {
     match event {
         SubscribeEventsMessage::EventEnvelope(env) => match env.payload {
-            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::MessageAvailableEvent(msg_evt) => {
+            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::MessageAvailableEvent(
+                msg_evt,
+            ) => {
                 let convo_id = msg_evt.conversation_id.to_string();
                 let seq = msg_evt.seq as u64;
                 WsEvent::EpochAdvanced {
@@ -500,7 +505,9 @@ async fn convert_event(
                     new_epoch: seq,
                 }
             }
-            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::ConversationChangedEvent(evt) => {
+            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::ConversationChangedEvent(
+                evt,
+            ) => {
                 let convo_id = evt.conversation_id.to_string();
                 WsEvent::EpochAdvanced {
                     convo_id,

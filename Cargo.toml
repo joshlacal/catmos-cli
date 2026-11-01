@@ -6,9 +6,9 @@ resolver = "2"
 catmos-core = { path = "catmos-core" }
 catmos-tui = { path = "catmos-tui" }
 catbird-mls = { path = "../catbird-mls", package = "catbird_mls" }
-catbird-atproto = { git = "https://github.com/joshlacal/catbird-atproto", rev = "d3da6f7f4fce482e3255c74128a05a40001af671", features = ["streaming"] }
-jacquard = { version = "0.13.0", git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d" }
-jacquard-common = { version = "0.13.0", git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d", features = ["websocket"] }
+catbird-atproto = { path = "../catbird-atproto", features = ["streaming"] }
+jacquard = { version = "0.13.0", git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
+jacquard-common = { version = "0.13.0", git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["websocket"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

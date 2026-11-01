@@ -79,8 +79,7 @@ impl SqliteStorage {
         ))?;
         #[cfg(target_os = "android")]
         {
-            let version: String =
-                conn.query_row("PRAGMA cipher_version", [], |row| row.get(0))?;
+            let version: String = conn.query_row("PRAGMA cipher_version", [], |row| row.get(0))?;
             if version.is_empty() {
                 tracing::error!("Android SQLCipher probe returned empty cipher_version");
                 return Err(rusqlite::Error::InvalidQuery);
@@ -1651,7 +1650,7 @@ impl MLSStorageBackend for SqliteStorage {
             for row in rows {
                 let (message, tombstone) =
                     row.map_err(|e| OrchestratorError::Storage(e.to_string()))?;
-                if before_sequence.map_or(true, |before| message.sequence_number < before)
+                if before_sequence.is_none_or(|before| message.sequence_number < before)
                     && !tombstone
                 {
                     merge_or_reject_message(&mut by_id, message)?;
@@ -2162,10 +2161,11 @@ fn verified_message_chain(
     while !entries.is_empty() {
         let mut candidate = None;
         for (index, entry) in entries.iter().enumerate() {
-            if verify(entry, previous.clone())? == Some(true) {
-                if candidate.replace(index).is_some() {
-                    return Err(storage_error(format!("legacy message HMAC chain branches in bucket {bucket}; original rows preserved")));
-                }
+            if verify(entry, previous.clone())? == Some(true) && candidate.replace(index).is_some()
+            {
+                return Err(storage_error(format!(
+                    "legacy message HMAC chain branches in bucket {bucket}; original rows preserved"
+                )));
             }
         }
         let index = candidate.ok_or_else(|| {
@@ -3229,13 +3229,9 @@ mod field_encryption_tests {
         // The encrypted column and HMAC tag must be persisted; the legacy
         // text column should hold an empty string (NOT NULL constraint).
         {
+            type RawMessageRow = (Option<Vec<u8>>, Option<Vec<u8>>, String, Option<i64>);
             let conn = storage.conn.lock().unwrap();
-            let (payload_encrypted, entry_hmac, text, payload_key_version): (
-                Option<Vec<u8>>,
-                Option<Vec<u8>>,
-                String,
-                Option<i64>,
-            ) = conn
+            let (payload_encrypted, entry_hmac, text, payload_key_version): RawMessageRow = conn
                 .query_row(
                     "SELECT payload_encrypted, entry_hmac, text, payload_key_version FROM messages WHERE id = 'msg-rt'",
                     [],

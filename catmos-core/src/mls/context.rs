@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use catbird_mls::EpochSecretStorage;
@@ -197,7 +197,7 @@ impl MlsManager {
     ///
     /// `data_dir` — base directory for MLS state (e.g. `~/.local/share/catmos/mls`)
     /// `did` — the user's DID, used to isolate storage and derive keychain keys
-    pub fn new(data_dir: &PathBuf, did: &str) -> Result<Self> {
+    pub fn new(data_dir: &Path, did: &str) -> Result<Self> {
         // Build per-DID storage path
         let did_hash = {
             let mut h = Sha256::new();
@@ -288,6 +288,12 @@ impl MlsManager {
 
 pub struct MlsEpochSecretStorage {
     secrets: Mutex<HashMap<(String, u64), Vec<u8>>>,
+}
+
+impl Default for MlsEpochSecretStorage {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MlsEpochSecretStorage {

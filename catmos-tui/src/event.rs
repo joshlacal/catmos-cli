@@ -79,7 +79,7 @@ impl EventLoop {
 
                 if has_event {
                     // Read the event (non-blocking since poll said one is ready)
-                    let read_result = tokio::task::spawn_blocking(|| event::read()).await;
+                    let read_result = tokio::task::spawn_blocking(event::read).await;
 
                     match read_result {
                         Ok(Ok(Event::Key(key))) => {

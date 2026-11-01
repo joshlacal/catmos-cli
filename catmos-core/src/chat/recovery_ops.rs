@@ -418,10 +418,7 @@ impl ChatService {
             epoch_authenticator: authenticator,
         };
         match self
-            .xrpc_procedure::<_, serde_json::Value>(
-                "blue.catbird.chat.requestLeafRecovery",
-                &req,
-            )
+            .xrpc_procedure::<_, serde_json::Value>("blue.catbird.chat.requestLeafRecovery", &req)
             .await
         {
             Ok(_) => info!(convo = %convo_label, "requestLeafRecovery accepted"),
@@ -1512,9 +1509,9 @@ impl ChatService {
     /// Ambiguous duplicate rows fail closed.
     async fn fetch_authoritative_group_id(&self, convo_id: &str) -> Result<Option<String>> {
         let convos = self.fetch_conversations().await?;
-        let mut matches = convos.into_iter().filter(|c| {
-            c.conversation_id == convo_id || c.group_id == convo_id
-        });
+        let mut matches = convos
+            .into_iter()
+            .filter(|c| c.conversation_id == convo_id || c.group_id == convo_id);
         let Some(first) = matches.next() else {
             return Ok(None);
         };

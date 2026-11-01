@@ -90,6 +90,27 @@ enum Commands {
     /// Manage Bluesky blocks (syncs with MLS group membership).
     #[command(subcommand)]
     Block(BlockCommands),
+    /// Manage Labyrinth 1.1 Spaces history backup, 40-char recovery codes, and PQ OTC pairing.
+    #[command(subcommand)]
+    Labyrinth(LabyrinthCommands),
+}
+
+#[derive(clap::Subcommand)]
+enum LabyrinthCommands {
+    /// Opt into MLS + Labyrinth 1.1 over ATProto Spaces and enroll this device
+    Enable,
+    /// Show Labyrinth 1.1 backup status, active epoch, and enrolled devices
+    Status,
+    /// Generate and bind a 40-character GF(32) recovery code
+    RecoverySetup,
+    /// Restore mailbox epoch using a 40-character GF(32) recovery code
+    RecoveryRestore { code: String },
+    /// Generate a 6-digit hybrid PQ (CPace + ML-KEM-768) One-Time Code
+    OtcInitiate,
+    /// Complete 6-digit hybrid PQ (CPace + ML-KEM-768) One-Time Code pairing
+    OtcComplete { code: String },
+    /// Revoke a peer Labyrinth device and rotate the mailbox epoch
+    RevokeDevice { device_id: String },
 }
 
 #[derive(clap::Subcommand)]
@@ -825,7 +846,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     .orchestrator()
                     .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                orch.add_members(&convo_id, &[did.clone()])
+                orch.add_members(&convo_id, std::slice::from_ref(&did))
                     .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Invited {did} to {convo} (pending acceptance)");
@@ -839,7 +860,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                     .orchestrator()
                     .await
                     .ok_or_else(|| anyhow::anyhow!("MLS orchestrator unavailable"))?;
-                orch.remove_members(&convo_id, &[did.clone()])
+                orch.remove_members(&convo_id, std::slice::from_ref(&did))
                     .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("Removed {did} from {convo}");
@@ -1140,6 +1161,81 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 }
             }
         },
+
+        Commands::Labyrinth(subcmd) => {
+            let config = Config::load()?;
+            let did = config
+                .default_account
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("No account configured. Run `catmos login` first."))?
+                .to_string();
+            let data_dir = Config::data_dir()?;
+            let open_unified = || {
+                catmos_core::CliUnifiedMlsClient::open_desktop(
+                    data_dir.clone(),
+                    &did,
+                    "did:web:mlschat.catbird.blue".to_string(),
+                    config.server.nest_url.clone(),
+                    "https://swan.place".to_string(),
+                )
+            };
+
+            match subcmd {
+                LabyrinthCommands::Enable => {
+                    let client = open_unified()?;
+                    let (receipt, status) = client.enable_and_enroll(None)?;
+                    println!(
+                        "Enabled MLS + Labyrinth 1.1 for {} (device={}, mailbox={}, epoch={})",
+                        receipt.account_did,
+                        receipt.device_id,
+                        status.mailbox_space_uri,
+                        status.epoch_seq
+                    );
+                }
+                LabyrinthCommands::Status => {
+                    if !catmos_core::CliUnifiedMlsClient::is_opted_in(&data_dir, &did) {
+                        println!("Labyrinth status: disabled (Chat/Spaces off by default; run `catmos labyrinth enable`).");
+                    } else {
+                        let client = open_unified()?;
+                        let status = client.status()?;
+                        println!("{}", serde_json::to_string_pretty(&status)?);
+                    }
+                }
+                LabyrinthCommands::RecoverySetup => {
+                    let client = open_unified()?;
+                    let code = client.setup_recovery_code()?;
+                    println!("40-character GF(32) Labyrinth recovery code:\n{code}");
+                }
+                LabyrinthCommands::RecoveryRestore { code } => {
+                    let client = open_unified()?;
+                    let status = client.restore_recovery_code(&code)?;
+                    println!("Restored Labyrinth mailbox to epoch {}", status.epoch_seq);
+                }
+                LabyrinthCommands::OtcInitiate => {
+                    let client = open_unified()?;
+                    let offer = client.initiate_otc()?;
+                    println!("6-digit hybrid PQ OTC code: {}", offer.formatted_code);
+                }
+                LabyrinthCommands::OtcComplete { code } => {
+                    let client = open_unified()?;
+                    let done = client.complete_otc(&code)?;
+                    println!(
+                        "Completed hybrid PQ CPace + ML-KEM-768 pairing (ek={}B, ct={}B, epoch={})",
+                        done.initiator_mlkem768_ek_len,
+                        done.responder_mlkem768_ct_len,
+                        done.new_epoch_seq
+                    );
+                }
+                LabyrinthCommands::RevokeDevice { device_id } => {
+                    let client = open_unified()?;
+                    let status = client.revoke_device(&device_id)?;
+                    println!(
+                        "Revoked {device_id}; rotated Labyrinth mailbox to epoch {}",
+                        status.epoch_seq
+                    );
+                }
+            }
+        }
 
         Commands::Chat => {
             unreachable!("handled in main");

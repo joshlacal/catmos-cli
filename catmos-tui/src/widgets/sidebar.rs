@@ -81,6 +81,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::truncate_for_sidebar;
 

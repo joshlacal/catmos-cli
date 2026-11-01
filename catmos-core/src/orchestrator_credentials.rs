@@ -190,6 +190,12 @@ impl KeyringCredentialStore {
     }
 }
 
+impl Default for KeyringCredentialStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl CredentialStore for KeyringCredentialStore {
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()> {

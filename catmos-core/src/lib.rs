@@ -9,6 +9,8 @@ pub mod orchestrator_storage;
 pub mod recovery;
 pub mod storage;
 pub mod types;
+pub mod unified_client;
+pub use unified_client::CliUnifiedMlsClient;
 pub type CliOrchestrator = catbird_mls::orchestrator::MLSOrchestrator<
     orchestrator_storage::SqliteStorage,
     orchestrator_api::CliApiClient,

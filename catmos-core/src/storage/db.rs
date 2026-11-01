@@ -1128,6 +1128,7 @@ impl Database {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod reset_pending_tests {
     use super::*;
     use crate::types::Conversation;
