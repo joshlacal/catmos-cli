@@ -159,10 +159,48 @@ impl PlatformKeyStore for CliPlatformKeyStore {
     }
 }
 
+type SpaceRecordKey = (String, String, String);
+
 pub struct CliPlatformTransport {
     http: reqwest::Client,
     bearer_token: RwLock<Option<String>>,
     offline_spaces_probe_override: Option<bool>,
+    mock_space_store: Option<Mutex<std::collections::BTreeMap<SpaceRecordKey, serde_json::Value>>>,
+}
+
+fn decode_query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=')?;
+        if k == key {
+            return Some(percent_decode_str(v));
+        }
+    }
+    None
+}
+
+fn percent_decode_str(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 impl CliPlatformTransport {
@@ -171,10 +209,13 @@ impl CliPlatformTransport {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let mock_space_store =
+            offline_spaces_probe_override.map(|_| Mutex::new(std::collections::BTreeMap::new()));
         Self {
             http,
             bearer_token: RwLock::new(None),
             offline_spaces_probe_override,
+            mock_space_store,
         }
     }
 
@@ -183,22 +224,172 @@ impl CliPlatformTransport {
             *guard = token;
         }
     }
+
+    fn execute_mock_http(
+        &self,
+        supports_spaces: bool,
+        store_mutex: &Mutex<std::collections::BTreeMap<SpaceRecordKey, serde_json::Value>>,
+        request: PlatformHttpRequest,
+    ) -> Result<PlatformHttpResponse, MLSError> {
+        let (path, query) = request
+            .url
+            .split_once('?')
+            .map_or((request.url.as_str(), ""), |(p, q)| (p, q));
+
+        if path.ends_with("/xrpc/com.atproto.space.getSpace") {
+            return Ok(PlatformHttpResponse {
+                status: if supports_spaces { 401 } else { 501 },
+                headers: Vec::new(),
+                body: if supports_spaces {
+                    b"{\"error\":\"AuthMissing\"}".to_vec()
+                } else {
+                    b"{\"error\":\"XRPCNotSupported\"}".to_vec()
+                },
+            });
+        }
+
+        if !supports_spaces && path.contains("/xrpc/com.atproto.space.") {
+            return Ok(PlatformHttpResponse {
+                status: 501,
+                headers: Vec::new(),
+                body: b"{\"error\":\"XRPCNotSupported\"}".to_vec(),
+            });
+        }
+
+        let mut store = store_mutex
+            .lock()
+            .map_err(|_| MLSError::Internal("mock space store mutex poisoned".to_string()))?;
+
+        if path.ends_with("/xrpc/com.atproto.space.applyWrites") {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}"))
+                    .map_err(|e| MLSError::Internal(format!("parse mock applyWrites: {e}")))?;
+            let space = parsed
+                .get("space")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if let Some(writes) = parsed.get("writes").and_then(|v| v.as_array()) {
+                for w in writes {
+                    let op = w.get("$type").and_then(|v| v.as_str()).unwrap_or_default();
+                    let col = w
+                        .get("collection")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let rkey = w
+                        .get("rkey")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if op.ends_with("#delete") {
+                        store.remove(&(space.clone(), col, rkey));
+                    } else if let Some(val) = w.get("value") {
+                        store.insert((space.clone(), col, rkey), val.clone());
+                    }
+                }
+            }
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{\"results\":[]}".to_vec(),
+            });
+        }
+
+        if path.ends_with("/xrpc/com.atproto.space.putRecord")
+            || path.ends_with("/xrpc/com.atproto.space.createRecord")
+        {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}"))
+                    .map_err(|e| MLSError::Internal(format!("parse mock putRecord: {e}")))?;
+            let space = parsed
+                .get("space")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let col = parsed
+                .get("collection")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let rkey = parsed
+                .get("rkey")
+                .and_then(|v| v.as_str())
+                .unwrap_or("self")
+                .to_string();
+            if let Some(val) = parsed.get("record") {
+                store.insert((space.clone(), col.clone(), rkey.clone()), val.clone());
+            }
+            let body = serde_json::to_vec(&serde_json::json!({
+                "uri": format!("{space}/{col}/{rkey}"),
+            }))
+            .unwrap_or_else(|_| b"{}".to_vec());
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body,
+            });
+        }
+
+        if path.ends_with("/xrpc/com.atproto.space.listRecords") {
+            let space = decode_query_param(query, "space").unwrap_or_default();
+            let col = decode_query_param(query, "collection").unwrap_or_default();
+            let records: Vec<serde_json::Value> = store
+                .iter()
+                .filter(|((s, c, _), _)| s == &space && c == &col)
+                .map(|((s, c, r), val)| {
+                    serde_json::json!({
+                        "uri": format!("{s}/{c}/{r}"),
+                        "value": val,
+                    })
+                })
+                .collect();
+            let body = serde_json::to_vec(&serde_json::json!({ "records": records }))
+                .map_err(|e| MLSError::Internal(format!("serialize mock listRecords: {e}")))?;
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body,
+            });
+        }
+
+        if path.ends_with("/xrpc/com.atproto.space.getRecord") {
+            let space = decode_query_param(query, "space").unwrap_or_default();
+            let col = decode_query_param(query, "collection").unwrap_or_default();
+            let rkey = decode_query_param(query, "rkey").unwrap_or_default();
+            if let Some(val) = store.get(&(space.clone(), col.clone(), rkey.clone())) {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "uri": format!("{space}/{col}/{rkey}"),
+                    "value": val,
+                }))
+                .map_err(|e| MLSError::Internal(format!("serialize mock getRecord: {e}")))?;
+                return Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body,
+                });
+            }
+            return Ok(PlatformHttpResponse {
+                status: 404,
+                headers: Vec::new(),
+                body: b"{\"error\":\"RecordNotFound\"}".to_vec(),
+            });
+        }
+
+        Ok(PlatformHttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: b"{}".to_vec(),
+        })
+    }
 }
 
 impl PlatformTransport for CliPlatformTransport {
     fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
-        if let Some(supports) = self.offline_spaces_probe_override {
-            if request.url.ends_with("/xrpc/com.atproto.space.getSpace") {
-                return Ok(PlatformHttpResponse {
-                    status: if supports { 401 } else { 501 },
-                    headers: Vec::new(),
-                    body: if supports {
-                        b"{\"error\":\"AuthMissing\"}".to_vec()
-                    } else {
-                        b"{\"error\":\"XRPCNotSupported\"}".to_vec()
-                    },
-                });
-            }
+        if let (Some(supports), Some(ref store_mutex)) =
+            (self.offline_spaces_probe_override, &self.mock_space_store)
+        {
+            return self.execute_mock_http(supports, store_mutex, request);
         }
 
         let http = self.http.clone();
@@ -283,6 +474,7 @@ pub struct CliUnifiedMlsClient {
     storage_root: PathBuf,
     normalized_did: String,
     did_hash: String,
+    transport: Arc<CliPlatformTransport>,
     sdk: Arc<CatbirdMlsClient>,
 }
 
@@ -332,8 +524,12 @@ impl CliUnifiedMlsClient {
             home_ds_endpoint,
             pds_endpoint,
             Arc::new(CliPlatformKeyStore::new_os_keyring()),
-            Arc::new(CliPlatformTransport::new(Some(true))),
+            Arc::new(CliPlatformTransport::new(None)),
         )
+    }
+
+    pub fn set_bearer_token(&self, token: Option<String>) {
+        self.transport.set_bearer_token(token);
     }
 
     pub fn open_for_testing(
@@ -390,11 +586,12 @@ impl CliUnifiedMlsClient {
             pds_endpoint,
         };
         let observer: Arc<dyn PlatformChangeObserver> = Arc::new(CliChangeObserver);
-        let sdk = CatbirdMlsClient::open(cfg, keystore, transport, Some(observer))?;
+        let sdk = CatbirdMlsClient::open(cfg, keystore, transport.clone(), Some(observer))?;
         Ok(Self {
             storage_root,
             normalized_did,
             did_hash,
+            transport,
             sdk,
         })
     }
@@ -480,5 +677,44 @@ mod tests {
         assert_eq!(otc_done.initiator_mlkem768_ek_len, 1184);
         assert_eq!(otc_done.responder_mlkem768_ct_len, 1088);
         assert_eq!(otc_done.new_epoch_seq, 3);
+    }
+
+    #[test]
+    fn cli_unified_client_restores_recovery_code_on_fresh_device_from_space_records() {
+        let shared_transport = Arc::new(CliPlatformTransport::new(Some(true)));
+        let did = "did:plc:catmosclifreshdev00002";
+
+        let dev_a_dir = tempfile::tempdir().expect("dev_a tempdir");
+        let dev_a = CliUnifiedMlsClient::open_inner(
+            dev_a_dir.path().to_path_buf(),
+            did,
+            "did:web:mlschat.catbird.blue".to_string(),
+            "https://mlschat.catbird.blue".to_string(),
+            "https://swan.place".to_string(),
+            Arc::new(CliPlatformKeyStore::new_in_memory()),
+            shared_transport.clone(),
+        )
+        .expect("open dev_a");
+        let (_receipt, status_a) = dev_a.enable_and_enroll(None).expect("enroll dev_a");
+        assert_eq!(status_a.epoch_seq, 1);
+        let code = dev_a.setup_recovery_code().expect("recovery code on dev_a");
+
+        // Fresh Device B has empty local SQLite storage and restores purely via Space listRecords.
+        let dev_b_dir = tempfile::tempdir().expect("dev_b tempdir");
+        let dev_b = CliUnifiedMlsClient::open_inner(
+            dev_b_dir.path().to_path_buf(),
+            did,
+            "did:web:mlschat.catbird.blue".to_string(),
+            "https://mlschat.catbird.blue".to_string(),
+            "https://swan.place".to_string(),
+            Arc::new(CliPlatformKeyStore::new_in_memory()),
+            shared_transport,
+        )
+        .expect("open dev_b");
+        let (_receipt_b, _) = dev_b.enable_and_enroll(None).expect("enroll dev_b");
+        let restored_b = dev_b
+            .restore_recovery_code(&code)
+            .expect("restore on fresh dev_b from Space VirtualDevice + Epoch records");
+        assert!(restored_b.epoch_seq >= 2);
     }
 }

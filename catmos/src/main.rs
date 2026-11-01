@@ -1170,14 +1170,33 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("No account configured. Run `catmos login` first."))?
                 .to_string();
             let data_dir = Config::data_dir()?;
+            let mut resolved_pds = "https://swan.place".to_string();
+            let mut resolved_bearer: Option<String> = None;
+            if let Ok(account_dir) = Config::account_data_dir(&did) {
+                let db_path = account_dir.join("catmos.db");
+                if db_path.exists() {
+                    if let Ok(db_key) = catmos_core::mls::context::get_or_create_db_key(&did) {
+                        if let Ok(db) = Database::open(&db_path, &db_key).await {
+                            if let Ok(Some(ap)) = AppPasswordAuth::load(&db).await {
+                                if !ap.pds_url.trim().is_empty() {
+                                    resolved_pds = ap.pds_url.clone();
+                                }
+                                resolved_bearer = ap.session.current_bearer().await.ok();
+                            }
+                        }
+                    }
+                }
+            }
             let open_unified = || {
-                catmos_core::CliUnifiedMlsClient::open_desktop(
+                let client = catmos_core::CliUnifiedMlsClient::open_desktop(
                     data_dir.clone(),
                     &did,
                     "did:web:mlschat.catbird.blue".to_string(),
                     config.server.nest_url.clone(),
-                    "https://swan.place".to_string(),
-                )
+                    resolved_pds.clone(),
+                )?;
+                client.set_bearer_token(resolved_bearer.clone());
+                Ok::<_, anyhow::Error>(client)
             };
 
             match subcmd {
