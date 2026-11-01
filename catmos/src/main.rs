@@ -1182,17 +1182,26 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                                     resolved_pds = ap.pds_url.clone();
                                 }
                                 resolved_bearer = ap.session.current_bearer().await.ok();
+                            } else if let Ok(Some(oauth)) = OAuthAuth::load(&db).await {
+                                if !oauth.nest_url.trim().is_empty() {
+                                    resolved_pds = oauth.nest_url.clone();
+                                }
+                                resolved_bearer = Some(oauth.session_cookie);
                             }
                         }
                     }
                 }
             }
+            let home_ds_did = std::env::var("CATMOS_MLS_DS_DID")
+                .unwrap_or_else(|_| "did:web:chat.catbird.blue".to_string());
+            let home_ds_endpoint = std::env::var("CATMOS_MLS_DS_URL")
+                .unwrap_or_else(|_| config.server.mls_url.clone());
             let open_unified = || {
                 let client = catmos_core::CliUnifiedMlsClient::open_desktop(
                     data_dir.clone(),
                     &did,
-                    "did:web:mlschat.catbird.blue".to_string(),
-                    config.server.nest_url.clone(),
+                    home_ds_did.clone(),
+                    home_ds_endpoint.clone(),
                     resolved_pds.clone(),
                 )?;
                 client.set_bearer_token(resolved_bearer.clone());

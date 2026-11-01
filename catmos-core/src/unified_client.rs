@@ -161,9 +161,33 @@ impl PlatformKeyStore for CliPlatformKeyStore {
 
 type SpaceRecordKey = (String, String, String);
 
+fn origin_key(url_str: &str) -> Option<(String, String, Option<u16>)> {
+    let parsed = reqwest::Url::parse(url_str).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    Some((
+        parsed.scheme().to_ascii_lowercase(),
+        host,
+        parsed.port_or_known_default(),
+    ))
+}
+
+fn extract_xrpc_nsid(url_str: &str) -> Option<String> {
+    let path_part = url_str.split('?').next().unwrap_or(url_str);
+    let (_, nsid) = path_part.rsplit_once("/xrpc/")?;
+    let trimmed = nsid.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 pub struct CliPlatformTransport {
     http: reqwest::Client,
     bearer_token: RwLock<Option<String>>,
+    pds_endpoint: RwLock<String>,
+    home_ds_endpoint: RwLock<String>,
+    home_ds_did: RwLock<String>,
     offline_spaces_probe_override: Option<bool>,
     mock_space_store: Option<Mutex<std::collections::BTreeMap<SpaceRecordKey, serde_json::Value>>>,
 }
@@ -214,8 +238,32 @@ impl CliPlatformTransport {
         Self {
             http,
             bearer_token: RwLock::new(None),
+            pds_endpoint: RwLock::new("https://swan.place".to_string()),
+            home_ds_endpoint: RwLock::new("https://chat.catbird.blue".to_string()),
+            home_ds_did: RwLock::new("did:web:chat.catbird.blue".to_string()),
             offline_spaces_probe_override,
             mock_space_store,
+        }
+    }
+
+    pub fn configure_endpoints(
+        &self,
+        pds_endpoint: &str,
+        home_ds_endpoint: &str,
+        home_ds_did: &str,
+    ) {
+        if let Ok(mut g) = self.pds_endpoint.write() {
+            *g = pds_endpoint.trim_end_matches('/').to_string();
+        }
+        if let Ok(mut g) = self.home_ds_endpoint.write() {
+            *g = home_ds_endpoint.trim_end_matches('/').to_string();
+        }
+        if let Ok(mut g) = self.home_ds_did.write() {
+            *g = home_ds_did
+                .split('#')
+                .next()
+                .unwrap_or(home_ds_did)
+                .to_string();
         }
     }
 
@@ -394,6 +442,22 @@ impl PlatformTransport for CliPlatformTransport {
 
         let http = self.http.clone();
         let bearer = self.bearer_token.read().ok().and_then(|g| g.clone());
+        let pds_endpoint = self
+            .pds_endpoint
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "https://swan.place".to_string());
+        let home_ds_endpoint = self
+            .home_ds_endpoint
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "https://chat.catbird.blue".to_string());
+        let home_ds_did = self
+            .home_ds_did
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "did:web:chat.catbird.blue".to_string());
+
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -412,7 +476,54 @@ impl PlatformTransport for CliPlatformTransport {
                 }
                 if !has_auth {
                     if let Some(tok) = bearer {
-                        builder = builder.bearer_auth(tok);
+                        let req_origin = origin_key(&request.url);
+                        if req_origin.is_some() && req_origin == origin_key(&pds_endpoint) {
+                            builder = builder.bearer_auth(tok);
+                        } else if req_origin.is_some()
+                            && req_origin == origin_key(&home_ds_endpoint)
+                        {
+                            if let Some(nsid) = extract_xrpc_nsid(&request.url)
+                                .filter(|n| n.starts_with("blue.catbird.chat."))
+                            {
+                                let sa_url = format!(
+                                    "{}/xrpc/com.atproto.server.getServiceAuth",
+                                    pds_endpoint.trim_end_matches('/')
+                                );
+                                let sa_resp = http
+                                    .get(&sa_url)
+                                    .query(&[("aud", home_ds_did.as_str()), ("lxm", nsid.as_str())])
+                                    .bearer_auth(&tok)
+                                    .send()
+                                    .await
+                                    .map_err(|e| {
+                                        MLSError::Internal(format!(
+                                            "mint getServiceAuth `{nsid}` failed: {e}"
+                                        ))
+                                    })?;
+                                if !sa_resp.status().is_success() {
+                                    let status = sa_resp.status().as_u16();
+                                    let text = sa_resp.text().await.unwrap_or_default();
+                                    return Err(MLSError::Internal(format!(
+                                        "getServiceAuth `{nsid}` returned HTTP {status}: {text}"
+                                    )));
+                                }
+                                let sa_json: serde_json::Value =
+                                    sa_resp.json().await.map_err(|e| {
+                                        MLSError::Internal(format!(
+                                            "decode getServiceAuth `{nsid}` JSON: {e}"
+                                        ))
+                                    })?;
+                                let service_jwt = sa_json
+                                    .get("token")
+                                    .and_then(|v| v.as_str())
+                                    .ok_or_else(|| {
+                                        MLSError::Internal(format!(
+                                            "getServiceAuth `{nsid}` response missing token"
+                                        ))
+                                    })?;
+                                builder = builder.bearer_auth(service_jwt);
+                            }
+                        }
                     }
                 }
                 if let Some(body) = request.body {
@@ -540,8 +651,8 @@ impl CliUnifiedMlsClient {
         Self::open_inner(
             storage_root,
             account_did,
-            "did:web:mlschat.catbird.blue".to_string(),
-            "https://mlschat.catbird.blue".to_string(),
+            "did:web:chat.catbird.blue".to_string(),
+            "https://chat.catbird.blue".to_string(),
             "https://swan.place".to_string(),
             Arc::new(CliPlatformKeyStore::new_in_memory()),
             Arc::new(CliPlatformTransport::new(Some(pds_supports_spaces))),
@@ -562,20 +673,22 @@ impl CliUnifiedMlsClient {
         let dev_dir = storage_root.join("mls-opt-in");
         std::fs::create_dir_all(&dev_dir)?;
         let dev_file = dev_dir.join(format!("{did_hash}.device"));
-        let device_id = if let Ok(existing) = std::fs::read_to_string(&dev_file) {
-            let trimmed = existing.trim();
-            if !trimmed.is_empty() {
-                trimmed.to_string()
-            } else {
-                let d = format!("catmos-cli-{}", uuid::Uuid::new_v4());
+        let device_id = std::fs::read_to_string(&dev_file)
+            .ok()
+            .and_then(|raw| {
+                uuid::Uuid::parse_str(raw.trim())
+                    .ok()
+                    .filter(|u| u.get_version_num() == 4)
+                    .map(|u| u.hyphenated().to_string())
+            })
+            .map(Ok::<String, std::io::Error>)
+            .unwrap_or_else(|| {
+                let d = uuid::Uuid::new_v4().hyphenated().to_string();
                 std::fs::write(&dev_file, d.as_bytes())?;
-                d
-            }
-        } else {
-            let d = format!("catmos-cli-{}", uuid::Uuid::new_v4());
-            std::fs::write(&dev_file, d.as_bytes())?;
-            d
-        };
+                Ok(d)
+            })?;
+
+        transport.configure_endpoints(&pds_endpoint, &home_ds_endpoint, &home_ds_did);
 
         let cfg = CatbirdMlsClientConfig {
             storage_root: storage_root.to_string_lossy().to_string(),
@@ -654,9 +767,23 @@ mod tests {
         let did = "did:plc:catmoscliunified00001";
         assert!(!CliUnifiedMlsClient::is_opted_in(tmp.path(), did));
 
+        // Seed a legacy non-UUIDv4 `.device` file and verify migration to canonical lowercase UUIDv4.
+        let did_hash = account_did_hash_hex(did).expect("did hash");
+        let opt_dir = tmp.path().join("mls-opt-in");
+        std::fs::create_dir_all(&opt_dir).expect("mkdir mls-opt-in");
+        std::fs::write(
+            opt_dir.join(format!("{did_hash}.device")),
+            b"catmos-cli-not-a-uuid",
+        )
+        .expect("seed legacy device file");
+
         let client = CliUnifiedMlsClient::open_for_testing(tmp.path().to_path_buf(), did, true)
             .expect("open unified client");
         let (receipt, status) = client.enable_and_enroll(None).expect("enroll");
+        let parsed_uuid =
+            uuid::Uuid::parse_str(&receipt.device_id).expect("device_id must be valid UUID");
+        assert_eq!(parsed_uuid.get_version_num(), 4);
+        assert_eq!(receipt.device_id, parsed_uuid.hyphenated().to_string());
         assert!(CliUnifiedMlsClient::is_opted_in(tmp.path(), did));
         assert!(receipt.labyrinth_backup_enabled);
         assert_eq!(status.epoch_seq, 1);
@@ -688,8 +815,8 @@ mod tests {
         let dev_a = CliUnifiedMlsClient::open_inner(
             dev_a_dir.path().to_path_buf(),
             did,
-            "did:web:mlschat.catbird.blue".to_string(),
-            "https://mlschat.catbird.blue".to_string(),
+            "did:web:chat.catbird.blue".to_string(),
+            "https://chat.catbird.blue".to_string(),
             "https://swan.place".to_string(),
             Arc::new(CliPlatformKeyStore::new_in_memory()),
             shared_transport.clone(),
@@ -704,8 +831,8 @@ mod tests {
         let dev_b = CliUnifiedMlsClient::open_inner(
             dev_b_dir.path().to_path_buf(),
             did,
-            "did:web:mlschat.catbird.blue".to_string(),
-            "https://mlschat.catbird.blue".to_string(),
+            "did:web:chat.catbird.blue".to_string(),
+            "https://chat.catbird.blue".to_string(),
             "https://swan.place".to_string(),
             Arc::new(CliPlatformKeyStore::new_in_memory()),
             shared_transport,
@@ -714,7 +841,7 @@ mod tests {
         let (_receipt_b, _) = dev_b.enable_and_enroll(None).expect("enroll dev_b");
         let restored_b = dev_b
             .restore_recovery_code(&code)
-            .expect("restore on fresh dev_b from Space VirtualDevice + Epoch records");
+            .expect("restore on fresh dev_b from Space listRecords");
         assert!(restored_b.epoch_seq >= 2);
     }
 }
