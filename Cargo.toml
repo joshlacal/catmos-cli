@@ -18,6 +18,8 @@ thiserror = "2.0.21"
 anyhow = "1.0.104"
 bytes = { version = "1.12.1", features = ["serde"] }
 ulid = "3.0.0"
+labyrinth-protocol = { path = "../labyrinth/labyrinth-protocol" }
+p256 = { version = "0.13", features = ["ecdsa", "jwk"] }
 
 [patch.crates-io]
 # Keep SQLx and the shared MLS provider linked to one maintained SQLite ABI.

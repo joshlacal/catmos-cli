@@ -653,6 +653,12 @@ Body: {}",
     }
 
     pub async fn actor_device_id(&self) -> Result<String> {
+        if let Some(unified) = self.unified_client().await {
+            let dev_id = unified.device_id().trim();
+            if !dev_id.is_empty() {
+                return Ok(dev_id.to_string());
+            }
+        }
         if let Some(orch) = self.orchestrator().await {
             if let Ok(Some(uuid)) = orch.credentials().get_device_uuid(self.did()).await {
                 if !uuid.trim().is_empty() {
@@ -1005,6 +1011,36 @@ Body: {}",
     }
 
     pub async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
+        if let Some(unified) = self.unified_client().await {
+            let cid = convo_id.to_string();
+            let self_did = self.did().to_string();
+            let sdk = unified.sdk().clone();
+            tokio::task::spawn_blocking(
+                move || -> std::result::Result<(), catbird_mls::MLSError> {
+                    if let Ok(reqs) = sdk.list_requests(None) {
+                        if let Some(pending) = reqs.into_iter().find(|r| {
+                            (r.conversation_id == cid || r.request_id == cid)
+                                && (r.consent == "incomingPending"
+                                    || r.consent == "outgoingPending"
+                                    || r.consent == "incoming_pending"
+                                    || r.consent == "outgoing_pending")
+                        }) {
+                            return sdk.decline_direct_request(&pending.request_id);
+                        }
+                    }
+                    sdk.remove_group_member(
+                        catbird_mls::groups::lifecycle::MemberRole::Admin,
+                        &cid,
+                        &self_did,
+                    )
+                },
+            )
+            .await
+            .map_err(|e| CatmosError::Other(format!("join error: {e}")))?
+            .map_err(CatmosError::Mls)?;
+            return Ok(());
+        }
+
         let req = serde_json::json!({
             "convoId": convo_id,
         });

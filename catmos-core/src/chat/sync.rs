@@ -32,8 +32,22 @@ impl ChatService {
         Ok(())
     }
 
-    /// Update the read cursor for a conversation on the server.
+    /// Update the read cursor / acknowledge entries up to `seq` on the server (`I14`).
     pub async fn update_cursor(&self, convo_id: &str, cursor: &str) -> Result<()> {
+        if let Some(unified) = self.unified_client().await {
+            if let Ok(seq) = cursor.trim().parse::<i64>() {
+                if seq >= 1 {
+                    let cid = convo_id.to_string();
+                    let sdk = unified.sdk().clone();
+                    tokio::task::spawn_blocking(move || sdk.acknowledge_entries_up_to(&cid, seq))
+                        .await
+                        .map_err(|e| crate::error::CatmosError::Other(format!("join error: {e}")))?
+                        .map_err(crate::error::CatmosError::Mls)?;
+                }
+            }
+            return Ok(());
+        }
+
         let req = UpdateCursorReq {
             convo_id: convo_id.to_string(),
             cursor: cursor.to_string(),

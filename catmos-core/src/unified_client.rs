@@ -182,6 +182,26 @@ fn extract_xrpc_nsid(url_str: &str) -> Option<String> {
     }
 }
 
+struct MockDsState {
+    spaces: std::collections::BTreeMap<SpaceRecordKey, serde_json::Value>,
+    pds_records: std::collections::BTreeMap<(String, String, String), serde_json::Value>,
+    conversations: std::collections::BTreeMap<String, (serde_json::Value, serde_json::Value, i64)>,
+    receipt_sk: p256::ecdsa::SigningKey,
+}
+
+impl MockDsState {
+    fn new() -> Self {
+        let receipt_sk = p256::ecdsa::SigningKey::from_bytes((&[0x42u8; 32]).into())
+            .expect("deterministic mock P-256 receipt signing key");
+        Self {
+            spaces: std::collections::BTreeMap::new(),
+            pds_records: std::collections::BTreeMap::new(),
+            conversations: std::collections::BTreeMap::new(),
+            receipt_sk,
+        }
+    }
+}
+
 pub struct CliPlatformTransport {
     http: reqwest::Client,
     bearer_token: RwLock<Option<String>>,
@@ -189,7 +209,7 @@ pub struct CliPlatformTransport {
     home_ds_endpoint: RwLock<String>,
     home_ds_did: RwLock<String>,
     offline_spaces_probe_override: Option<bool>,
-    mock_space_store: Option<Mutex<std::collections::BTreeMap<SpaceRecordKey, serde_json::Value>>>,
+    mock_space_store: Option<Mutex<MockDsState>>,
 }
 
 fn decode_query_param(query: &str, key: &str) -> Option<String> {
@@ -227,6 +247,16 @@ fn percent_decode_str(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn decode_mock_json_bytes(val: &serde_json::Value) -> Option<Vec<u8>> {
+    if let Some(s) = val.get("$bytes").and_then(|v| v.as_str()) {
+        return BASE64_STANDARD.decode(s).ok();
+    }
+    if let Some(s) = val.as_str() {
+        return BASE64_STANDARD.decode(s).ok();
+    }
+    None
+}
+
 impl CliPlatformTransport {
     pub fn new(offline_spaces_probe_override: Option<bool>) -> Self {
         let http = reqwest::Client::builder()
@@ -234,7 +264,7 @@ impl CliPlatformTransport {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let mock_space_store =
-            offline_spaces_probe_override.map(|_| Mutex::new(std::collections::BTreeMap::new()));
+            offline_spaces_probe_override.map(|_| Mutex::new(MockDsState::new()));
         Self {
             http,
             bearer_token: RwLock::new(None),
@@ -276,13 +306,70 @@ impl CliPlatformTransport {
     fn execute_mock_http(
         &self,
         supports_spaces: bool,
-        store_mutex: &Mutex<std::collections::BTreeMap<SpaceRecordKey, serde_json::Value>>,
+        store_mutex: &Mutex<MockDsState>,
         request: PlatformHttpRequest,
     ) -> Result<PlatformHttpResponse, MLSError> {
         let (path, query) = request
             .url
             .split_once('?')
             .map_or((request.url.as_str(), ""), |(p, q)| (p, q));
+
+        if path.ends_with("/.well-known/did.json") {
+            let ds_did = self
+                .home_ds_did
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_else(|_| "did:web:chat.catbird.blue".to_string());
+            let state = store_mutex
+                .lock()
+                .map_err(|_| MLSError::Internal("mock ds mutex poisoned".to_string()))?;
+            let pt = state.receipt_sk.verifying_key().to_encoded_point(false);
+            let x = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(pt.x().expect("P-256 uncompressed point has x"));
+            let y = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(pt.y().expect("P-256 uncompressed point has y"));
+            let doc = serde_json::json!({
+                "id": ds_did,
+                "verificationMethod": [{
+                    "id": format!("{ds_did}#mls-receipt-1"),
+                    "type": "JsonWebKey2020",
+                    "controller": ds_did,
+                    "publicKeyJwk": {
+                        "kty": "EC",
+                        "crv": "P-256",
+                        "x": x,
+                        "y": y,
+                    },
+                }],
+            });
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&doc).unwrap_or_default(),
+            });
+        }
+
+        if path.contains("plc.directory/") {
+            let did = path.rsplit('/').next().unwrap_or("did:plc:mock");
+            let pds = self
+                .pds_endpoint
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_else(|_| "https://swan.place".to_string());
+            let doc = serde_json::json!({
+                "id": percent_decode_str(did),
+                "service": [{
+                    "id": "#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": pds,
+                }],
+            });
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&doc).unwrap_or_default(),
+            });
+        }
 
         if path.ends_with("/xrpc/com.atproto.space.getSpace") {
             return Ok(PlatformHttpResponse {
@@ -304,9 +391,67 @@ impl CliPlatformTransport {
             });
         }
 
-        let mut store = store_mutex
+        let mut state = store_mutex
             .lock()
             .map_err(|_| MLSError::Internal("mock space store mutex poisoned".to_string()))?;
+
+        if path.ends_with("/xrpc/com.atproto.repo.putRecord") {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}"))
+                    .map_err(|e| MLSError::Internal(format!("parse mock repo.putRecord: {e}")))?;
+            let repo = parsed
+                .get("repo")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let col = parsed
+                .get("collection")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let rkey = parsed
+                .get("rkey")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if let Some(rec) = parsed.get("record") {
+                state
+                    .pds_records
+                    .insert((repo.clone(), col.clone(), rkey.clone()), rec.clone());
+            }
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "uri": format!("at://{repo}/{col}/{rkey}"),
+                    "cid": "bafyreimockpdsrecord000000000000000000000000000000",
+                }))
+                .unwrap_or_default(),
+            });
+        }
+
+        if path.ends_with("/xrpc/com.atproto.repo.listRecords") {
+            let repo = decode_query_param(query, "repo").unwrap_or_default();
+            let col = decode_query_param(query, "collection").unwrap_or_default();
+            let records: Vec<serde_json::Value> = state
+                .pds_records
+                .iter()
+                .filter(|((r, c, _), _)| r == &repo && c == &col)
+                .map(|((r, c, rk), val)| {
+                    serde_json::json!({
+                        "uri": format!("at://{r}/{c}/{rk}"),
+                        "cid": "bafyreimockpdsrecord000000000000000000000000000000",
+                        "value": val,
+                    })
+                })
+                .collect();
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&serde_json::json!({ "records": records }))
+                    .unwrap_or_default(),
+            });
+        }
 
         if path.ends_with("/xrpc/com.atproto.space.applyWrites") {
             let parsed: serde_json::Value =
@@ -331,9 +476,9 @@ impl CliPlatformTransport {
                         .unwrap_or_default()
                         .to_string();
                     if op.ends_with("#delete") {
-                        store.remove(&(space.clone(), col, rkey));
+                        state.spaces.remove(&(space.clone(), col, rkey));
                     } else if let Some(val) = w.get("value") {
-                        store.insert((space.clone(), col, rkey), val.clone());
+                        state.spaces.insert((space.clone(), col, rkey), val.clone());
                     }
                 }
             }
@@ -366,7 +511,9 @@ impl CliPlatformTransport {
                 .unwrap_or("self")
                 .to_string();
             if let Some(val) = parsed.get("record") {
-                store.insert((space.clone(), col.clone(), rkey.clone()), val.clone());
+                state
+                    .spaces
+                    .insert((space.clone(), col.clone(), rkey.clone()), val.clone());
             }
             let body = serde_json::to_vec(&serde_json::json!({
                 "uri": format!("{space}/{col}/{rkey}"),
@@ -382,7 +529,8 @@ impl CliPlatformTransport {
         if path.ends_with("/xrpc/com.atproto.space.listRecords") {
             let space = decode_query_param(query, "space").unwrap_or_default();
             let col = decode_query_param(query, "collection").unwrap_or_default();
-            let records: Vec<serde_json::Value> = store
+            let records: Vec<serde_json::Value> = state
+                .spaces
                 .iter()
                 .filter(|((s, c, _), _)| s == &space && c == &col)
                 .map(|((s, c, r), val)| {
@@ -405,7 +553,10 @@ impl CliPlatformTransport {
             let space = decode_query_param(query, "space").unwrap_or_default();
             let col = decode_query_param(query, "collection").unwrap_or_default();
             let rkey = decode_query_param(query, "rkey").unwrap_or_default();
-            if let Some(val) = store.get(&(space.clone(), col.clone(), rkey.clone())) {
+            if let Some(val) = state
+                .spaces
+                .get(&(space.clone(), col.clone(), rkey.clone()))
+            {
                 let body = serde_json::to_vec(&serde_json::json!({
                     "uri": format!("{space}/{col}/{rkey}"),
                     "value": val,
@@ -424,10 +575,252 @@ impl CliPlatformTransport {
             });
         }
 
+        if path.ends_with("/xrpc/blue.catbird.chat.enrollDevice") {
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{\"authGeneration\":1,\"device\":{\"authGeneration\":1}}".to_vec(),
+            });
+        }
+
+        if path.ends_with("/xrpc/blue.catbird.chat.publishDirectRequestKeys")
+            || path.ends_with("/xrpc/blue.catbird.chat.replenishKeyPackages")
+        {
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{\"accepted\":true}".to_vec(),
+            });
+        }
+
+        if path.ends_with("/xrpc/blue.catbird.chat.createConversation") {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}")).map_err(|e| {
+                    MLSError::Internal(format!("parse mock createConversation: {e}"))
+                })?;
+            let body_obj = parsed
+                .get("signedRequest")
+                .and_then(|sr| sr.get("body"))
+                .cloned()
+                .unwrap_or(parsed);
+            let coords = body_obj
+                .get("next")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let cid = coords
+                .get("conversationId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let meta_snap = body_obj
+                .get("metadataSnapshot")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            state
+                .conversations
+                .insert(cid, (coords.clone(), meta_snap, 1));
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "seq": 1,
+                    "state": { "coordinates": coords },
+                }))
+                .unwrap_or_default(),
+            });
+        }
+
+        if path.ends_with("/xrpc/blue.catbird.chat.sendMessage") {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}"))
+                    .map_err(|e| MLSError::Internal(format!("parse mock sendMessage: {e}")))?;
+            let body_obj = parsed
+                .get("signedRequest")
+                .and_then(|sr| sr.get("body"))
+                .ok_or_else(|| {
+                    MLSError::Internal("mock sendMessage missing signedRequest.body".into())
+                })?;
+            let prior = body_obj
+                .get("prior")
+                .ok_or_else(|| MLSError::Internal("mock sendMessage missing prior".into()))?;
+            let cid = prior
+                .get("conversationId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let generation = prior
+                .get("generation")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let epoch = prior.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+            let group_id = prior
+                .get("groupId")
+                .and_then(decode_mock_json_bytes)
+                .unwrap_or_else(|| vec![0u8; 32]);
+            let entry_id = body_obj
+                .get("messageId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let sender_did = body_obj
+                .get("actorDid")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let sender_dev_id = body_obj
+                .get("actorDeviceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let commitment_vec = body_obj
+                .get("aad")
+                .and_then(|a| a.get("archiveCommitment"))
+                .and_then(decode_mock_json_bytes)
+                .unwrap_or_else(|| vec![0u8; 32]);
+            let archive_commitment: [u8; 32] = commitment_vec
+                .as_slice()
+                .try_into()
+                .map_err(|_| MLSError::Internal("mock archiveCommitment len".into()))?;
+
+            let next_seq = state
+                .conversations
+                .get_mut(&cid)
+                .map(|entry| {
+                    entry.2 += 1;
+                    entry.2
+                })
+                .unwrap_or(2);
+            let ds_did = self
+                .home_ds_did
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_else(|_| "did:web:chat.catbird.blue".to_string());
+            let kid = format!("{ds_did}#mls-receipt-1");
+            let issued_at_ms = chrono::Utc::now().timestamp_millis();
+            let payload = labyrinth_protocol::receipt::SequencerReceiptPayload {
+                sequencer_did: ds_did.clone(),
+                conversation_id: cid.clone(),
+                group_id: group_id.clone(),
+                epoch,
+                sender_device_did_url: format!("{sender_did}#{sender_dev_id}"),
+                entry_id: entry_id.clone(),
+                archive_commitment,
+                seq: next_seq as u64,
+                issued_at_ms,
+            };
+            let signed = labyrinth_protocol::receipt::sign_sequencer_receipt(
+                &state.receipt_sk,
+                &kid,
+                &payload,
+            )
+            .map_err(|e| MLSError::Internal(format!("mock sign receipt: {e}")))?;
+
+            let resp = serde_json::json!({
+                "seq": next_seq,
+                "receivedAt": chrono::Utc::now().to_rfc3339(),
+                "sequencerReceipt": {
+                    "conversationId": cid,
+                    "generation": generation,
+                    "groupId": { "$bytes": BASE64_STANDARD.encode(&group_id) },
+                    "epoch": epoch,
+                    "entryId": entry_id,
+                    "seq": next_seq,
+                    "senderDid": sender_did,
+                    "senderDeviceId": sender_dev_id,
+                    "archiveCommitment": { "$bytes": BASE64_STANDARD.encode(archive_commitment) },
+                    "issuedAtMs": issued_at_ms,
+                    "sequencerDid": ds_did,
+                    "kid": kid,
+                    "signature": { "$bytes": BASE64_STANDARD.encode(signed.signature) },
+                }
+            });
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&resp).unwrap_or_default(),
+            });
+        }
+
+        if path.ends_with("/xrpc/blue.catbird.chat.getInbox") {
+            let convos: Vec<serde_json::Value> = state
+                .conversations
+                .iter()
+                .map(|(cid, (coords, snap, seq))| {
+                    serde_json::json!({
+                        "conversationId": cid,
+                        "coordinates": coords,
+                        "metadataSnapshot": snap,
+                        "latestSeq": seq,
+                    })
+                })
+                .collect();
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "welcomes": [],
+                    "requests": [],
+                    "conversations": convos,
+                }))
+                .unwrap_or_default(),
+            });
+        }
+
+        if path.ends_with("/xrpc/blue.catbird.chat.getEntries") {
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{\"entries\":[],\"hasMore\":false}".to_vec(),
+            });
+        }
+
+        if path.ends_with("/xrpc/blue.catbird.chat.acknowledgeEntries") {
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{\"acknowledgedUpToSeq\":1}".to_vec(),
+            });
+        }
+
+        if path.ends_with("/xrpc/blue.catbird.chat.submitTransition") {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}"))
+                    .unwrap_or_else(|_| serde_json::json!({}));
+            let coords = parsed
+                .get("signedRequest")
+                .and_then(|sr| sr.get("body"))
+                .and_then(|b| b.get("next"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let cid = coords
+                .get("conversationId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let next_seq = state
+                .conversations
+                .get_mut(&cid)
+                .map(|entry| {
+                    entry.0 = coords.clone();
+                    entry.2 += 1;
+                    entry.2
+                })
+                .unwrap_or(2);
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "seq": next_seq,
+                    "state": { "coordinates": coords },
+                }))
+                .unwrap_or_default(),
+            });
+        }
+
         Ok(PlatformHttpResponse {
-            status: 200,
+            status: 404,
             headers: Vec::new(),
-            body: b"{}".to_vec(),
+            body: b"{\"error\":\"NotFound\"}".to_vec(),
         })
     }
 }
@@ -585,6 +978,7 @@ pub struct CliUnifiedMlsClient {
     storage_root: PathBuf,
     normalized_did: String,
     did_hash: String,
+    device_id: String,
     transport: Arc<CliPlatformTransport>,
     sdk: Arc<CatbirdMlsClient>,
 }
@@ -693,7 +1087,7 @@ impl CliUnifiedMlsClient {
         let cfg = CatbirdMlsClientConfig {
             storage_root: storage_root.to_string_lossy().to_string(),
             account_did: normalized_did.clone(),
-            device_id,
+            device_id: device_id.clone(),
             home_ds_did,
             home_ds_endpoint,
             pds_endpoint,
@@ -704,6 +1098,7 @@ impl CliUnifiedMlsClient {
             storage_root,
             normalized_did,
             did_hash,
+            device_id,
             transport,
             sdk,
         })
@@ -726,6 +1121,10 @@ impl CliUnifiedMlsClient {
 
     pub fn sdk(&self) -> &Arc<CatbirdMlsClient> {
         &self.sdk
+    }
+
+    pub fn device_id(&self) -> &str {
+        &self.device_id
     }
 
     pub fn home_ds_did(&self) -> String {

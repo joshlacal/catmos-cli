@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 catbird-mls = { workspace = true }
 catbird-atproto = { workspace = true }
+labyrinth-protocol = { workspace = true }
+p256 = { workspace = true }
 jacquard = { workspace = true }
 jacquard-common = { workspace = true }
 jacquard-identity = { version = "0.13.0", git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
