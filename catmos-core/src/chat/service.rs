@@ -140,6 +140,7 @@ pub struct ChatService {
     pub(crate) inventory_session: Arc<RwLock<Option<(String, String)>>>,
     pub(crate) quarantine_events: tokio::sync::broadcast::Sender<QuarantineEvent>,
     pub(crate) orchestrator: Arc<RwLock<Option<Arc<CliOrchestrator>>>>,
+    pub(crate) unified_client: Arc<RwLock<Option<Arc<crate::CliUnifiedMlsClient>>>>,
 }
 
 impl ChatService {
@@ -169,6 +170,7 @@ impl ChatService {
             inventory_session: Arc::new(RwLock::new(None)),
             quarantine_events: tokio::sync::broadcast::channel(32).0,
             orchestrator: Arc::new(RwLock::new(None)),
+            unified_client: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -187,6 +189,171 @@ impl ChatService {
 
     pub async fn orchestrator(&self) -> Option<Arc<CliOrchestrator>> {
         self.orchestrator.read().await.clone()
+    }
+
+    pub async fn set_unified_client(&self, client: Arc<crate::CliUnifiedMlsClient>) {
+        *self.unified_client.write().await = Some(client);
+    }
+
+    pub async fn unified_client(&self) -> Option<Arc<crate::CliUnifiedMlsClient>> {
+        self.unified_client.read().await.clone()
+    }
+
+    pub(crate) async fn refresh_unified_bearer(&self, unified: &crate::CliUnifiedMlsClient) {
+        let bearer = if let Some(ref sess) = self.token_session {
+            sess.current_bearer().await.ok()
+        } else {
+            match &self.auth {
+                AuthMethod::OAuth { session_cookie, .. } => Some(session_cookie.clone()),
+                AuthMethod::AppPassword { .. } => None,
+            }
+        };
+        if bearer.is_some() {
+            unified.set_bearer_token(bearer);
+        }
+    }
+
+    pub(crate) async fn resolve_unified_conversation_id(
+        &self,
+        unified: &Arc<crate::CliUnifiedMlsClient>,
+        input: &str,
+    ) -> Result<String> {
+        let trimmed = input.trim().to_string();
+        let sdk = Arc::clone(unified.sdk());
+        let rows = tokio::task::spawn_blocking(move || sdk.list_conversations(None, 200))
+            .await
+            .map_err(|e| CatmosError::Other(format!("join unified list_conversations: {e}")))?
+            .map_err(|e| CatmosError::Other(e.to_string()))?;
+        for row in &rows {
+            let gid_hex = hex::encode(&row.group_id);
+            if row.conversation_id.eq_ignore_ascii_case(&trimmed)
+                || gid_hex.eq_ignore_ascii_case(&trimmed)
+            {
+                return Ok(row.conversation_id.clone());
+            }
+        }
+        Ok(trimmed)
+    }
+
+    pub(crate) async fn hydrate_unified_conversations(
+        &self,
+        unified: &Arc<crate::CliUnifiedMlsClient>,
+    ) -> Result<Vec<Conversation>> {
+        let sdk = Arc::clone(unified.sdk());
+        let snapshots = tokio::task::spawn_blocking(move || {
+            let rows = sdk.list_conversations(None, 200)?;
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let members = sdk
+                    .list_members(&row.conversation_id)
+                    .unwrap_or_else(|_| vec![sdk.account_did().to_string()]);
+                let meta = sdk.get_group_metadata(&row.conversation_id).ok().flatten();
+                out.push((row, members, meta));
+            }
+            Ok::<_, catbird_mls::MLSError>(out)
+        })
+        .await
+        .map_err(|e| CatmosError::Other(format!("join unified hydrate_conversations: {e}")))?
+        .map_err(|e| CatmosError::Other(e.to_string()))?;
+
+        let self_did = self.did().to_string();
+        let aliases_guard = self.aliases.read().await;
+        let mut convos = Vec::with_capacity(snapshots.len());
+        for (row, member_dids, meta) in snapshots {
+            let group_id_hex = hex::encode(&row.group_id);
+            let ts = chrono::DateTime::from_timestamp_millis(row.updated_at_ms)
+                .unwrap_or_else(chrono::Utc::now);
+            let members: Vec<crate::types::Member> = member_dids
+                .into_iter()
+                .map(|did| crate::types::Member {
+                    did: did.clone(),
+                    user_did: did.clone(),
+                    device_id: None,
+                    device_name: None,
+                    is_admin: did == self_did,
+                    is_moderator: false,
+                    joined_at: ts,
+                })
+                .collect();
+            let title = meta
+                .as_ref()
+                .and_then(|m| m.title.clone())
+                .or_else(|| row.title.clone());
+            let description = meta.as_ref().and_then(|m| m.description.clone());
+            let metadata_version = meta.as_ref().map(|m| m.metadata_version);
+            let alias = aliases_guard.all().iter().find_map(|(k, v)| {
+                if v == &group_id_hex || v == &row.conversation_id {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            });
+            let convo = Conversation {
+                conversation_id: row.conversation_id,
+                group_id: group_id_hex,
+                name: title,
+                description,
+                creator: self_did.clone(),
+                epoch: row.epoch.max(0) as u64,
+                cipher_suite: MLS_CIPHER_SUITE.to_string(),
+                members,
+                created_at: ts,
+                last_message_at: Some(ts),
+                unread_count: row.unread_count.max(0) as u32,
+                alias,
+                metadata_version,
+                metadata_blob_locator: None,
+                avatar_blob_locator: None,
+                avatar_bytes: None,
+                avatar_content_type: None,
+            };
+            if let Err(e) = self.db.store_conversation(&convo).await {
+                warn!(
+                    "Failed to cache unified conversation {}: {e}",
+                    convo.conversation_id
+                );
+            }
+            convos.push(convo);
+        }
+        drop(aliases_guard);
+        *self.conversations.write().await = convos.clone();
+        Ok(convos)
+    }
+
+    pub(crate) async fn hydrate_unified_messages(
+        &self,
+        unified: &Arc<crate::CliUnifiedMlsClient>,
+        convo_id: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::types::Message>> {
+        let canonical_id = self
+            .resolve_unified_conversation_id(unified, convo_id)
+            .await?;
+        let sdk = Arc::clone(unified.sdk());
+        let cid = canonical_id.clone();
+        let mut rows = tokio::task::spawn_blocking(move || sdk.list_messages(&cid, None, limit))
+            .await
+            .map_err(|e| CatmosError::Other(format!("join unified list_messages: {e}")))?
+            .map_err(|e| CatmosError::Other(e.to_string()))?;
+        rows.reverse();
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let created_at = chrono::DateTime::from_timestamp_millis(row.created_at_ms)
+                .unwrap_or_else(chrono::Utc::now);
+            let msg = crate::types::Message {
+                id: row.message_id,
+                convo_id: convo_id.to_string(),
+                sender_did: Some(row.sender_did),
+                content: super::messages::parse_message_content(&row.plaintext_json),
+                epoch: row.epoch.max(0) as u64,
+                seq: row.seq.max(0) as u64,
+                created_at,
+            };
+            let _ = self.db.store_message(&msg).await;
+            out.push(msg);
+        }
+        Ok(out)
     }
 
     pub fn did(&self) -> &str {
@@ -638,6 +805,36 @@ Body: {}",
             .cloned()
             .collect();
 
+        if let Some(unified) = self.unified_client().await {
+            self.refresh_unified_bearer(&unified).await;
+            let convo_id = uuid::Uuid::new_v4().hyphenated().to_string();
+            let home_ds_did = unified.home_ds_did();
+            let title_opt = (!name.trim().is_empty()).then(|| name.trim().to_string());
+            let desc_opt = description
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(str::to_string);
+            let sdk = Arc::clone(unified.sdk());
+            let cid = convo_id.clone();
+            let members_clone = initial_members.clone();
+            tokio::task::spawn_blocking(move || {
+                sdk.create_group(&cid, &home_ds_did, members_clone, title_opt, desc_opt)
+            })
+            .await
+            .map_err(|e| CatmosError::Other(format!("join unified create_group: {e}")))?
+            .map_err(|e| CatmosError::Other(e.to_string()))?;
+
+            let convos = self.hydrate_unified_conversations(&unified).await?;
+            return convos
+                .into_iter()
+                .find(|c| c.conversation_id == convo_id)
+                .ok_or_else(|| {
+                    CatmosError::Other(format!(
+                        "unified conversation {convo_id} missing after create"
+                    ))
+                });
+        }
+
         let key_packages = if initial_members.is_empty() {
             Vec::new()
         } else {
@@ -934,6 +1131,24 @@ Body: {}",
         name: Option<&str>,
         description: Option<&str>,
     ) -> Result<()> {
+        if let Some(unified) = self.unified_client().await {
+            self.refresh_unified_bearer(&unified).await;
+            let canonical_id = self
+                .resolve_unified_conversation_id(&unified, convo_id)
+                .await?;
+            let title = name.unwrap_or("").to_string();
+            let desc = description.unwrap_or("").to_string();
+            let sdk = Arc::clone(unified.sdk());
+            tokio::task::spawn_blocking(move || {
+                sdk.update_group_metadata(&canonical_id, title, desc, None)
+            })
+            .await
+            .map_err(|e| CatmosError::Other(format!("join unified update_group_metadata: {e}")))?
+            .map_err(|e| CatmosError::Other(e.to_string()))?;
+            let _ = self.hydrate_unified_conversations(&unified).await;
+            return Ok(());
+        }
+
         let group_id_bytes = hex::decode(convo_id)
             .map_err(|_| CatmosError::Other(format!("Invalid hex group ID: {convo_id}")))?;
         let result = self.mls.with_context(|ctx| {
@@ -1013,6 +1228,21 @@ Body: {}",
     }
 
     pub async fn add_member(&self, convo_id: &str, member_did: &str) -> Result<()> {
+        if let Some(unified) = self.unified_client().await {
+            self.refresh_unified_bearer(&unified).await;
+            let canonical_id = self
+                .resolve_unified_conversation_id(&unified, convo_id)
+                .await?;
+            let target = member_did.to_string();
+            let sdk = Arc::clone(unified.sdk());
+            tokio::task::spawn_blocking(move || sdk.add_group_members(&canonical_id, vec![target]))
+                .await
+                .map_err(|e| CatmosError::Other(format!("join unified add_group_members: {e}")))?
+                .map_err(|e| CatmosError::Other(e.to_string()))?;
+            let _ = self.hydrate_unified_conversations(&unified).await;
+            return Ok(());
+        }
+
         let kp_refs = self.fetch_key_packages(&[member_did.to_string()]).await?;
         if kp_refs.is_empty() {
             return Err(CatmosError::Other(format!(
@@ -1099,6 +1329,27 @@ Body: {}",
     }
 
     pub async fn remove_member(&self, convo_id: &str, member_did: &str) -> Result<()> {
+        if let Some(unified) = self.unified_client().await {
+            self.refresh_unified_bearer(&unified).await;
+            let canonical_id = self
+                .resolve_unified_conversation_id(&unified, convo_id)
+                .await?;
+            let target = member_did.to_string();
+            let sdk = Arc::clone(unified.sdk());
+            tokio::task::spawn_blocking(move || {
+                sdk.remove_group_member(
+                    catbird_mls::groups::lifecycle::MemberRole::Admin,
+                    &canonical_id,
+                    &target,
+                )
+            })
+            .await
+            .map_err(|e| CatmosError::Other(format!("join unified remove_group_member: {e}")))?
+            .map_err(|e| CatmosError::Other(e.to_string()))?;
+            let _ = self.hydrate_unified_conversations(&unified).await;
+            return Ok(());
+        }
+
         let did = self.did().to_string();
         let plan = self.mls.with_commit_context(|ctx| {
             ctx.stage_commit(
@@ -1514,9 +1765,7 @@ Body: {}",
         let url = match &self.auth {
             AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
             AuthMethod::AppPassword { pds_url, .. } => {
-                if nsid.starts_with("blue.catbird.chat.")
-                    || nsid.starts_with("blue.catbird.mlsChat.")
-                {
+                if nsid.starts_with("blue.catbird.chat.") {
                     let proxy_val = crate::mls::atproto_proxy_header_value();
                     if let Ok(hv) = HeaderValue::from_str(&proxy_val) {
                         headers.insert(
@@ -1674,6 +1923,77 @@ mod tests {
         assert!(!is_expired_token_response(
             StatusCode::NOT_FOUND,
             br#"{"error":"ExpiredToken"}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_service_unified_client_executes_create_send_and_sync() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let did = "did:plc:catmoscliunifiedchat01";
+        let db_path = tmp.path().join("catmos.db");
+        let db = Arc::new(
+            Database::open(&db_path, "test-sqlcipher-key-0123456789abcdef")
+                .await
+                .expect("open db"),
+        );
+        let mls_dir = tmp.path().join("mls");
+        let mls = Arc::new(MlsManager::new(&mls_dir, did).expect("open mls manager"));
+        let auth = AuthMethod::OAuth {
+            did: did.to_string(),
+            nest_url: "https://swan.place".to_string(),
+            session_cookie: "mock-session-bearer".to_string(),
+        };
+        let service = ChatService::new(
+            auth,
+            None,
+            mls,
+            db,
+            Config::default(),
+            Arc::new(RwLock::new(AliasStore::default())),
+        );
+
+        let unified = Arc::new(
+            crate::CliUnifiedMlsClient::open_for_testing(tmp.path().join("unified"), did, true)
+                .expect("open unified client"),
+        );
+        unified
+            .enable_and_enroll(None)
+            .expect("enroll unified client");
+        service.set_unified_client(unified).await;
+
+        let created = service
+            .create_conversation("CLI Unified Room", &[], Some("X-Wing unified"))
+            .await
+            .expect("create unified conversation");
+        assert_eq!(created.name.as_deref(), Some("CLI Unified Room"));
+        assert!(uuid::Uuid::parse_str(&created.conversation_id).is_ok());
+
+        let sent = service
+            .send_message(&created.conversation_id, "hello from unified cli")
+            .await
+            .expect("send message via CatbirdMlsClient");
+        assert!(uuid::Uuid::parse_str(&sent.id).is_ok());
+        assert!(matches!(
+            sent.content,
+            crate::types::MessageContent::Text(ref t) if t == "hello from unified cli"
+        ));
+
+        service
+            .full_sync()
+            .await
+            .expect("full_sync via unified client");
+        let convos = service.conversations().await;
+        assert_eq!(convos.len(), 1);
+        assert_eq!(convos[0].conversation_id, created.conversation_id);
+
+        let messages = service
+            .fetch_messages(&created.conversation_id, 50)
+            .await
+            .expect("fetch_messages via unified client");
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages[0].content,
+            crate::types::MessageContent::Text(ref t) if t == "hello from unified cli"
         ));
     }
 }

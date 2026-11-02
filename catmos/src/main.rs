@@ -9,14 +9,10 @@ use catmos_core::auth::oauth::OAuthAuth;
 use catmos_core::auth::restore_saved_auth;
 use catmos_core::chat::ChatService;
 use catmos_core::mls::{MlsManager, MLS_CIPHER_SUITE};
-use catmos_core::orchestrator_api::CliApiClient;
-use catmos_core::orchestrator_credentials::KeyringCredentialStore;
-use catmos_core::orchestrator_storage::SqliteStorage;
 use catmos_core::storage::aliases::AliasStore;
 use catmos_core::storage::config::Config;
 use catmos_core::storage::db::Database;
 use catmos_core::types::MessageContent;
-use catmos_core::CliOrchestrator;
 
 #[derive(Parser)]
 #[command(name = "catmos", about = "MLS group chat in your terminal")]
@@ -289,6 +285,16 @@ async fn init_service() -> anyhow::Result<Arc<ChatService>> {
 
     let aliases = Arc::new(RwLock::new(AliasStore::load()?));
 
+    let resolved_pds = match &auth {
+        catmos_core::auth::AuthMethod::AppPassword { pds_url, .. } => pds_url.clone(),
+        catmos_core::auth::AuthMethod::OAuth { nest_url, .. } => nest_url.clone(),
+    };
+    let home_ds_did = std::env::var("CATMOS_MLS_DS_DID")
+        .unwrap_or_else(|_| "did:web:chat.catbird.blue".to_string());
+    let home_ds_endpoint =
+        std::env::var("CATMOS_MLS_DS_URL").unwrap_or_else(|_| config.server.mls_url.clone());
+    let data_dir = Config::data_dir()?;
+
     let db = Arc::new(db);
     let service = Arc::new(ChatService::new(
         auth,
@@ -299,67 +305,50 @@ async fn init_service() -> anyhow::Result<Arc<ChatService>> {
         aliases,
     ));
 
-    let orchestrator_db = account_dir.join("orchestrator.db");
-    let orchestrator_storage = Arc::new(SqliteStorage::new(
-        orchestrator_db.to_string_lossy().as_ref(),
-        &db_key,
+    if !catmos_core::CliUnifiedMlsClient::is_opted_in(&data_dir, &did) {
+        info!("Chat/Spaces disabled by default (ctl #2); skipping unsolicited MLS sync");
+        return Ok(service);
+    }
+
+    let unified = Arc::new(catmos_core::CliUnifiedMlsClient::open_desktop(
+        data_dir,
+        &did,
+        home_ds_did,
+        home_ds_endpoint,
+        resolved_pds,
     )?);
-    orchestrator_storage.set_mls_context(mls.context().clone());
-    let orchestrator_api = Arc::new(CliApiClient::new(service.clone()));
-    let credentials =
-        Arc::new(KeyringCredentialStore::try_new().map_err(|e| anyhow::anyhow!(e.to_string()))?);
-    let orchestrator: Arc<CliOrchestrator> =
-        Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
-            mls.context().clone(),
-            orchestrator_storage,
-            orchestrator_api,
-            credentials,
-            catbird_mls::orchestrator::OrchestratorConfig::default(),
-        ));
-    service.set_orchestrator(orchestrator.clone()).await;
-    if let Err(e) = orchestrator.initialize(&did).await {
-        tracing::warn!("orchestrator initialization failed: {e}");
-    }
-    if let Err(e) = orchestrator.ensure_device_registered().await {
-        tracing::warn!("orchestrator ensure_device_registered failed: {e}");
-    }
+    service.set_unified_client(unified).await;
 
-    // Fetch conversations and join any that lack local MLS state
+    // Sync unified conversations from mls-ds and reconcile block list
     match service.fetch_conversations().await {
-        Ok(_convos) => {
-            // Block reconciliation: leave any MLS group containing a
-            // user from this account's own block list. Catches up on
-            // blocks made from other clients (iOS, web, etc.) before
-            // catmos-cli last ran.
-            match service.list_own_blocks().await {
-                Ok(blocks) if !blocks.is_empty() => {
-                    let blocked: std::collections::HashSet<String> = blocks.into_iter().collect();
-                    let convos_to_leave: Vec<String> = service
-                        .conversations()
-                        .await
-                        .into_iter()
-                        .filter(|c| c.members.iter().any(|m| blocked.contains(&m.user_did)))
-                        .map(|c| c.group_id)
-                        .collect();
+        Ok(_convos) => match service.list_own_blocks().await {
+            Ok(blocks) if !blocks.is_empty() => {
+                let blocked: std::collections::HashSet<String> = blocks.into_iter().collect();
+                let convos_to_leave: Vec<String> = service
+                    .conversations()
+                    .await
+                    .into_iter()
+                    .filter(|c| c.members.iter().any(|m| blocked.contains(&m.user_did)))
+                    .map(|c| c.conversation_id)
+                    .collect();
 
-                    let mut left = 0usize;
-                    for id in &convos_to_leave {
-                        if let Err(e) = service.leave_conversation(id).await {
-                            tracing::warn!("reconcile leave {id}: {e}");
-                        } else {
-                            left += 1;
-                        }
-                    }
-                    if left > 0 {
-                        println!("Reconciled: left {left} group(s) containing blocked users.");
+                let mut left = 0usize;
+                for id in &convos_to_leave {
+                    if let Err(e) = service.leave_conversation(id).await {
+                        tracing::warn!("reconcile leave {id}: {e}");
+                    } else {
+                        left += 1;
                     }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!("Failed to fetch own block list: {e}");
+                if left > 0 {
+                    println!("Reconciled: left {left} group(s) containing blocked users.");
                 }
             }
-        }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("Failed to fetch own block list: {e}");
+            }
+        },
         Err(e) => {
             tracing::warn!("Failed to fetch conversations: {e}");
         }

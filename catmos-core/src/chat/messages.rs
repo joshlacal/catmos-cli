@@ -293,6 +293,40 @@ fn unpad(data: &[u8]) -> &[u8] {
 impl ChatService {
     /// Encrypt and send a text message to a conversation.
     pub async fn send_message(&self, convo_id: &str, text: &str) -> Result<Message> {
+        if let Some(unified) = self.unified_client().await {
+            self.refresh_unified_bearer(&unified).await;
+            let canonical_id = self
+                .resolve_unified_conversation_id(&unified, convo_id)
+                .await?;
+            let msg_id = uuid::Uuid::new_v4().hyphenated().to_string();
+            let text_owned = text.to_string();
+            let sdk = std::sync::Arc::clone(unified.sdk());
+            let cid = canonical_id.clone();
+            let mid = msg_id.clone();
+            let row = tokio::task::spawn_blocking(move || {
+                let sent = sdk.send_message(&cid, &mid, &text_owned)?;
+                let _ = sdk.flush_labyrinth_queue();
+                Ok::<_, catbird_mls::MLSError>(sent)
+            })
+            .await
+            .map_err(|e| CatmosError::Other(format!("join unified send_message: {e}")))?
+            .map_err(|e| CatmosError::Other(e.to_string()))?;
+
+            let created_at =
+                chrono::DateTime::from_timestamp_millis(row.created_at_ms).unwrap_or_else(Utc::now);
+            let msg = Message {
+                id: row.message_id,
+                convo_id: convo_id.to_string(),
+                sender_did: Some(row.sender_did),
+                content: parse_message_content(&row.plaintext_json),
+                epoch: row.epoch.max(0) as u64,
+                seq: row.seq.max(0) as u64,
+                created_at,
+            };
+            let _ = self.db.store_message(&msg).await;
+            return Ok(msg);
+        }
+
         if self.is_quarantined(convo_id).await {
             return Err(CatmosError::Other(format!(
                 "Conversation paused. Type :reset to continue. (convo={})",
@@ -528,6 +562,15 @@ impl ChatService {
 
     /// Fetch all conversations from the server, decrypt metadata, and cache locally.
     pub async fn fetch_conversations(&self) -> Result<Vec<Conversation>> {
+        if let Some(unified) = self.unified_client().await {
+            self.refresh_unified_bearer(&unified).await;
+            let sdk = std::sync::Arc::clone(unified.sdk());
+            let _ = tokio::task::spawn_blocking(move || sdk.sync())
+                .await
+                .map_err(|e| CatmosError::Other(format!("join unified sync: {e}")))?
+                .map_err(|e| CatmosError::Other(e.to_string()))?;
+            return self.hydrate_unified_conversations(&unified).await;
+        }
         self.fetch_conversations_with_states()
             .await
             .map(|(conversations, _)| conversations)
@@ -840,6 +883,18 @@ impl ChatService {
     /// Sync MLS state for a conversation by processing all commit messages
     /// in seq order.
     pub async fn sync_conversation(&self, convo_id: &str) -> Result<()> {
+        if let Some(unified) = self.unified_client().await {
+            self.refresh_unified_bearer(&unified).await;
+            let sdk = std::sync::Arc::clone(unified.sdk());
+            let _ = tokio::task::spawn_blocking(move || sdk.sync())
+                .await
+                .map_err(|e| CatmosError::Other(format!("join unified sync_conversation: {e}")))?
+                .map_err(|e| CatmosError::Other(e.to_string()))?;
+            let _ = self.hydrate_unified_conversations(&unified).await;
+            let _ = self.hydrate_unified_messages(&unified, convo_id, 200).await;
+            return Ok(());
+        }
+
         let (convo_uuid, gid_bytes) = if let Ok(parsed) = uuid::Uuid::parse_str(convo_id) {
             let uuid_str = parsed.to_string();
             let gid = self
@@ -1034,11 +1089,29 @@ impl ChatService {
 
     /// Load messages from the local SQLCipher database (no server round-trip).
     pub async fn load_local_messages(&self, convo_id: &str, limit: u32) -> Result<Vec<Message>> {
+        if let Some(unified) = self.unified_client().await {
+            return self
+                .hydrate_unified_messages(&unified, convo_id, limit)
+                .await;
+        }
         self.db.get_messages(convo_id, limit, None).await
     }
 
     /// Fetch messages for a conversation from the server, decrypt each, and store locally.
     pub async fn fetch_messages(&self, convo_id: &str, limit: u32) -> Result<Vec<Message>> {
+        if let Some(unified) = self.unified_client().await {
+            self.refresh_unified_bearer(&unified).await;
+            let sdk = std::sync::Arc::clone(unified.sdk());
+            let _ = tokio::task::spawn_blocking(move || sdk.sync())
+                .await
+                .map_err(|e| CatmosError::Other(format!("join unified fetch_messages sync: {e}")))?
+                .map_err(|e| CatmosError::Other(e.to_string()))?;
+            let _ = self.hydrate_unified_conversations(&unified).await;
+            return self
+                .hydrate_unified_messages(&unified, convo_id, limit)
+                .await;
+        }
+
         if let Err(e) = self.sync_conversation(convo_id).await {
             warn!(
                 "Failed to sync commits for {}: {e}",
@@ -1155,7 +1228,7 @@ impl ChatService {
 }
 
 /// Parse a decrypted JSON payload into a `MessageContent`.
-fn parse_message_content(plaintext: &str) -> MessageContent {
+pub(crate) fn parse_message_content(plaintext: &str) -> MessageContent {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(plaintext) {
         let msg_type = v
             .get("messageType")
@@ -1216,6 +1289,13 @@ fn parse_message_content(plaintext: &str) -> MessageContent {
                     .unwrap_or("")
                     .to_string();
                 MessageContent::System(text)
+            }
+            None => {
+                if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+                    MessageContent::Text(t.to_string())
+                } else {
+                    MessageContent::Unknown
+                }
             }
             _ => MessageContent::Unknown,
         }

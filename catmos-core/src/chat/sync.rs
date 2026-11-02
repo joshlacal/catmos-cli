@@ -20,6 +20,10 @@ impl ChatService {
     pub async fn full_sync(&self) -> Result<()> {
         debug!("Starting full sync");
         self.fetch_conversations().await?;
+        if self.unified_client().await.is_some() {
+            debug!("Full sync complete (unified CatbirdMlsClient)");
+            return Ok(());
+        }
         // Spec §8.5: run AFTER the conversation list is refreshed so that
         // newly-arrived RESET_PENDING flags from the server are visible and
         // dropped conversations are not retried.

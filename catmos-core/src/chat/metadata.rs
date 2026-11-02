@@ -693,9 +693,7 @@ impl ChatService {
         let url = match &self.auth {
             AuthMethod::OAuth { nest_url, .. } => format!("{nest_url}/xrpc/{nsid}"),
             AuthMethod::AppPassword { pds_url, .. } => {
-                if nsid.starts_with("blue.catbird.chat.")
-                    || nsid.starts_with("blue.catbird.mlsChat.")
-                {
+                if nsid.starts_with("blue.catbird.chat.") {
                     let proxy_val = crate::mls::atproto_proxy_header_value();
                     if let Ok(hv) = HeaderValue::from_str(&proxy_val) {
                         headers.insert(

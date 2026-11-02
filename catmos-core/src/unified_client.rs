@@ -728,6 +728,14 @@ impl CliUnifiedMlsClient {
         &self.sdk
     }
 
+    pub fn home_ds_did(&self) -> String {
+        self.transport
+            .home_ds_did
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "did:web:chat.catbird.blue".to_string())
+    }
+
     pub fn did_hash(&self) -> &str {
         &self.did_hash
     }

@@ -66,6 +66,16 @@ pub async fn run() -> anyhow::Result<()> {
     db.set_content_root_key(content_root_key);
 
     // ── 4. Create ChatService ──────────────────────────────────────────
+    let resolved_pds = match &auth {
+        catmos_core::auth::AuthMethod::AppPassword { pds_url, .. } => pds_url.clone(),
+        catmos_core::auth::AuthMethod::OAuth { nest_url, .. } => nest_url.clone(),
+    };
+    let home_ds_did = std::env::var("CATMOS_MLS_DS_DID")
+        .unwrap_or_else(|_| "did:web:chat.catbird.blue".to_string());
+    let home_ds_endpoint =
+        std::env::var("CATMOS_MLS_DS_URL").unwrap_or_else(|_| config.server.mls_url.clone());
+    let data_dir = Config::data_dir()?;
+
     let aliases = Arc::new(RwLock::new(AliasStore::load()?));
     let service = Arc::new(ChatService::new(
         auth,
@@ -76,28 +86,24 @@ pub async fn run() -> anyhow::Result<()> {
         aliases,
     ));
 
-    // ── 4a. MLS device registration + join missing conversations ──────
-    // Timeout the entire registration/join phase so a slow server can't block startup
-    let reg_result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        let device_info = mls.ensure_registered(&service, &did, &db).await?;
-        info!("MLS device ready: {}", device_info.device_id);
-        // Fetch conversations first so join_missing knows what groups exist
-        service.fetch_conversations().await?;
-        info!("Joining missing conversations (10s timeout)...");
-        let did_clone = did.clone();
-        let svc = Arc::clone(&service);
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            svc.join_missing_conversations(&did_clone),
-        )
-        .await;
-        Ok::<_, catmos_core::error::CatmosError>(())
-    })
-    .await;
-    match reg_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("MLS setup failed: {e}"),
-        Err(_) => info!("MLS setup timed out — will continue with background sync"),
+    // ── 4a. Unified CatbirdMlsClient setup (ctl #2: off by default until opted in)
+    let mls_opted_in = catmos_core::CliUnifiedMlsClient::is_opted_in(&data_dir, &did);
+    if mls_opted_in {
+        match catmos_core::CliUnifiedMlsClient::open_desktop(
+            data_dir,
+            &did,
+            home_ds_did,
+            home_ds_endpoint,
+            resolved_pds,
+        ) {
+            Ok(unified) => {
+                service.set_unified_client(Arc::new(unified)).await;
+                info!("Attached unified CatbirdMlsClient for {did}");
+            }
+            Err(e) => error!("Failed to open unified CatbirdMlsClient: {e}"),
+        }
+    } else {
+        info!("Chat/Spaces disabled by default (ctl #2); skipping unsolicited MLS registration");
     }
 
     // ── 5. Initial sync ────────────────────────────────────────────────
@@ -107,45 +113,47 @@ pub async fn run() -> anyhow::Result<()> {
         config.ui.member_panel_visible,
     );
 
-    info!("Fetching conversations...");
-    match service.fetch_conversations().await {
-        Ok(convos) => {
-            app.conversations = convos;
-            app.set_status(format!("ready · {} conversations", app.conversations.len()));
-            // Populate handle cache from service for sender display
-            app.handle_cache = service.handle_cache().await;
+    if mls_opted_in {
+        info!("Fetching conversations...");
+        match service.fetch_conversations().await {
+            Ok(convos) => {
+                app.conversations = convos;
+                app.set_status(format!("ready · {} conversations", app.conversations.len()));
+                app.handle_cache = service.handle_cache().await;
 
-            // Load cached messages for the active conversation immediately
-            if let Some(convo) = app.active_conversation() {
-                let convo_id = convo.conversation_id.clone();
-                if let Ok(cached) = service.load_local_messages(&convo_id, 50).await {
-                    if !cached.is_empty() {
-                        app.messages = cached;
+                if let Some(convo) = app.active_conversation() {
+                    let convo_id = convo.conversation_id.clone();
+                    if let Ok(cached) = service.load_local_messages(&convo_id, 50).await {
+                        if !cached.is_empty() {
+                            app.messages = cached;
+                        }
                     }
                 }
-            }
 
-            // Pre-fetch messages for ALL conversations in background (populates SQLCipher cache).
-            // Don't block startup — TUI renders immediately with cached messages.
-            let group_ids: Vec<String> = app
-                .conversations
-                .iter()
-                .map(|c| c.group_id.clone())
-                .collect();
-            for gid in group_ids {
-                let svc = Arc::clone(&service);
-                tokio::spawn(async move {
-                    if let Err(e) = svc.fetch_messages(&gid, 50).await {
-                        debug!("Pre-fetch failed for {}: {e}", &gid[..12.min(gid.len())]);
-                    }
-                });
+                // Pre-fetch messages for ALL conversations in background (populates SQLCipher cache).
+                let convo_ids: Vec<String> = app
+                    .conversations
+                    .iter()
+                    .map(|c| c.conversation_id.clone())
+                    .collect();
+                for cid in convo_ids {
+                    let svc = Arc::clone(&service);
+                    tokio::spawn(async move {
+                        if let Err(e) = svc.fetch_messages(&cid, 50).await {
+                            debug!("Pre-fetch failed for {}: {e}", &cid[..12.min(cid.len())]);
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                error!("Failed to fetch conversations: {e}");
+                app.set_status(format!("list unavailable: {e}"));
             }
         }
-        Err(e) => {
-            error!("Failed to fetch conversations: {e}");
-            app.set_status(format!("list unavailable: {e}"));
-            // Continue with empty state — user can retry
-        }
+    } else {
+        app.set_status(
+            "Chat/Spaces disabled — run `catmos labyrinth enable` to enroll".to_string(),
+        );
     }
 
     // ── 6. Set up terminal ─────────────────────────────────────────────
