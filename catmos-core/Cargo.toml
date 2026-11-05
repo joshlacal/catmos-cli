@@ -43,6 +43,8 @@ hostname = "0.4.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Unit tests open catbird-mls's explicit offline archive harness (`open_offline_archive_for_test`).
+catbird-mls = { workspace = true, features = ["test-utils"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }

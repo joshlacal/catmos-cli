@@ -1093,7 +1093,13 @@ impl CliUnifiedMlsClient {
             pds_endpoint,
         };
         let observer: Arc<dyn PlatformChangeObserver> = Arc::new(CliChangeObserver);
-        let sdk = CatbirdMlsClient::open(cfg, keystore, transport.clone(), Some(observer))?;
+        // Unit tests drive Space-only flows over the offline test transport, so they open
+        // catbird-mls's explicit offline archive harness; every other build opens the live client.
+        #[cfg(test)]
+        let open = CatbirdMlsClient::open_offline_archive_for_test;
+        #[cfg(not(test))]
+        let open = CatbirdMlsClient::open;
+        let sdk = open(cfg, keystore, transport.clone(), Some(observer))?;
         Ok(Self {
             storage_root,
             normalized_did,

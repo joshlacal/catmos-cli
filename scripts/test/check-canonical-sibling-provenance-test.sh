@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-exact_sibling=$(cd "$repo_root/../.codex-workspaces/task1-clean-chat-signed-request" && pwd)
+exact_sibling=$(cd "$repo_root/../catbird-mls" && pwd)
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 
@@ -10,6 +10,7 @@ mkdir -p "$fixture/catmos-cli"
 rsync -a --exclude target --exclude .jj --exclude .git "$repo_root/" "$fixture/catmos-cli/"
 ln -s "$exact_sibling" "$fixture/catbird-mls"
 ln -s "$repo_root/../catbird-atproto" "$fixture/catbird-atproto"
+ln -s "$repo_root/../labyrinth" "$fixture/labyrinth"
 
 checked_sibling=$(cd "$fixture/catbird-mls" && pwd)
 (cd "$fixture/catmos-cli" && scripts/check-canonical-sibling-provenance.sh)
