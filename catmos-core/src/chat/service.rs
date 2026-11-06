@@ -823,20 +823,21 @@ Body: {}",
             let sdk = Arc::clone(unified.sdk());
             let cid = convo_id.clone();
             let members_clone = initial_members.clone();
-            tokio::task::spawn_blocking(move || {
+            let created = tokio::task::spawn_blocking(move || {
                 sdk.create_group(&cid, &home_ds_did, members_clone, title_opt, desc_opt)
             })
             .await
             .map_err(|e| CatmosError::Other(format!("join unified create_group: {e}")))?
             .map_err(|e| CatmosError::Other(e.to_string()))?;
+            let canonical_convo_id = created.conversation_id;
 
             let convos = self.hydrate_unified_conversations(&unified).await?;
             return convos
                 .into_iter()
-                .find(|c| c.conversation_id == convo_id)
+                .find(|c| c.conversation_id == canonical_convo_id)
                 .ok_or_else(|| {
                     CatmosError::Other(format!(
-                        "unified conversation {convo_id} missing after create"
+                        "unified conversation {canonical_convo_id} missing after create"
                     ))
                 });
         }
