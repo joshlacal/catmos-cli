@@ -20,6 +20,20 @@ use url::Url;
 use crate::error::{AuthRenewalFailure, CatmosError, Result};
 use crate::storage::db::Database;
 
+type SessionSnapshot = std::collections::HashMap<String, String>;
+
+/// Storage attempts made inside one renewal before serving rotated tokens
+/// from memory and retrying on the next use.
+const PERSIST_ATTEMPTS: u32 = 3;
+const PERSIST_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+enum PersistOutcome {
+    Stored,
+    /// Another writer replaced the durable session since the baseline read.
+    Superseded,
+    Failed,
+}
+
 pub(crate) const APP_PASSWORD_SESSION_KEYS: &[&str] = &[
     "auth_method",
     "handle",
@@ -40,8 +54,15 @@ pub struct TokenSession {
     did: Did,
     handle: String,
     pds_url: String,
-    refresh_persist_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes refresh and persistence. Holds the durable snapshot that
+    /// in-memory credentials were rotated from while they remain unsaved: the
+    /// PDS has consumed that snapshot's refresh token, so memory is
+    /// authoritative until a save succeeds or another writer supersedes it.
+    refresh_persist_lock: Arc<tokio::sync::Mutex<Option<SessionSnapshot>>>,
     invalidated: Arc<AtomicBool>,
+    /// Test-only count of storage attempts to fail before touching SQLite.
+    #[cfg(test)]
+    pub(crate) persist_faults: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Cancellation drops futures without visiting their error branches. Once a
@@ -184,8 +205,10 @@ impl TokenSession {
             handle: credentials.handle.to_string(),
             credentials: Arc::new(RwLock::new(credentials)),
             pds_url,
-            refresh_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
+            refresh_persist_lock: Arc::new(tokio::sync::Mutex::new(None)),
             invalidated: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            persist_faults: Default::default(),
         }
     }
 
@@ -196,18 +219,38 @@ impl TokenSession {
         Ok(self.credentials.read().await.access_jwt.clone())
     }
 
+    /// Return the current access token after one attempt to save rotated
+    /// tokens that an earlier renewal could not persist.
+    pub async fn current_bearer_persisting(&self, db: &Database) -> Result<String> {
+        let mut pending = self.refresh_persist_lock.lock().await;
+        self.require_valid_session()?;
+        if pending.is_some() {
+            // A superseding writer's pair is adopted (or the session is
+            // invalidated) inside; either way memory now reflects that.
+            let _ = self.persist_rotation(db, &mut pending, 1).await;
+            self.require_valid_session()?;
+        }
+        Ok(self.credentials.read().await.access_jwt.clone())
+    }
+
     /// Force a `com.atproto.server.refreshSession` call and return the new bearer.
-    /// Persists the refreshed tokens to `db`.
+    /// Persists the refreshed tokens to `db`; if storage keeps failing, the
+    /// rotated tokens are served from memory and saved on a later use.
     pub async fn refresh(&self, db: &Database) -> Result<String> {
-        let _guard = self.refresh_persist_lock.lock().await;
+        let mut pending = self.refresh_persist_lock.lock().await;
         self.require_valid_session()?;
         let expected = db
             .get_session_values(APP_PASSWORD_SESSION_KEYS)
             .await
             .map_err(|_| AuthRenewalFailure::ReadSnapshot)?;
-        if let Err(error) = self.adopt_durable_snapshot(&expected).await {
-            self.invalidated.store(true, Ordering::Release);
-            return Err(error);
+        if pending.as_ref() != Some(&expected) {
+            // Nothing unsaved, or another writer replaced the consumed
+            // snapshot: the durable session is authoritative.
+            *pending = None;
+            if let Err(error) = self.adopt_durable_snapshot(&expected).await {
+                self.invalidated.store(true, Ordering::Release);
+                return Err(error);
+            }
         }
         // Declared after the serialization guard so Drop invalidates memory
         // before another clone can acquire the session lock on cancellation.
@@ -216,7 +259,9 @@ impl TokenSession {
         let atp = match super::renewal::refresh(&self.transport, &self.pds_url, &refresh).await {
             Ok(atp) => atp,
             Err(error) => {
-                if self.restore_current_or_invalidate(db).await.is_ok() {
+                // With unsaved rotated tokens, the durable refresh token is
+                // already consumed; keep memory rather than re-adopt it.
+                if pending.is_some() || self.restore_current_or_invalidate(db).await.is_ok() {
                     cancellation.disarm();
                 }
                 return Err(error.into());
@@ -233,9 +278,67 @@ impl TokenSession {
             atp.handle.clone(),
             atp.did.clone(),
         );
+        *pending = Some(expected);
+        let stored = self
+            .persist_rotation(db, &mut pending, PERSIST_ATTEMPTS)
+            .await;
+        // Every outcome leaves memory consistent: saved, superseded and
+        // re-adopted, unsaved but authoritative, or invalidated.
+        cancellation.disarm();
+        if !stored? {
+            tracing::warn!(
+                "renewed session could not be saved; serving it from memory and retrying on next use"
+            );
+        }
+        Ok(bearer)
+    }
+
+    /// Save the in-memory rotation against its consumed baseline snapshot.
+    /// Returns `Ok(false)` while storage keeps failing (memory stays
+    /// authoritative) and `AuthSessionChanged` after adopting a newer pair
+    /// that another writer stored.
+    async fn persist_rotation(
+        &self,
+        db: &Database,
+        pending: &mut Option<SessionSnapshot>,
+        attempts: u32,
+    ) -> Result<bool> {
+        let Some(expected) = pending.clone() else {
+            return Ok(true);
+        };
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                tokio::time::sleep(PERSIST_RETRY_DELAY * attempt).await;
+            }
+            match self.store_rotated(db, &expected).await {
+                PersistOutcome::Stored => {
+                    *pending = None;
+                    return Ok(true);
+                }
+                PersistOutcome::Superseded => {
+                    *pending = None;
+                    self.restore_current_or_invalidate(db).await?;
+                    return Err(CatmosError::AuthSessionChanged);
+                }
+                PersistOutcome::Failed => {}
+            }
+        }
+        Ok(false)
+    }
+
+    async fn store_rotated(&self, db: &Database, expected: &SessionSnapshot) -> PersistOutcome {
+        #[cfg(test)]
+        if self
+            .persist_faults
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return PersistOutcome::Failed;
+        }
+        let atp = self.credentials.read().await;
         let saved = db
             .compare_and_store_session_values(
-                &expected,
+                expected,
                 &[
                     ("auth_method", "app_password"),
                     ("handle", atp.handle.as_str()),
@@ -247,22 +350,10 @@ impl TokenSession {
             )
             .await;
         match saved {
-            Ok(true) => cancellation.disarm(),
-            Ok(false) => {
-                self.restore_current_or_invalidate(db).await?;
-                cancellation.disarm();
-                return Err(CatmosError::AuthSessionChanged);
-            }
-            Err(_) => {
-                // Do not expose an unpersisted token to other clones after a
-                // storage failure. A later retry may require normal login.
-                if self.restore_current_or_invalidate(db).await.is_ok() {
-                    cancellation.disarm();
-                }
-                return Err(AuthRenewalFailure::PersistSnapshot.into());
-            }
+            Ok(true) => PersistOutcome::Stored,
+            Ok(false) => PersistOutcome::Superseded,
+            Err(_) => PersistOutcome::Failed,
         }
-        Ok(bearer)
     }
 
     fn require_valid_session(&self) -> Result<()> {
@@ -317,9 +408,11 @@ impl TokenSession {
 
     /// Write the session's current access/refresh JWTs into the DB session table.
     pub async fn persist(&self, db: &Database) -> Result<()> {
-        let _guard = self.refresh_persist_lock.lock().await;
+        let mut pending = self.refresh_persist_lock.lock().await;
         self.require_valid_session()?;
-        self.persist_unlocked(db).await
+        self.persist_unlocked(db).await?;
+        *pending = None;
+        Ok(())
     }
 
     async fn persist_unlocked(&self, db: &Database) -> Result<()> {

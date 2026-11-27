@@ -850,7 +850,7 @@ Body: {}",
             (AuthMethod::OAuth { session_cookie, .. }, _) => Ok(session_cookie.clone()),
             (AuthMethod::AppPassword { pds_url, .. }, Some(session)) => {
                 if !nsid.starts_with("blue.catbird.chat.") && !nsid.starts_with("blue.catbird.mlsChat.") {
-                    return session.current_bearer().await;
+                    return session.current_bearer_persisting(&self.db).await;
                 }
                 let client = crate::device_records::public_client()?;
                 let pds = crate::device_records::https_base(pds_url)?;
@@ -858,7 +858,7 @@ Body: {}",
                 let audience = crate::auth::service_auth::audience(&proxy)?;
                 crate::auth::service_auth::acquire(
                     &client, &pds, self.did(), audience, nsid,
-                    session.current_bearer().await?, || session.refresh(&self.db),
+                    session.current_bearer_persisting(&self.db).await?, || session.refresh(&self.db),
                 ).await
             }
             (AuthMethod::AppPassword { .. }, None) => Err(CatmosError::AuthFailed(
@@ -870,7 +870,9 @@ Body: {}",
     pub(crate) async fn current_bearer(&self) -> Result<String> {
         match (&self.auth, &self.token_session) {
             (AuthMethod::OAuth { session_cookie, .. }, _) => Ok(session_cookie.clone()),
-            (AuthMethod::AppPassword { .. }, Some(sess)) => sess.current_bearer().await,
+            (AuthMethod::AppPassword { .. }, Some(sess)) => {
+                sess.current_bearer_persisting(&self.db).await
+            }
             (AuthMethod::AppPassword { .. }, None) => Err(CatmosError::AuthFailed(
                 "AppPassword auth without a TokenSession — restart catmos".into(),
             )),
