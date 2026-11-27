@@ -234,14 +234,14 @@ impl ChatService {
 
         // 3. Spawn reader task with reconnect loop
         tokio::spawn(async move {
-            let mut attempt: u32 = 0;
+            let mut backoff = ReconnectBackoff::default();
+            let mut decode_warnings = DecodeWarnLimiter::default();
             let mut current_stream = Some(ws_stream);
 
             loop {
+                let mut outcome = ConnectionOutcome::default();
                 if let Some(stream) = current_stream.take() {
-                    // Reset attempt counter on successful connection
-                    attempt = 0;
-
+                    let connected_at = std::time::Instant::now();
                     let (mut write, mut read) = stream.split();
                     let mut disconnected = false;
 
@@ -249,14 +249,28 @@ impl ChatService {
                         match msg_result {
                             Ok(tungstenite::Message::Binary(data)) => match decode_event(&data) {
                                 Ok(Some(event)) => {
+                                    outcome.decoded_event = true;
                                     if tx.send(event).is_err() {
                                         return;
                                     }
                                 }
                                 Ok(None) => {}
-                                Err(()) => {
-                                    warn!("Subscription error frame; reconnecting");
+                                Err(FrameFailure::ErrorFrame { error }) => {
+                                    warn!("Subscription error frame ({error}); reconnecting");
+                                    outcome.error = Some(error);
                                     break;
+                                }
+                                Err(FrameFailure::Undecodable { frame_type, reason }) => {
+                                    if let Some(suppressed) =
+                                        decode_warnings.admit(std::time::Instant::now())
+                                    {
+                                        warn!(
+                                            frame_type = %frame_type,
+                                            reason,
+                                            suppressed,
+                                            "Failed to decode WebSocket event"
+                                        );
+                                    }
                                 }
                             },
                             Ok(tungstenite::Message::Text(text)) => {
@@ -285,14 +299,18 @@ impl ChatService {
                         // Stream ended without explicit close/error — still reconnect
                         info!("WebSocket stream ended");
                     }
+                    outcome.lasted = connected_at.elapsed();
                 }
 
                 // ── Reconnect with exponential backoff ──────────────────
-                attempt += 1;
-                let backoff_secs = std::cmp::min(2u64.saturating_pow(attempt), 30);
+                let delay = backoff.next_delay(&outcome);
                 let _ = tx.send(WsEvent::Reconnecting);
-                info!("WebSocket reconnecting in {backoff_secs}s (attempt {attempt})");
-                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                info!(
+                    "WebSocket reconnecting in {}s (attempt {})",
+                    delay.as_secs(),
+                    backoff.attempt
+                );
+                tokio::time::sleep(delay).await;
 
                 if tx.is_closed() {
                     return;
@@ -323,6 +341,104 @@ impl ChatService {
         });
 
         Ok(rx)
+    }
+}
+
+const MAX_BACKOFF_SECS: u64 = 30;
+/// A connection that stayed up this long was healthy even if idle.
+const HEALTHY_CONNECTION: std::time::Duration = std::time::Duration::from_secs(60);
+/// Delay after an error that a fresh ticket will not fix by itself.
+const PERMANENT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+/// Error-frame names that recur until the user or server acts. mls-ds closes
+/// the socket rather than sending error frames today (its ticket and auth
+/// failures surface as HTTP errors before the upgrade), so these are the
+/// standard ATProto subscription and session names.
+const PERMANENT_STREAM_ERRORS: &[&str] = &[
+    "FutureCursor",
+    "AuthRequired",
+    "InvalidTicket",
+    "ExpiredToken",
+    "InvalidToken",
+    "AccountSessionExpired",
+    "AccountTakedown",
+];
+const DECODE_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_WIRE_NAME_CHARS: usize = 96;
+
+/// What one socket did before it ended (default: a failed reconnect).
+#[derive(Debug, Default)]
+struct ConnectionOutcome {
+    decoded_event: bool,
+    lasted: std::time::Duration,
+    error: Option<String>,
+}
+
+/// Exponential reconnect delay. Connecting alone proves nothing (a server can
+/// accept and immediately error), so only a decoded event or a long-lived
+/// connection resets it.
+#[derive(Debug, Default)]
+struct ReconnectBackoff {
+    attempt: u32,
+}
+
+impl ReconnectBackoff {
+    fn next_delay(&mut self, outcome: &ConnectionOutcome) -> std::time::Duration {
+        if outcome.decoded_event || outcome.lasted >= HEALTHY_CONNECTION {
+            self.attempt = 0;
+        }
+        self.attempt = self.attempt.saturating_add(1);
+        let delay =
+            std::time::Duration::from_secs(2u64.saturating_pow(self.attempt).min(MAX_BACKOFF_SECS));
+        let permanent = outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| PERMANENT_STREAM_ERRORS.contains(&error));
+        if permanent {
+            delay.max(PERMANENT_ERROR_BACKOFF)
+        } else {
+            delay
+        }
+    }
+}
+
+/// At most one decode warning per interval, reporting how many were dropped.
+#[derive(Debug, Default)]
+struct DecodeWarnLimiter {
+    quiet_until: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+impl DecodeWarnLimiter {
+    fn admit(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self.quiet_until.is_some_and(|until| now < until) {
+            self.suppressed += 1;
+            return None;
+        }
+        self.quiet_until = Some(now + DECODE_WARN_INTERVAL);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+/// Why a binary frame produced no event. Carries wire names and fixed
+/// reasons only, never payload bytes.
+#[derive(Debug, PartialEq, Eq)]
+enum FrameFailure {
+    /// `op: -1`; the server ends the stream after this frame.
+    ErrorFrame { error: String },
+    Undecodable {
+        frame_type: String,
+        reason: &'static str,
+    },
+}
+
+fn wire_name(value: &str) -> String {
+    value.chars().take(MAX_WIRE_NAME_CHARS).collect()
+}
+
+fn undecodable(frame_type: &str, reason: &'static str) -> FrameFailure {
+    FrameFailure::Undecodable {
+        frame_type: wire_name(frame_type),
+        reason,
     }
 }
 
@@ -368,46 +484,52 @@ fn convert_event(event: SubscriptionMessage) -> WsEvent {
 
 /// Attempt to decode a raw framed binary message for event types not yet in the
 /// generated `SubscriptionMessage` enum. Returns `Some(WsEvent)` on success.
-fn decode_event(data: &[u8]) -> std::result::Result<Option<WsEvent>, ()> {
+fn decode_event(data: &[u8]) -> std::result::Result<Option<WsEvent>, FrameFailure> {
     let (message_type, payload) = match petrel_core::decode_frame(data) {
         Ok(SubscriptionFrame::Message {
             message_type,
             payload,
             ..
         }) => (message_type, payload),
-        Ok(SubscriptionFrame::Error { .. }) => return Err(()),
+        Ok(SubscriptionFrame::Error { error, .. }) => {
+            return Err(FrameFailure::ErrorFrame {
+                error: wire_name(&error),
+            })
+        }
         Ok(SubscriptionFrame::UnknownOperation { .. }) => return Ok(None),
         Err(_) => {
             // Earlier servers also sent a CBOR header followed by a JSON body.
             // Retain that format without relaxing the operation or frame limit.
             if data.len() > petrel_core::MAXIMUM_FRAME_BYTES {
-                return Ok(None);
+                return Err(undecodable("unknown", "oversized frame"));
             }
             let Ok((Value::Object(header), body)) = petrel_core::dagcbor::decode_prefix_with(
                 data,
                 petrel_core::dagcbor::Limits::STANDARD,
             ) else {
-                return Ok(None);
+                return Err(undecodable("unknown", "frame header"));
             };
             if header.get("op") != Some(&Value::Integer(1)) {
                 return Ok(None);
             }
             let Some(t) = header.get("t").and_then(Value::as_str) else {
-                return Ok(None);
+                return Err(undecodable("unknown", "missing frame type"));
             };
             let Ok(Value::Object(mut payload)) = Value::from_json_data_model(body) else {
-                return Ok(None);
+                return Err(undecodable(t, "legacy JSON body"));
             };
             payload.insert("$type".into(), Value::String(t.to_owned()));
             (t.to_owned(), Value::Object(payload))
         }
     };
-    Ok(match message_type.as_str() {
-        "#groupResetEvent" | "#resetRequestedEvent" => decode_legacy_event(&message_type, &payload),
+    match message_type.as_str() {
+        "#groupResetEvent" | "#resetRequestedEvent" => decode_legacy_event(&message_type, &payload)
+            .map(Some)
+            .ok_or_else(|| undecodable(&message_type, "legacy event body")),
         _ => SubscriptionMessage::from_value(payload)
-            .ok()
-            .map(convert_event),
-    })
+            .map(|event| Some(convert_event(event)))
+            .map_err(|_| undecodable(&message_type, "event body")),
+    }
 }
 
 fn decode_legacy_event(message_type: &str, payload: &Value) -> Option<WsEvent> {
@@ -581,6 +703,193 @@ mod tests {
         assert_eq!(tickets.load(Ordering::SeqCst), 2);
         drop(events);
         sockets.await.unwrap();
+        ds_server.abort();
+    }
+
+    fn error_frame(error: &str) -> Vec<u8> {
+        #[derive(Serialize)]
+        struct ErrorHeader {
+            op: i64,
+        }
+        let mut buf = serde_ipld_dagcbor::ser::to_vec(&ErrorHeader { op: -1 }).unwrap();
+        buf.extend(
+            serde_ipld_dagcbor::ser::to_vec(&serde_json::json!({ "error": error })).unwrap(),
+        );
+        buf
+    }
+
+    async fn subscribing_service(dir: &std::path::Path, ds_url: String) -> ChatService {
+        use crate::auth::AuthMethod;
+        use crate::storage::{aliases::AliasStore, config::Config, db::Database};
+        let did = "did:plc:wsreconnecttest";
+        std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
+        let db = Database::open(&dir.join("chat.db"), "local-test-only")
+            .await
+            .unwrap();
+        db.store_session_value("mls_device_id", "device")
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.server.mls_url = ds_url.clone();
+        ChatService::new(
+            AuthMethod::OAuth {
+                did: did.into(),
+                session_cookie: "test-only".into(),
+                nest_url: ds_url,
+            },
+            None,
+            std::sync::Arc::new(crate::mls::MlsManager::new(&dir.to_path_buf(), did).unwrap()),
+            std::sync::Arc::new(db),
+            config,
+            std::sync::Arc::new(tokio::sync::RwLock::new(AliasStore::default())),
+        )
+    }
+
+    #[test]
+    fn backoff_resets_only_after_a_decoded_event_or_a_healthy_connection() {
+        use std::time::Duration;
+        let mut backoff = ReconnectBackoff::default();
+        let errored = ConnectionOutcome {
+            error: Some("ConsumerTooSlow".into()),
+            ..Default::default()
+        };
+        let delays: Vec<u64> = (0..5)
+            .map(|_| backoff.next_delay(&errored).as_secs())
+            .collect();
+        assert_eq!(delays, [2, 4, 8, 16, 30]);
+        let decoded = ConnectionOutcome {
+            decoded_event: true,
+            ..Default::default()
+        };
+        assert_eq!(backoff.next_delay(&decoded), Duration::from_secs(2));
+        assert_eq!(
+            backoff.next_delay(&ConnectionOutcome::default()),
+            Duration::from_secs(4)
+        );
+        let idle_but_healthy = ConnectionOutcome {
+            lasted: HEALTHY_CONNECTION,
+            ..Default::default()
+        };
+        assert_eq!(
+            backoff.next_delay(&idle_but_healthy),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn permanent_error_frames_wait_long_even_after_a_decoded_event() {
+        let mut backoff = ReconnectBackoff::default();
+        for error in ["FutureCursor", "AuthRequired"] {
+            let outcome = ConnectionOutcome {
+                decoded_event: true,
+                error: Some(error.into()),
+                ..Default::default()
+            };
+            assert_eq!(backoff.next_delay(&outcome), PERMANENT_ERROR_BACKOFF);
+        }
+    }
+
+    #[test]
+    fn error_frames_report_their_wire_name() {
+        assert!(matches!(
+            decode_event(&error_frame("FutureCursor")),
+            Err(FrameFailure::ErrorFrame { error }) if error == "FutureCursor"
+        ));
+    }
+
+    #[test]
+    fn undecodable_event_body_is_reported_with_frame_type_not_payload() {
+        let event = frame(
+            "blue.catbird.chat.defs#typingEvent",
+            &serde_json::json!({"conversationId": "SECRET-PAYLOAD-MARKER"}),
+        );
+        let Err(failure) = decode_event(&event) else {
+            panic!("undecodable body was silently dropped");
+        };
+        assert_eq!(
+            failure,
+            FrameFailure::Undecodable {
+                frame_type: "blue.catbird.chat.defs#typingEvent".into(),
+                reason: "event body",
+            }
+        );
+        assert!(!format!("{failure:?}").contains("SECRET-PAYLOAD-MARKER"));
+        assert!(matches!(
+            decode_event(b"not cbor"),
+            Err(FrameFailure::Undecodable {
+                reason: "frame header",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_warnings_are_rate_limited_and_count_suppressed() {
+        let start = std::time::Instant::now();
+        let mut limiter = DecodeWarnLimiter::default();
+        assert_eq!(limiter.admit(start), Some(0));
+        assert_eq!(
+            limiter.admit(start + std::time::Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            limiter.admit(start + std::time::Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(limiter.admit(start + DECODE_WARN_INTERVAL), Some(2));
+    }
+
+    /// A server that accepts every socket and immediately sends an error frame
+    /// must not be re-dialled (and re-ticketed) every two seconds forever.
+    #[tokio::test]
+    async fn error_frame_after_connect_keeps_backing_off() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::net::TcpListener;
+
+        let ds = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ds_url = format!("http://{}", ds.local_addr().unwrap());
+        let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", ws.local_addr().unwrap());
+        let tickets = Arc::new(AtomicUsize::new(0));
+        let issued = tickets.clone();
+        let ds_app = Router::new().route(
+            "/xrpc/blue.catbird.chat.getSubscriptionTicket",
+            post(move || {
+                let n = issued.fetch_add(1, Ordering::SeqCst) + 1;
+                let endpoint = endpoint.clone();
+                async move {
+                    Json(serde_json::json!({"ticket":format!("ticket-{n}"), "endpoint":endpoint}))
+                }
+            }),
+        );
+        let ds_server = tokio::spawn(async move { axum::serve(ds, ds_app).await.unwrap() });
+        let sockets = tokio::spawn(async move {
+            loop {
+                let (tcp, _) = ws.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let _ = socket
+                    .send(tungstenite::Message::Binary(error_frame("ConsumerTooSlow")))
+                    .await;
+                let _ = socket.close(None).await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let service = subscribing_service(dir.path(), ds_url).await;
+        let events = service.subscribe().await.unwrap();
+        // Delays must grow 2 s, 4 s, ...: a third ticket by 5 s means the
+        // counter was reset by the connect that only delivered an error.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert_eq!(
+            tickets.load(Ordering::SeqCst),
+            2,
+            "reconnect backoff was reset by an errored connection"
+        );
+        drop(events);
+        sockets.abort();
         ds_server.abort();
     }
 
