@@ -599,7 +599,7 @@ impl ChatService {
     /// apply invitation consent gates. Local/legacy rows carry no snapshot.
     pub(crate) async fn fetch_conversations_with_states(&self) -> Result<(
         Vec<Conversation>,
-        HashMap<String, catbird_atproto::blue_catbird::chat::ConversationState>,
+        HashMap<String, petrel_catbird::generated::blue::catbird::chat::defs::ConversationState>,
     )> {
         let actor_device_id = self.actor_device_id().await?;
         let mut convos: Vec<Conversation> = Vec::new();

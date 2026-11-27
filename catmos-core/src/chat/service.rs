@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use catbird_mls::orchestrator::credentials::CredentialStore;
-use catbird_mls::orchestrator_bridge::FFICommitKind;
+use catbird_mls::payload_types::CommitKind;
 use catbird_mls::{GroupConfig, KeyPackageData};
 
 use crate::auth::{AuthMethod, TokenSession};
@@ -1368,15 +1368,17 @@ Body: {}",
                 "No key packages available for {member_did}"
             )));
         }
-        let key_packages: Vec<Vec<u8>> = kp_refs.iter().map(|k| k.key_package.clone()).collect();
+        let key_packages = kp_refs.into_iter()
+            .map(|kp| catbird_mls::KeyPackageData { data: kp.key_package })
+            .collect();
 
         let did = self.did().to_string();
         let plan = self.mls.with_commit_context(|ctx| {
             ctx.stage_commit(
                 group_id.clone(),
-                FFICommitKind::AddMembers {
+                CommitKind::AddMembers {
                     member_dids: vec![member_did.to_string()],
-                    key_packages: key_packages.clone(),
+                    key_packages,
                 },
                 did.as_bytes().to_vec(),
             )
@@ -1456,7 +1458,7 @@ Body: {}",
         let plan = self.mls.with_commit_context(|ctx| {
             ctx.stage_commit(
                 group_id.clone(),
-                FFICommitKind::RemoveMembers {
+                CommitKind::RemoveMembers {
                     member_dids: vec![member_did.to_string()],
                 },
                 did.as_bytes().to_vec(),
@@ -2340,11 +2342,11 @@ mod tests {
         std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
         let temporary = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_unencrypted(&temporary.path().join("chat.db")).await.unwrap());
-        db.store_session_value("mls_device_id", "test-device").await.unwrap();
-        let mls = Arc::new(MlsManager::new(&temporary.path().join("mls"), "did:plc:historytest").unwrap());
+        db.store_session_value("mls_device_id", "70707070-7070-4070-b070-707070707070").await.unwrap();
+        let mls = Arc::new(MlsManager::new(&temporary.path().join("mls"), "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").unwrap());
         mls.context().set_content_root_key(vec![0x74; 32]).unwrap();
         let service = Arc::new(ChatService::new(
-            AuthMethod::OAuth { session_cookie: "test-only".into(), did: "did:plc:historytest".into(), nest_url: endpoint },
+            AuthMethod::OAuth { session_cookie: "test-only".into(), did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(), nest_url: endpoint },
             None, mls.clone(), db, Config::default(),
             Arc::new(RwLock::new(AliasStore::with_path(temporary.path().join("aliases.json")))),
         ));
@@ -2356,10 +2358,12 @@ mod tests {
             timestamp: Utc::now(), epoch: 1, sequence_number: 0, is_own: false,
             delivery_status: None, payload_json: None,
         }).await.unwrap();
+        let credentials = Arc::new(KeyringCredentialStore::new());
+        credentials.store_server_device_id(service.did(), "70707070-7070-4070-b070-707070707070").await.unwrap();
         let orchestrator = Arc::new(MLSOrchestrator::new(
             mls.context().clone(), storage.clone(),
             Arc::new(CliApiClient::new(service.clone())),
-            Arc::new(KeyringCredentialStore::new()), OrchestratorConfig::default(),
+            credentials, OrchestratorConfig::default(),
         ));
         orchestrator.initialize(service.did()).await.unwrap();
         service.set_orchestrator(orchestrator.clone()).await;

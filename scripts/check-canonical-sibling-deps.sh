@@ -22,17 +22,17 @@ if grep -Fq '.codex-workspaces' "$manifest"; then
   exit 1
 fi
 
-required_mls='catbird-mls = { path = "../catbird-mls", package = "catbird_mls" }'
-required_atproto='catbird-atproto = { path = "../catbird-atproto", features = ["streaming"] }'
-
-if ! grep -Fqx "$required_mls" "$manifest"; then
-  printf 'canonical catbird-mls dependency missing from manifest: %s\n' "$manifest" >&2
-  exit 1
-fi
-
-if ! grep -Fqx "$required_atproto" "$manifest"; then
-  printf 'canonical catbird-atproto dependency missing from manifest: %s\n' "$manifest" >&2
-  exit 1
-fi
+required_mls_canonical='catbird-mls = { path = "../catbird-mls", package = "catbird_mls", features = ["legacy-orchestrator"] }'
+for expected in \
+  "$required_mls_canonical" \
+  'petrel = { path = "../Petrel/rust/petrel" }' \
+  'petrel-core = { path = "../Petrel/rust/petrel-core" }' \
+  'petrel-api = { path = "../Petrel/rust/petrel-api", features = ["com_atproto"] }' \
+  'petrel-catbird = { path = "../PetrelCatbird/rust/petrel-catbird" }'; do
+  if ! grep -Fqx "$expected" "$manifest"; then
+    printf 'canonical dependency missing: %s\n' "$expected" >&2
+    exit 1
+  fi
+done
 
 printf 'canonical sibling dependency paths verified: %s\n' "$manifest"

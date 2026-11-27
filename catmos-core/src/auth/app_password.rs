@@ -1,4 +1,4 @@
-//! App-password auth: thin DTO + DB persistence over the jacquard-backed
+//! App-password auth: thin DTO + DB persistence over the Petrel-backed
 //! `TokenSession`. Callers use `login` / `load` to obtain a `TokenSession`
 //! plus the metadata needed to build an `AuthMethod`.
 
@@ -18,8 +18,8 @@ pub struct AppPasswordAuth {
 impl AppPasswordAuth {
     /// Log in using an AT Protocol handle and app password.
     ///
-    /// Delegates to `TokenSession::login`, which uses jacquard's built-in
-    /// PublicResolver to locate the user's PDS and create a session there.
+    /// Delegates to `TokenSession::login`, which uses Petrel's identity
+    /// resolver to locate the user's PDS and create a session there.
     pub async fn login(handle: &str, app_password: &str) -> Result<Self> {
         let session = TokenSession::login(handle, app_password).await?;
         Ok(Self {

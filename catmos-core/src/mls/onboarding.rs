@@ -442,7 +442,7 @@ impl MlsManager {
             //
             // Build CommitGroupChange<'static> directly (via
             // `chat::service::build_commit_group_change`) to bypass the
-            // double-encoding trap in `catbird_atproto::catbird::mls_chat::
+            // double-encoding trap in `petrel_catbird::generated::blue::catbird::chat::
             // commit_group_change::InputData`. That wrapper types bytes fields
             // as `Option<String>` and maps them via `bytes::Bytes::from(String)`
             // which takes the UTF-8 bytes of the string verbatim — passing a

@@ -5,10 +5,10 @@ edition = "2021"
 
 [dependencies]
 catbird-mls = { workspace = true }
-catbird-atproto = { workspace = true }
-jacquard = { workspace = true }
-jacquard-common = { workspace = true }
-jacquard-identity = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
+petrel = { workspace = true }
+petrel-api = { workspace = true }
+petrel-core = { workspace = true }
+petrel-catbird = { workspace = true }
 url = "2"
 tokio = { workspace = true }
 serde = { workspace = true }
