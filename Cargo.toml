@@ -5,10 +5,11 @@ resolver = "2"
 [workspace.dependencies]
 catmos-core = { path = "catmos-core" }
 catmos-tui = { path = "catmos-tui" }
-catbird-mls = { path = "../catbird-mls", package = "catbird_mls" }
-catbird-atproto = { path = "../catbird-atproto", features = ["streaming"] }
-jacquard = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
-jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["websocket"] }
+catbird-mls = { path = "../catbird-mls", package = "catbird_mls", features = ["legacy-orchestrator"] }
+petrel = { path = "../Petrel/rust/petrel" }
+petrel-api = { path = "../Petrel/rust/petrel-api", features = ["com_atproto"] }
+petrel-core = { path = "../Petrel/rust/petrel-core" }
+petrel-catbird = { path = "../PetrelCatbird/rust/petrel-catbird" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

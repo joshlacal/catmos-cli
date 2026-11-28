@@ -52,6 +52,34 @@ use super::service::{validate_group_id_hex, ChatService};
 use crate::error::{CatmosError, Result};
 use crate::types::Conversation;
 
+/// The legacy upload route uses the stable, domain-separated blob mutation
+/// preserved in the native client's clean-chat transcript implementation.
+fn signed_blob_upload(
+    body: serde_json::Value,
+    public_key: &[u8],
+    sign: impl FnOnce(Vec<u8>) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    use catbird_mls::chat_v2::transcript::{
+        decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
+        VerifiedMutation,
+    };
+    let json = serde_json::to_vec(&body).map_err(|e| CatmosError::Other(e.to_string()))?;
+    let strict = decode_strict_json(&json).map_err(|e| CatmosError::Other(e.to_string()))?;
+    let canonical = project_signed_body(SignedMutationKind::BlobUploadPreparation, &strict)
+        .map_err(|e| CatmosError::Other(e.to_string()))?;
+    let transcript =
+        SigningTranscript::build(&canonical).map_err(|e| CatmosError::Other(e.to_string()))?;
+    let signature = sign(transcript.bytes().to_vec())?
+        .try_into()
+        .map_err(|_| CatmosError::Other("invalid blob upload signature length".into()))?;
+    VerifiedMutation::verify(canonical, signature, public_key)
+        .map_err(|e| CatmosError::Other(e.to_string()))?;
+    serde_json::to_vec(
+        &serde_json::json!({"signedRequest":{"body":body,"signature":BASE64.encode(signature)}}),
+    )
+    .map_err(|e| CatmosError::Other(e.to_string()))
+}
+
 /// Decrypted metadata payload returned by `bootstrap_group_metadata`. Pure
 /// data — the function persists it to the DB before returning so callers
 /// rarely need to inspect the value, but it's exposed for tests and for
@@ -418,11 +446,9 @@ impl ChatService {
         };
 
         let metadata_payload = GroupMetadataV1 {
-            version: 1,
-            title: title.clone(),
-            description: description.clone(),
             avatar_blob_locator: avatar_locator.clone(),
             avatar_content_type: avatar_content_type.clone(),
+            ..GroupMetadataV1::new(title.clone(), description.clone())
         };
 
         let metadata_ct = mls_metadata::encrypt_metadata_blob(
@@ -787,31 +813,9 @@ impl ChatService {
             "signedAt": signed_at
         });
 
-        let binding = catbird_mls::orchestrator::CleanChatSigningContext {
-            actor_did: user_did.clone(),
-            device_id: actor_device_id.clone(),
-            auth_generation: None,
-        };
-
-        let prepared = catbird_mls::orchestrator::canonical_transport::prepare_signed_request_with(
-            &binding,
-            catbird_mls::orchestrator::CanonicalOperation::PrepareBlobUpload,
-            serde_json::to_vec(&prep_body)
-                .map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?,
-            |transcript| {
-                self.mls
-                    .with_context(|ctx| {
-                        ctx.sign_with_identity_key(mls_did.clone(), transcript.to_vec())
-                    })
-                    .map_err(|_| catbird_mls::orchestrator::TransportError::Signing)
-            },
-        )
-        .map_err(|e| CatmosError::Mls(catbird_mls::MLSError::Internal(e.to_string())))?;
-
-        let prepared_bytes = prepared.body.ok_or_else(|| {
-            CatmosError::Mls(catbird_mls::MLSError::Internal(
-                "prepared blob body missing".into(),
-            ))
+        let prepared_bytes = signed_blob_upload(prep_body, &public_key, |transcript| {
+            self.mls
+                .with_context(|ctx| ctx.sign_with_identity_key(mls_did.clone(), transcript))
         })?;
 
         let prep_resp: serde_json::Value = self
@@ -861,9 +865,7 @@ impl ChatService {
 
         if self.should_retry_after_refresh(status, &body_bytes) {
             self.refresh_bearer().await?;
-            let fresh_bearer = self
-                .get_service_token(UPLOAD_NSID)
-                .await?;
+            let fresh_bearer = self.get_service_token(UPLOAD_NSID).await?;
             let (url, mut headers) = self.build_request(UPLOAD_NSID, &fresh_bearer)?;
             headers.insert(
                 reqwest::header::CONTENT_TYPE,
@@ -894,5 +896,33 @@ impl ChatService {
 
         Ok(returned_blob_id)
     }
+}
 
+#[cfg(test)]
+mod signed_upload_tests {
+    use super::*;
+
+    #[test]
+    fn blob_upload_matches_the_delivery_service_signing_vector() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/blob-upload-signing.json"
+        ))
+        .unwrap();
+        let key = hex::decode(fixture["publicKeyHex"].as_str().unwrap()).unwrap();
+        let signature = hex::decode(fixture["signatureHex"].as_str().unwrap()).unwrap();
+        let body = fixture["body"].clone();
+        let wire = signed_blob_upload(body.clone(), &key, |transcript| {
+            assert_eq!(
+                hex::encode(Sha256::digest(transcript)),
+                fixture["canonicalRequestDigestHex"]
+            );
+            Ok(signature.clone())
+        })
+        .unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(
+            request,
+            serde_json::json!({"signedRequest":{"body":body,"signature":BASE64.encode(signature)}})
+        );
+    }
 }

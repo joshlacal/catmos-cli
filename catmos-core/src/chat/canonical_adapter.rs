@@ -516,7 +516,7 @@ mod tests {
     fn caller_supplied_proof_jkt_and_signature_tuple_has_no_adapter_path() {
         for operation in [
             CanonicalOperation::SendMessage,
-            CanonicalOperation::UploadBlob,
+            CanonicalOperation::SubmitTransition,
             CanonicalOperation::SubscribeEvents,
         ] {
             let error =

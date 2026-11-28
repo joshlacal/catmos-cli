@@ -4,6 +4,7 @@ use keyring::Entry;
 use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 
+#[cfg(not(test))]
 const SERVICE_NAME: &str = "blue.catbird.catmos";
 
 /// OS keychain-backed credential store using the `keyring` crate.
@@ -32,8 +33,15 @@ impl KeyringCredentialStore {
         }
     }
 
+    #[cfg(not(test))]
     fn entry(key: &str) -> std::result::Result<Entry, keyring::Error> {
         Entry::new(&crate::storage::config::Config::keychain_service(SERVICE_NAME), key)
+    }
+
+    // Unit tests exercise the same durable fallback without touching desktop credentials.
+    #[cfg(test)]
+    fn entry(_key: &str) -> std::result::Result<Entry, keyring::Error> {
+        Ok(Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default())))
     }
 
     fn key_signing(user_did: &str) -> String {
@@ -67,7 +75,13 @@ impl KeyringCredentialStore {
         let mut hasher = sha2::Sha256::new();
         hasher.update(key.as_bytes());
         let hash = hex::encode(hasher.finalize());
+        #[cfg(not(test))]
         let dir = crate::storage::config::Config::data_dir().ok()?.join("credentials");
+        #[cfg(test)]
+        let dir = {
+            static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+            ROOT.get_or_init(|| tempfile::tempdir().expect("test credential directory")).path().to_path_buf()
+        };
         let _ = std::fs::create_dir_all(&dir);
         Some(dir.join(format!("{hash}.key")))
     }

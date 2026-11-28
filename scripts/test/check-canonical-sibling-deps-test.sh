@@ -15,7 +15,7 @@ rewrite_fixture() {
 
 rewrite_fixture \
   -e 's#path = "../catbird-mls"#path = "../.codex-workspaces/security-w1-catbird-mls-resolved-context"#' \
-  -e 's#path = "../catbird-atproto"#path = "../.codex-workspaces/catbird-atproto"#'
+  -e 's#path = "../Petrel/rust/petrel"#path = "../.codex-workspaces/parked-petrel"#'
 
 run_expect_failure() {
   local output status
@@ -46,7 +46,7 @@ run_expect_failure
 rewrite_fixture 's#path = "../\.codex-workspaces/security-w1-catbird-mls-resolved-context"#path = "../catbird-mls"#'
 run_expect_failure
 
-rewrite_fixture 's#path = "../\.codex-workspaces/catbird-atproto"#path = "../catbird-atproto"#'
+rewrite_fixture 's#path = "../\.codex-workspaces/parked-petrel"#path = "../Petrel/rust/petrel"#'
 run_expect_success
 
 printf 'canonical sibling dependency guard test passed\n'

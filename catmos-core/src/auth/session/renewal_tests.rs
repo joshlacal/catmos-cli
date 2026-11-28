@@ -5,6 +5,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
+use std::sync::Arc;
 
 const DID: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
 const HANDLE: &str = "actor.catbird.blue";
@@ -146,36 +147,148 @@ async fn renewal_transport_and_snapshot_read_are_distinct_and_redacted() {
     assert!(error.to_string().contains("read saved session"));
 }
 
-#[tokio::test]
-async fn renewal_write_failure_is_redacted_and_keeps_durable_pair() {
-    let app=Router::new().route("/xrpc/com.atproto.server.refreshSession",post(||async {
-        Json(json!({"did":DID,"handle":HANDLE,"accessJwt":"next-access","refreshJwt":"next-refresh"}))
-    }));
+/// PDS that rotates `SECRET` → `next-*` and `next-refresh` → `third-*`, and
+/// rejects any other (already consumed) refresh token like a real PDS would.
+async fn rotating_pds() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let app = Router::new().route(
+        "/xrpc/com.atproto.server.refreshSession",
+        post(move |headers: axum::http::HeaderMap| {
+            let log = log.clone();
+            async move {
+                let bearer = headers["authorization"].to_str().unwrap().to_owned();
+                log.lock().unwrap().push(bearer.clone());
+                let (access, refresh) = match bearer.as_str() {
+                    b if b == format!("Bearer {SECRET}") => ("next-access", "next-refresh"),
+                    "Bearer next-refresh" => ("third-access", "third-refresh"),
+                    _ => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error":"ExpiredToken"})),
+                        )
+                    }
+                };
+                (
+                    StatusCode::OK,
+                    Json(
+                        json!({"did":DID,"handle":HANDLE,"accessJwt":access,"refreshJwt":refresh}),
+                    ),
+                )
+            }
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let pds = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (pds, server, seen)
+}
+
+async fn durable_pair(db: &Database) -> (Option<String>, Option<String>) {
+    (
+        db.get_session_value("access_jwt").await.unwrap(),
+        db.get_session_value("refresh_jwt").await.unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn renewal_write_failure_keeps_rotated_tokens_and_persists_on_next_use() {
+    let (pds, server, seen) = rotating_pds().await;
     let (_dir, db, session) = fixture(pds).await;
+    let sibling = session.clone();
     sqlx::query("CREATE TRIGGER fail_refresh BEFORE INSERT ON session WHEN NEW.key='refresh_jwt' BEGIN SELECT RAISE(ABORT, 'DO_NOT_EXPOSE_REFRESH_SECRET'); END").execute(db.pool_for_test()).await.unwrap();
-    let error = session.refresh(&db).await.unwrap_err();
-    assert!(matches!(
-        error,
-        CatmosError::AuthRenewal(AuthRenewalFailure::PersistSnapshot)
-    ));
-    let text = error.to_string();
-    let debug = format!("{error:?}");
-    assert!(
-        !text.contains(SECRET) && !debug.contains(SECRET),
-        "storage details escaped"
+    // The PDS consumed SECRET; the rotated pair must stay usable in-process.
+    assert_eq!(session.refresh(&db).await.unwrap(), "next-access");
+    assert_eq!(sibling.current_bearer().await.unwrap(), "next-access");
+    assert_eq!(
+        durable_pair(&db).await,
+        (Some(SECRET.into()), Some(SECRET.into()))
     );
-    assert!(text.contains("save renewed session"));
-    assert!(session.current_bearer().await.unwrap() == SECRET);
-    assert!(db.get_session_value("access_jwt").await.unwrap().as_deref() == Some(SECRET));
-    assert!(
-        db.get_session_value("refresh_jwt")
+    // A later renewal while storage is still failing must present the rotated
+    // refresh token, never the consumed durable one.
+    assert_eq!(session.refresh(&db).await.unwrap(), "third-access");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![format!("Bearer {SECRET}"), "Bearer next-refresh".to_owned()]
+    );
+    assert_eq!(
+        durable_pair(&db).await,
+        (Some(SECRET.into()), Some(SECRET.into()))
+    );
+    // Storage recovers: the next use persists the newest pair.
+    sqlx::query("DROP TRIGGER fail_refresh")
+        .execute(db.pool_for_test())
+        .await
+        .unwrap();
+    assert_eq!(
+        sibling.current_bearer_persisting(&db).await.unwrap(),
+        "third-access"
+    );
+    assert_eq!(
+        durable_pair(&db).await,
+        (Some("third-access".into()), Some("third-refresh".into()))
+    );
+    assert_eq!(
+        db.get_session_value("device_uuid")
             .await
             .unwrap()
-            .as_deref()
-            == Some(SECRET)
+            .as_deref(),
+        Some("preserved-device")
+    );
+    db.pool_for_test().close().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn renewal_write_failing_once_is_retried_before_returning() {
+    let (pds, server, _) = rotating_pds().await;
+    let (_dir, db, session) = fixture(pds).await;
+    session
+        .persist_faults
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(session.refresh(&db).await.unwrap(), "next-access");
+    assert_eq!(
+        session
+            .persist_faults
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        durable_pair(&db).await,
+        (Some("next-access".into()), Some("next-refresh".into()))
+    );
+    db.pool_for_test().close().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn unsaved_rotation_yields_to_a_newer_pair_stored_by_another_process() {
+    let (pds, server, _) = rotating_pds().await;
+    let (_dir, db, session) = fixture(pds.clone()).await;
+    sqlx::query("CREATE TRIGGER fail_refresh BEFORE INSERT ON session WHEN NEW.key='refresh_jwt' AND NEW.value='next-refresh' BEGIN SELECT RAISE(ABORT, 'simulated storage failure'); END").execute(db.pool_for_test()).await.unwrap();
+    assert_eq!(session.refresh(&db).await.unwrap(), "next-access");
+    // Another process signs in and stores a newer pair for the same account.
+    let login = TokenSession::restore(
+        HANDLE.into(),
+        DID.into(),
+        "access-login".into(),
+        "refresh-login".into(),
+        pds,
+    )
+    .await
+    .unwrap();
+    login.persist(&db).await.unwrap();
+    assert_eq!(
+        session.current_bearer_persisting(&db).await.unwrap(),
+        "access-login"
+    );
+    assert_eq!(
+        durable_pair(&db).await,
+        (Some("access-login".into()), Some("refresh-login".into()))
     );
     db.pool_for_test().close().await;
     server.abort();

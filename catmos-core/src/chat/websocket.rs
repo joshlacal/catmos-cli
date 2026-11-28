@@ -1,17 +1,16 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
-
-use catbird_atproto::blue_catbird::chat::subscribe_events::SubscribeEventsMessage;
 use futures_util::{SinkExt, StreamExt};
+use petrel_catbird::generated::blue::catbird::chat::defs::{
+    ProtocolEventPayload, SubscriptionMessage,
+};
+use petrel_core::{FromValue, SubscriptionFrame, Value};
 use serde::Deserialize;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Raw GroupResetEvent fields for manual DAG-CBOR deserialization.
-/// The generated `SubscribeEventsMessage` does not yet include this variant,
-/// so we parse it from raw bytes when `decode_framed` returns `UnknownEventType`.
+/// The generated `SubscriptionMessage` does not yet include this variant,
+/// so we parse it from the decoded payload when its short-name header is present.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct RawGroupResetEvent {
@@ -30,10 +29,8 @@ struct RawGroupResetEvent {
 /// requested a crypto session reset. The server has NOT minted a new MLS
 /// group id; subscribed clients are invited to elect a first responder.
 ///
-/// The generated `SubscribeEventsMessage` does not yet include this variant
-/// on `catbird-atproto/main` (the type lives on the
-/// `lexicon/reset-requested-event` branch). We parse it from raw bytes when
-/// `decode_framed` returns `UnknownEventType`, mirroring the
+/// The generated `SubscriptionMessage` does not yet include this variant
+/// as a top-level message. We decode its legacy short-name form like the
 /// `RawGroupResetEvent` pattern above.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -140,10 +137,7 @@ pub enum WsEvent {
     Reconnecting,
 }
 
-/// Thin owned wrapper for the getSubscriptionTicket response.
-/// The generated `GetSubscriptionTicketOutput` uses lifetime parameters and
-/// `CowStr<'a>`, so it cannot be used with `DeserializeOwned`-based flows.
-/// We keep this minimal owned version matching the generated field names.
+/// Earlier ticket issuers omitted the endpoint and used the configured service URL.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SubscriptionTicketResponse {
@@ -158,44 +152,38 @@ impl ChatService {
         ticket: &str,
         cursor: &str,
         endpoint: Option<&str>,
-    ) -> String {
-        let endpoint = endpoint.map(String::from).unwrap_or_else(|| {
-            let base = config.server.mls_url.clone();
-            format!("{base}/xrpc/blue.catbird.chat.subscribeEvents?ticket={ticket}&cursor={cursor}")
-        });
-
-        let mut url_str = endpoint;
-        if !url_str.contains("cursor=") {
-            let sep = if url_str.contains('?') { "&" } else { "?" };
-            url_str = format!("{url_str}{sep}cursor={cursor}");
+    ) -> Result<String> {
+        let fallback = format!(
+            "{}/xrpc/blue.catbird.chat.subscribeEvents",
+            config.server.mls_url.trim_end_matches('/')
+        );
+        let mut url = url::Url::parse(endpoint.unwrap_or(&fallback))
+            .map_err(|_| CatmosError::WebSocket("invalid subscription endpoint".into()))?;
+        let ws_scheme = match url.scheme() {
+            "ws" | "http" => "ws",
+            "wss" | "https" => "wss",
+            _ => {
+                return Err(CatmosError::WebSocket(
+                    "unsupported subscription endpoint scheme".into(),
+                ))
+            }
+        };
+        url.set_scheme(ws_scheme)
+            .map_err(|_| CatmosError::WebSocket("invalid subscription endpoint scheme".into()))?;
+        for (key, value) in [("cursor", cursor), ("ticket", ticket)] {
+            if !url.query_pairs().any(|(name, _)| name == key) {
+                url.query_pairs_mut().append_pair(key, value);
+            }
         }
-        if !url_str.contains("ticket=") {
-            let sep = if url_str.contains('?') { "&" } else { "?" };
-            url_str = format!("{url_str}{sep}ticket={ticket}");
-        }
-        url_str
-            .replace("https://", "wss://")
-            .replace("http://", "ws://")
+        Ok(url.into())
     }
 
-    /// Subscribe to real-time events via WebSocket.
-    ///
-    /// Returns an unbounded receiver that emits `WsEvent`s. The WebSocket
-    /// reader runs in a background task with automatic reconnect and
-    /// exponential backoff (max 30s) on disconnect/error.
-    pub async fn subscribe(&self) -> Result<mpsc::UnboundedReceiver<WsEvent>> {
-        let actor_device_id = self.actor_device_id().await?;
-        let (inventory_session_id, event_cursor) = {
-            let guard = self.inventory_session.read().await;
-            guard.clone().unwrap_or_else(|| {
-                (
-                    "catmos-cli-session".to_string(),
-                    "0".to_string(),
-                )
-            })
-        };
-
-        // 1. Get a subscription ticket for the initial connection
+    async fn subscription_url(
+        &self,
+        actor_device_id: &str,
+        inventory_session_id: &str,
+        event_cursor: &str,
+    ) -> Result<String> {
         let ticket_resp: SubscriptionTicketResponse = self
             .xrpc_procedure(
                 "blue.catbird.chat.getSubscriptionTicket",
@@ -207,14 +195,31 @@ impl ChatService {
             )
             .await?;
 
-        let ws_url = Self::build_ws_url(
+        Self::build_ws_url(
             &self.config,
             &ticket_resp.ticket,
-            &event_cursor,
+            event_cursor,
             ticket_resp.endpoint.as_deref(),
-        );
+        )
+    }
 
-        debug!("Connecting WebSocket to {ws_url}");
+    /// Subscribe to real-time events via WebSocket.
+    ///
+    /// Returns an unbounded receiver that emits `WsEvent`s. The WebSocket
+    /// reader runs in a background task with automatic reconnect and
+    /// exponential backoff (max 30s) on disconnect/error.
+    pub async fn subscribe(&self) -> Result<mpsc::UnboundedReceiver<WsEvent>> {
+        let actor_device_id = self.actor_device_id().await?;
+        let (inventory_session_id, event_cursor) = {
+            let guard = self.inventory_session.read().await;
+            guard
+                .clone()
+                .unwrap_or_else(|| ("catmos-cli-session".to_string(), "0".to_string()))
+        };
+
+        let ws_url = self
+            .subscription_url(&actor_device_id, &inventory_session_id, &event_cursor)
+            .await?;
 
         // 2. Connect
         let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
@@ -225,65 +230,49 @@ impl ChatService {
 
         let (tx, rx) = mpsc::unbounded_channel();
 
-        // Clone what the background reconnect task needs
-        let mls = self.mls.clone();
-        let own_commits = self.own_commits.clone();
-        let config = self.config.clone();
-        let auth = self.auth.clone();
-        let token_session = self.token_session.clone();
-        let db = self.db.clone();
-        let http = self.http.clone();
-        let actor_device_id_task = actor_device_id.clone();
-        let inventory_session_task = inventory_session_id.clone();
-        let event_cursor_task = event_cursor.clone();
+        let service = self.clone();
 
         // 3. Spawn reader task with reconnect loop
         tokio::spawn(async move {
-            let mut attempt: u32 = 0;
+            let mut backoff = ReconnectBackoff::default();
+            let mut decode_warnings = DecodeWarnLimiter::default();
             let mut current_stream = Some(ws_stream);
 
             loop {
+                let mut outcome = ConnectionOutcome::default();
                 if let Some(stream) = current_stream.take() {
-                    // Reset attempt counter on successful connection
-                    attempt = 0;
-
+                    let connected_at = std::time::Instant::now();
                     let (mut write, mut read) = stream.split();
                     let mut disconnected = false;
 
                     while let Some(msg_result) = read.next().await {
                         match msg_result {
-                            Ok(tungstenite::Message::Binary(data)) => {
-                                if let Some(ws_event) = try_decode_unknown_event(&data) {
-                                    if tx.send(ws_event).is_err() {
-                                        debug!("WsEvent receiver dropped, stopping reader");
+                            Ok(tungstenite::Message::Binary(data)) => match decode_event(&data) {
+                                Ok(Some(event)) => {
+                                    outcome.decoded_event = true;
+                                    if tx.send(event).is_err() {
                                         return;
                                     }
-                                } else if let Ok((_header, body)) =
-                                    jacquard_common::xrpc::subscription::parse_event_header(&data)
-                                {
-                                    if let Ok(event) =
-                                        serde_ipld_dagcbor::from_slice::<SubscribeEventsMessage>(&body)
+                                }
+                                Ok(None) => {}
+                                Err(FrameFailure::ErrorFrame { error }) => {
+                                    warn!("Subscription error frame ({error}); reconnecting");
+                                    outcome.error = Some(error);
+                                    break;
+                                }
+                                Err(FrameFailure::Undecodable { frame_type, reason }) => {
+                                    if let Some(suppressed) =
+                                        decode_warnings.admit(std::time::Instant::now())
                                     {
-                                        let ws_event =
-                                            convert_event(event, &mls, &own_commits).await;
-                                        if tx.send(ws_event).is_err() {
-                                            debug!("WsEvent receiver dropped, stopping reader");
-                                            return;
-                                        }
-                                    } else if let Ok(event) =
-                                        serde_json::from_slice::<SubscribeEventsMessage>(&body)
-                                    {
-                                        let ws_event =
-                                            convert_event(event, &mls, &own_commits).await;
-                                        if tx.send(ws_event).is_err() {
-                                            debug!("WsEvent receiver dropped, stopping reader");
-                                            return;
-                                        }
-                                    } else {
-                                        warn!("Failed to decode WebSocket event body");
+                                        warn!(
+                                            frame_type = %frame_type,
+                                            reason,
+                                            suppressed,
+                                            "Failed to decode WebSocket event"
+                                        );
                                     }
                                 }
-                            }
+                            },
                             Ok(tungstenite::Message::Text(text)) => {
                                 warn!("Received unexpected text frame, ignoring: {text}");
                             }
@@ -310,41 +299,27 @@ impl ChatService {
                         // Stream ended without explicit close/error — still reconnect
                         info!("WebSocket stream ended");
                     }
+                    outcome.lasted = connected_at.elapsed();
                 }
 
                 // ── Reconnect with exponential backoff ──────────────────
-                attempt += 1;
-                let backoff_secs = std::cmp::min(2u64.saturating_pow(attempt), 30);
+                let delay = backoff.next_delay(&outcome);
                 let _ = tx.send(WsEvent::Reconnecting);
-                info!("WebSocket reconnecting in {backoff_secs}s (attempt {attempt})");
-                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                info!(
+                    "WebSocket reconnecting in {}s (attempt {})",
+                    delay.as_secs(),
+                    backoff.attempt
+                );
+                tokio::time::sleep(delay).await;
 
-                // Get a fresh subscription ticket using a temporary client
-                // (we can't hold &self across the spawn boundary, so we
-                //  rebuild the request manually). Uses the jacquard token
-                // session so token refresh happens transparently.
-                let ticket_result = get_subscription_ticket_standalone(
-                    &http,
-                    &auth,
-                    token_session.as_ref(),
-                    &db,
-                    &config,
-                    &actor_device_id_task,
-                    &inventory_session_task,
-                    &event_cursor_task,
-                )
-                .await;
-
-                match ticket_result {
-                    Ok(ticket_resp) => {
-                        let ws_url = ChatService::build_ws_url(
-                            &config,
-                            &ticket_resp.ticket,
-                            &event_cursor_task,
-                            ticket_resp.endpoint.as_deref(),
-                        );
-                        debug!("Reconnecting WebSocket to {ws_url}");
-
+                if tx.is_closed() {
+                    return;
+                }
+                match service
+                    .subscription_url(&actor_device_id, &inventory_session_id, &event_cursor)
+                    .await
+                {
+                    Ok(ws_url) => {
                         match tokio_tungstenite::connect_async(&ws_url).await {
                             Ok((stream, _)) => {
                                 info!("WebSocket reconnected");
@@ -369,131 +344,109 @@ impl ChatService {
     }
 }
 
-/// Standalone subscription ticket fetch for use inside the reconnect task.
-/// Avoids needing a `&ChatService` reference across the spawn boundary.
-/// On 401/400 with an AppPassword session, refreshes tokens via jacquard
-/// and retries once.
-async fn get_subscription_ticket_standalone(
-    http: &reqwest::Client,
-    auth: &crate::auth::AuthMethod,
-    token_session: Option<&crate::auth::TokenSession>,
-    db: &crate::storage::db::Database,
-    config: &crate::storage::config::Config,
-    actor_device_id: &str,
-    inventory_session_id: &str,
-    event_cursor: &str,
-) -> std::result::Result<SubscriptionTicketResponse, String> {
-    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-    use reqwest::StatusCode;
+const MAX_BACKOFF_SECS: u64 = 30;
+/// A connection that stayed up this long was healthy even if idle.
+const HEALTHY_CONNECTION: std::time::Duration = std::time::Duration::from_secs(60);
+/// Delay after an error that a fresh ticket will not fix by itself.
+const PERMANENT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+/// Error-frame names that recur until the user or server acts. mls-ds closes
+/// the socket rather than sending error frames today (its ticket and auth
+/// failures surface as HTTP errors before the upgrade), so these are the
+/// standard ATProto subscription and session names.
+const PERMANENT_STREAM_ERRORS: &[&str] = &[
+    "FutureCursor",
+    "AuthRequired",
+    "InvalidTicket",
+    "ExpiredToken",
+    "InvalidToken",
+    "AccountSessionExpired",
+    "AccountTakedown",
+];
+const DECODE_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_WIRE_NAME_CHARS: usize = 96;
 
-    let nsid = "blue.catbird.chat.getSubscriptionTicket";
-
-    let (base_url, is_proxy) = match auth {
-        crate::auth::AuthMethod::OAuth { nest_url, .. } => (format!("{nest_url}/xrpc/{nsid}"), false),
-        crate::auth::AuthMethod::AppPassword { pds_url, .. } => {
-            (format!("{}/xrpc/{nsid}", pds_url.trim_end_matches('/')), true)
-        }
-    };
-
-    // Resolve the bearer token for this attempt — OAuth uses the cookie;
-    // AppPassword pulls the current access JWT out of the token session.
-    let initial_bearer = match (auth, token_session) {
-        (crate::auth::AuthMethod::OAuth { session_cookie, .. }, _) => session_cookie.clone(),
-        (crate::auth::AuthMethod::AppPassword { .. }, Some(sess)) => sess
-            .current_bearer()
-            .await
-            .map_err(|e| format!("bearer fetch failed: {e}"))?,
-        (crate::auth::AuthMethod::AppPassword { .. }, None) => {
-            return Err("AppPassword auth without a TokenSession".into());
-        }
-    };
-
-    let build_headers = |bearer: &str| -> std::result::Result<HeaderMap, String> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {bearer}")).map_err(|e| e.to_string())?,
-        );
-        if is_proxy {
-            let proxy_val = crate::mls::atproto_proxy_header_value();
-            if let Ok(hv) = HeaderValue::from_str(&proxy_val) {
-                headers.insert(
-                    reqwest::header::HeaderName::from_static("atproto-proxy"),
-                    hv,
-                );
-            }
-        }
-        Ok(headers)
-    };
-
-    let ticket_body = serde_json::json!({
-        "actorDeviceId": actor_device_id,
-        "eventCursor": event_cursor,
-        "inventorySessionId": inventory_session_id,
-    });
-
-    let resp = http
-        .post(&base_url)
-        .headers(build_headers(&initial_bearer)?)
-        .json(&ticket_body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
-
-    let status = resp.status();
-    let body_bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
-
-    // Retry once after token refresh only if AppPassword + ExpiredToken
-    let body_bytes = if token_session.is_some() && crate::chat::service::is_expired_token_response(status, &body_bytes) {
-        let sess = token_session.expect("checked above");
-        let new_bearer = sess
-            .refresh(db)
-            .await
-            .map_err(|e| format!("refresh failed: {e}"))?;
-        let retry_resp = http
-            .post(&base_url)
-            .headers(build_headers(&new_bearer)?)
-            .json(&ticket_body)
-            .send()
-            .await
-            .map_err(|e| format!("Network error (retry): {e}"))?;
-        let retry_status = retry_resp.status();
-        let retry_bytes = retry_resp
-            .bytes()
-            .await
-            .map_err(|e| format!("Network error (retry): {e}"))?;
-        if !retry_status.is_success() {
-            let body = String::from_utf8_lossy(&retry_bytes);
-            return Err(format!("Ticket request failed: {body}"));
-        }
-        retry_bytes
-    } else {
-        if !status.is_success() {
-            let body = String::from_utf8_lossy(&body_bytes);
-            return Err(format!("Ticket request failed: {body}"));
-        }
-        body_bytes
-    };
-
-    serde_json::from_slice::<SubscriptionTicketResponse>(&body_bytes)
-        .map_err(|e| format!("Parse error: {e}"))
+/// What one socket did before it ended (default: a failed reconnect).
+#[derive(Debug, Default)]
+struct ConnectionOutcome {
+    decoded_event: bool,
+    lasted: std::time::Duration,
+    error: Option<String>,
 }
-/// Convert a decoded `SubscribeEventsMessage` into a `WsEvent`, decrypting
-/// message ciphertext where applicable.
-///
-/// `own_commits` is checked for commit messages to prevent duplicate processing
-/// of our own commits received back via WebSocket (spec section 5.4).
-async fn convert_event(
-    event: SubscribeEventsMessage,
-    _mls: &Arc<crate::mls::MlsManager>,
-    _own_commits: &Arc<Mutex<HashMap<[u8; 32], Instant>>>,
-) -> WsEvent {
+
+/// Exponential reconnect delay. Connecting alone proves nothing (a server can
+/// accept and immediately error), so only a decoded event or a long-lived
+/// connection resets it.
+#[derive(Debug, Default)]
+struct ReconnectBackoff {
+    attempt: u32,
+}
+
+impl ReconnectBackoff {
+    fn next_delay(&mut self, outcome: &ConnectionOutcome) -> std::time::Duration {
+        if outcome.decoded_event || outcome.lasted >= HEALTHY_CONNECTION {
+            self.attempt = 0;
+        }
+        self.attempt = self.attempt.saturating_add(1);
+        let delay =
+            std::time::Duration::from_secs(2u64.saturating_pow(self.attempt).min(MAX_BACKOFF_SECS));
+        let permanent = outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| PERMANENT_STREAM_ERRORS.contains(&error));
+        if permanent {
+            delay.max(PERMANENT_ERROR_BACKOFF)
+        } else {
+            delay
+        }
+    }
+}
+
+/// At most one decode warning per interval, reporting how many were dropped.
+#[derive(Debug, Default)]
+struct DecodeWarnLimiter {
+    quiet_until: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+impl DecodeWarnLimiter {
+    fn admit(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self.quiet_until.is_some_and(|until| now < until) {
+            self.suppressed += 1;
+            return None;
+        }
+        self.quiet_until = Some(now + DECODE_WARN_INTERVAL);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+/// Why a binary frame produced no event. Carries wire names and fixed
+/// reasons only, never payload bytes.
+#[derive(Debug, PartialEq, Eq)]
+enum FrameFailure {
+    /// `op: -1`; the server ends the stream after this frame.
+    ErrorFrame { error: String },
+    Undecodable {
+        frame_type: String,
+        reason: &'static str,
+    },
+}
+
+fn wire_name(value: &str) -> String {
+    value.chars().take(MAX_WIRE_NAME_CHARS).collect()
+}
+
+fn undecodable(frame_type: &str, reason: &'static str) -> FrameFailure {
+    FrameFailure::Undecodable {
+        frame_type: wire_name(frame_type),
+        reason,
+    }
+}
+
+/// Convert a decoded `SubscriptionMessage` into a `WsEvent`.
+fn convert_event(event: SubscriptionMessage) -> WsEvent {
     match event {
-        SubscribeEventsMessage::EventEnvelope(env) => match env.payload {
-            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::MessageAvailableEvent(msg_evt) => {
+        SubscriptionMessage::EventEnvelope(env) => match env.payload {
+            ProtocolEventPayload::MessageAvailableEvent(msg_evt) => {
                 let convo_id = msg_evt.conversation_id.to_string();
                 let seq = msg_evt.seq as u64;
                 WsEvent::EpochAdvanced {
@@ -501,29 +454,27 @@ async fn convert_event(
                     new_epoch: seq,
                 }
             }
-            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::ConversationChangedEvent(evt) => {
+            ProtocolEventPayload::ConversationChangedEvent(evt) => {
                 let convo_id = evt.conversation_id.to_string();
                 WsEvent::EpochAdvanced {
                     convo_id,
                     new_epoch: 0,
                 }
             }
-            catbird_atproto::blue_catbird::chat::ProtocolEventPayload::ResetRequestedEvent(evt) => {
-                WsEvent::ResetRequested {
-                    convo_id: evt.conversation_id.to_string(),
-                    crypto_session_id: String::new(),
-                    generation: 0,
-                    trigger: "reset_requested".to_string(),
-                    request_event_id: evt.reset_request_id.to_string(),
-                    expected_new_mls_group_id: None,
-                }
-            }
+            ProtocolEventPayload::ResetRequestedEvent(evt) => WsEvent::ResetRequested {
+                convo_id: evt.conversation_id.to_string(),
+                crypto_session_id: String::new(),
+                generation: 0,
+                trigger: "reset_requested".to_string(),
+                request_event_id: evt.reset_request_id.to_string(),
+                expected_new_mls_group_id: None,
+            },
             _ => WsEvent::EpochAdvanced {
                 convo_id: String::new(),
                 new_epoch: 0,
             },
         },
-        SubscribeEventsMessage::TypingEvent(evt) => WsEvent::Typing {
+        SubscriptionMessage::TypingEvent(evt) => WsEvent::Typing {
             convo_id: evt.conversation_id.to_string(),
             sender_did: evt.actor_did.to_string(),
             is_typing: evt.is_typing,
@@ -532,19 +483,63 @@ async fn convert_event(
 }
 
 /// Attempt to decode a raw framed binary message for event types not yet in the
-/// generated `SubscribeEventsMessage` enum. Returns `Some(WsEvent)` on success.
-fn try_decode_unknown_event(data: &[u8]) -> Option<WsEvent> {
-    let (header, body) = jacquard_common::xrpc::subscription::parse_event_header(data).ok()?;
+/// generated `SubscriptionMessage` enum. Returns `Some(WsEvent)` on success.
+fn decode_event(data: &[u8]) -> std::result::Result<Option<WsEvent>, FrameFailure> {
+    let (message_type, payload) = match petrel_core::decode_frame(data) {
+        Ok(SubscriptionFrame::Message {
+            message_type,
+            payload,
+            ..
+        }) => (message_type, payload),
+        Ok(SubscriptionFrame::Error { error, .. }) => {
+            return Err(FrameFailure::ErrorFrame {
+                error: wire_name(&error),
+            })
+        }
+        Ok(SubscriptionFrame::UnknownOperation { .. }) => return Ok(None),
+        Err(_) => {
+            // Earlier servers also sent a CBOR header followed by a JSON body.
+            // Retain that format without relaxing the operation or frame limit.
+            if data.len() > petrel_core::MAXIMUM_FRAME_BYTES {
+                return Err(undecodable("unknown", "oversized frame"));
+            }
+            let Ok((Value::Object(header), body)) = petrel_core::dagcbor::decode_prefix_with(
+                data,
+                petrel_core::dagcbor::Limits::STANDARD,
+            ) else {
+                return Err(undecodable("unknown", "frame header"));
+            };
+            if header.get("op") != Some(&Value::Integer(1)) {
+                return Ok(None);
+            }
+            let Some(t) = header.get("t").and_then(Value::as_str) else {
+                return Err(undecodable("unknown", "missing frame type"));
+            };
+            let Ok(Value::Object(mut payload)) = Value::from_json_data_model(body) else {
+                return Err(undecodable(t, "legacy JSON body"));
+            };
+            payload.insert("$type".into(), Value::String(t.to_owned()));
+            (t.to_owned(), Value::Object(payload))
+        }
+    };
+    match message_type.as_str() {
+        "#groupResetEvent" | "#resetRequestedEvent" => decode_legacy_event(&message_type, &payload)
+            .map(Some)
+            .ok_or_else(|| undecodable(&message_type, "legacy event body")),
+        _ => SubscriptionMessage::from_value(payload)
+            .map(|event| Some(convert_event(event)))
+            .map_err(|_| undecodable(&message_type, "event body")),
+    }
+}
 
-    match header.t.as_str() {
+fn decode_legacy_event(message_type: &str, payload: &Value) -> Option<WsEvent> {
+    let body = serde_json::to_value(payload).ok()?;
+    match message_type {
         "#groupResetEvent" => {
-            let raw: RawGroupResetEvent = serde_ipld_dagcbor::from_slice(body).ok()?;
+            let raw: RawGroupResetEvent = serde_json::from_value(body).ok()?;
             info!(
                 "WS GroupResetEvent: convo={} new_group={} gen={} by={}",
-                &raw.convo_id[..12.min(raw.convo_id.len())],
-                &raw.new_group_id[..12.min(raw.new_group_id.len())],
-                raw.reset_generation,
-                &raw.reset_by[..20.min(raw.reset_by.len())]
+                raw.convo_id, raw.new_group_id, raw.reset_generation, raw.reset_by
             );
             Some(WsEvent::GroupReset {
                 convo_id: raw.convo_id,
@@ -556,15 +551,15 @@ fn try_decode_unknown_event(data: &[u8]) -> Option<WsEvent> {
             })
         }
         "#resetRequestedEvent" => {
-            let raw: RawResetRequestedEvent = serde_ipld_dagcbor::from_slice(body).ok()?;
+            let raw: RawResetRequestedEvent = serde_json::from_value(body).ok()?;
             info!(
                 phase_2_5_path = "request_only",
                 "WS ResetRequestedEvent: convo={} crypto_session={} gen={} trigger={} request_event_id={} expected_new_group={}",
-                &raw.convo_id[..12.min(raw.convo_id.len())],
-                &raw.crypto_session_id[..12.min(raw.crypto_session_id.len())],
+                raw.convo_id,
+                raw.crypto_session_id,
                 raw.generation,
                 raw.trigger,
-                &raw.request_event_id[..16.min(raw.request_event_id.len())],
+                raw.request_event_id,
                 raw.expected_new_mls_group_id
                     .as_deref()
                     .unwrap_or("<none>")
@@ -584,16 +579,14 @@ fn try_decode_unknown_event(data: &[u8]) -> Option<WsEvent> {
 
 #[cfg(test)]
 mod tests {
-    //! Wire-level decode tests for the manual `try_decode_unknown_event`
-    //! parser. The framed format is the AT Protocol subscription frame
-    //! `cbor(EventHeader { op, t }) ++ cbor(body)` per
-    //! `jacquard_common::xrpc::subscription::parse_event_header`.
-
+    //! Wire fixtures independently encode the header and payload like the server.
     use super::*;
     use serde::Serialize;
 
-    /// Mirror of `jacquard_common::xrpc::subscription::EventHeader` for
-    /// encoding test fixtures. The real type is `Deserialize`-only.
+    fn try_decode_unknown_event(data: &[u8]) -> Option<WsEvent> {
+        decode_event(data).ok().flatten()
+    }
+
     #[derive(Serialize)]
     struct TestEventHeader<'a> {
         op: i64,
@@ -612,6 +605,292 @@ mod tests {
             .into_iter()
             .for_each(|b| buf.push(b));
         buf
+    }
+
+    #[test]
+    fn canonical_typing_header_supplies_the_body_discriminator() {
+        let event = frame(
+            "blue.catbird.chat.defs#typingEvent",
+            &serde_json::json!({
+                "typingId":"typing", "conversationId": "room", "actorDid": "did:plc:z72i7hdynmk6r22z27h6tvur", "actorDeviceId":"device", "isTyping": true, "expiresAt":"2026-11-27T15:00:00Z",
+            }),
+        );
+        assert!(
+            matches!(decode_event(&event), Ok(Some(WsEvent::Typing { convo_id, is_typing: true, .. })) if convo_id == "room")
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_fetches_another_ticket_and_decodes_the_next_socket() {
+        use crate::auth::AuthMethod;
+        use crate::storage::{aliases::AliasStore, config::Config, db::Database};
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::net::TcpListener;
+
+        let ds = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ds_url = format!("http://{}", ds.local_addr().unwrap());
+        let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", ws.local_addr().unwrap());
+        let tickets = Arc::new(AtomicUsize::new(0));
+        let issued = tickets.clone();
+        let ds_app = Router::new().route(
+            "/xrpc/blue.catbird.chat.getSubscriptionTicket",
+            post(move |headers: HeaderMap| {
+                let n = issued.fetch_add(1, Ordering::SeqCst) + 1;
+                let endpoint = endpoint.clone();
+                async move {
+                    assert_eq!(
+                        headers["authorization"].to_str().unwrap(),
+                        "Bearer test-only"
+                    );
+                    Json(serde_json::json!({"ticket":format!("ticket-{n}"), "endpoint":endpoint}))
+                }
+            }),
+        );
+        let ds_server = tokio::spawn(async move { axum::serve(ds, ds_app).await.unwrap() });
+        let sockets = tokio::spawn(async move {
+            for n in 1..=2 {
+                let (tcp, _) = ws.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let bytes = frame(
+                    "blue.catbird.chat.defs#typingEvent",
+                    &serde_json::json!({
+                        "typingId": "typing", "conversationId": format!("room-{n}"),
+                        "actorDid":"did:plc:z72i7hdynmk6r22z27h6tvur", "actorDeviceId":"device",
+                        "isTyping":true, "expiresAt":"2026-11-27T15:00:00Z"
+                    }),
+                );
+                socket
+                    .send(tungstenite::Message::Binary(bytes.into()))
+                    .await
+                    .unwrap();
+                socket.close(None).await.unwrap();
+            }
+        });
+        let did = "did:plc:wsreconnecttest";
+        std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("chat.db"), "local-test-only")
+            .await
+            .unwrap();
+        db.store_session_value("mls_device_id", "device")
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.server.mls_url = ds_url.clone();
+        let service = ChatService::new(
+            AuthMethod::OAuth {
+                did: did.into(),
+                session_cookie: "test-only".into(),
+                nest_url: ds_url,
+            },
+            None,
+            Arc::new(crate::mls::MlsManager::new(&dir.path().to_path_buf(), did).unwrap()),
+            Arc::new(db),
+            config,
+            Arc::new(tokio::sync::RwLock::new(AliasStore::default())),
+        );
+        let mut events = service.subscribe().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(12), async {
+            assert!(matches!(events.recv().await, Some(WsEvent::Typing { convo_id, .. }) if convo_id == "room-1"));
+            assert!(matches!(events.recv().await, Some(WsEvent::Reconnecting)));
+            assert!(matches!(events.recv().await, Some(WsEvent::Typing { convo_id, .. }) if convo_id == "room-2"));
+        }).await.unwrap();
+        assert_eq!(tickets.load(Ordering::SeqCst), 2);
+        drop(events);
+        sockets.await.unwrap();
+        ds_server.abort();
+    }
+
+    fn error_frame(error: &str) -> Vec<u8> {
+        #[derive(Serialize)]
+        struct ErrorHeader {
+            op: i64,
+        }
+        let mut buf = serde_ipld_dagcbor::ser::to_vec(&ErrorHeader { op: -1 }).unwrap();
+        buf.extend(
+            serde_ipld_dagcbor::ser::to_vec(&serde_json::json!({ "error": error })).unwrap(),
+        );
+        buf
+    }
+
+    async fn subscribing_service(dir: &std::path::Path, ds_url: String) -> ChatService {
+        use crate::auth::AuthMethod;
+        use crate::storage::{aliases::AliasStore, config::Config, db::Database};
+        let did = "did:plc:wsreconnecttest";
+        std::env::set_var("CATMOS_TEST_KEYCHAIN_FALLBACK", "1");
+        let db = Database::open(&dir.join("chat.db"), "local-test-only")
+            .await
+            .unwrap();
+        db.store_session_value("mls_device_id", "device")
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.server.mls_url = ds_url.clone();
+        ChatService::new(
+            AuthMethod::OAuth {
+                did: did.into(),
+                session_cookie: "test-only".into(),
+                nest_url: ds_url,
+            },
+            None,
+            std::sync::Arc::new(crate::mls::MlsManager::new(&dir.to_path_buf(), did).unwrap()),
+            std::sync::Arc::new(db),
+            config,
+            std::sync::Arc::new(tokio::sync::RwLock::new(AliasStore::default())),
+        )
+    }
+
+    #[test]
+    fn backoff_resets_only_after_a_decoded_event_or_a_healthy_connection() {
+        use std::time::Duration;
+        let mut backoff = ReconnectBackoff::default();
+        let errored = ConnectionOutcome {
+            error: Some("ConsumerTooSlow".into()),
+            ..Default::default()
+        };
+        let delays: Vec<u64> = (0..5)
+            .map(|_| backoff.next_delay(&errored).as_secs())
+            .collect();
+        assert_eq!(delays, [2, 4, 8, 16, 30]);
+        let decoded = ConnectionOutcome {
+            decoded_event: true,
+            ..Default::default()
+        };
+        assert_eq!(backoff.next_delay(&decoded), Duration::from_secs(2));
+        assert_eq!(
+            backoff.next_delay(&ConnectionOutcome::default()),
+            Duration::from_secs(4)
+        );
+        let idle_but_healthy = ConnectionOutcome {
+            lasted: HEALTHY_CONNECTION,
+            ..Default::default()
+        };
+        assert_eq!(
+            backoff.next_delay(&idle_but_healthy),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn permanent_error_frames_wait_long_even_after_a_decoded_event() {
+        let mut backoff = ReconnectBackoff::default();
+        for error in ["FutureCursor", "AuthRequired"] {
+            let outcome = ConnectionOutcome {
+                decoded_event: true,
+                error: Some(error.into()),
+                ..Default::default()
+            };
+            assert_eq!(backoff.next_delay(&outcome), PERMANENT_ERROR_BACKOFF);
+        }
+    }
+
+    #[test]
+    fn error_frames_report_their_wire_name() {
+        assert!(matches!(
+            decode_event(&error_frame("FutureCursor")),
+            Err(FrameFailure::ErrorFrame { error }) if error == "FutureCursor"
+        ));
+    }
+
+    #[test]
+    fn undecodable_event_body_is_reported_with_frame_type_not_payload() {
+        let event = frame(
+            "blue.catbird.chat.defs#typingEvent",
+            &serde_json::json!({"conversationId": "SECRET-PAYLOAD-MARKER"}),
+        );
+        let Err(failure) = decode_event(&event) else {
+            panic!("undecodable body was silently dropped");
+        };
+        assert_eq!(
+            failure,
+            FrameFailure::Undecodable {
+                frame_type: "blue.catbird.chat.defs#typingEvent".into(),
+                reason: "event body",
+            }
+        );
+        assert!(!format!("{failure:?}").contains("SECRET-PAYLOAD-MARKER"));
+        assert!(matches!(
+            decode_event(b"not cbor"),
+            Err(FrameFailure::Undecodable {
+                reason: "frame header",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_warnings_are_rate_limited_and_count_suppressed() {
+        let start = std::time::Instant::now();
+        let mut limiter = DecodeWarnLimiter::default();
+        assert_eq!(limiter.admit(start), Some(0));
+        assert_eq!(
+            limiter.admit(start + std::time::Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            limiter.admit(start + std::time::Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(limiter.admit(start + DECODE_WARN_INTERVAL), Some(2));
+    }
+
+    /// A server that accepts every socket and immediately sends an error frame
+    /// must not be re-dialled (and re-ticketed) every two seconds forever.
+    #[tokio::test]
+    async fn error_frame_after_connect_keeps_backing_off() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::net::TcpListener;
+
+        let ds = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ds_url = format!("http://{}", ds.local_addr().unwrap());
+        let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", ws.local_addr().unwrap());
+        let tickets = Arc::new(AtomicUsize::new(0));
+        let issued = tickets.clone();
+        let ds_app = Router::new().route(
+            "/xrpc/blue.catbird.chat.getSubscriptionTicket",
+            post(move || {
+                let n = issued.fetch_add(1, Ordering::SeqCst) + 1;
+                let endpoint = endpoint.clone();
+                async move {
+                    Json(serde_json::json!({"ticket":format!("ticket-{n}"), "endpoint":endpoint}))
+                }
+            }),
+        );
+        let ds_server = tokio::spawn(async move { axum::serve(ds, ds_app).await.unwrap() });
+        let sockets = tokio::spawn(async move {
+            loop {
+                let (tcp, _) = ws.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let _ = socket
+                    .send(tungstenite::Message::Binary(error_frame("ConsumerTooSlow")))
+                    .await;
+                let _ = socket.close(None).await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let service = subscribing_service(dir.path(), ds_url).await;
+        let events = service.subscribe().await.unwrap();
+        // Delays must grow 2 s, 4 s, ...: a third ticket by 5 s means the
+        // counter was reset by the connect that only delivered an error.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert_eq!(
+            tickets.load(Ordering::SeqCst),
+            2,
+            "reconnect backoff was reset by an errored connection"
+        );
+        drop(events);
+        sockets.abort();
+        ds_server.abort();
     }
 
     /// Lexicon-shaped payload (camelCase keys), matching what the server

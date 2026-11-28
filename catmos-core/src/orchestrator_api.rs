@@ -22,6 +22,36 @@ pub struct CliApiClient {
     service: Arc<ChatService>,
 }
 
+/// Older delivery services omit the signed body's union tag while emitting
+/// lexicon JSON bytes. Unwrap only the MLS artifact selected by the entry kind.
+fn decode_history_entry(mut entry: serde_json::Value, conversation: &str) -> Result<Option<IncomingEnvelope>> {
+    use catbird_mls::chat_v2::wire::{
+        APPLICATION_ENTRY_KIND, COMMIT_ENTRY_KIND, LEAF_RECOVERY_FULFILLMENT_ENTRY_KIND,
+        LEAVE_COMMIT_FULFILLMENT_ENTRY_KIND,
+    };
+    let artifact = match entry["$type"].as_str() {
+        Some(APPLICATION_ENTRY_KIND) => Some("applicationMessage"),
+        Some(COMMIT_ENTRY_KIND | LEAF_RECOVERY_FULFILLMENT_ENTRY_KIND | LEAVE_COMMIT_FULFILLMENT_ENTRY_KIND) => Some("commit"),
+        _ => None,
+    };
+    let legacy_bytes = artifact
+        .and_then(|field| entry.pointer_mut("/signedRequest/body")
+            .filter(|body| body.get("$type").is_none())
+            .and_then(|body| body.get_mut(field)))
+        .and_then(|artifact| artifact.get_mut("bytes"));
+    if let Some(bytes) = legacy_bytes {
+        if let serde_json::Value::Object(map) = bytes {
+            let Some(serde_json::Value::String(encoded)) = map.remove("$bytes").filter(|_| map.is_empty()) else {
+                return Err(OrchestratorError::InvalidInput("invalid legacy MLS bytes object".into()));
+            };
+            catbird_mls::chat_v2::transcript::decode_standard_base64(&encoded)
+                .map_err(|_| OrchestratorError::InvalidInput("invalid legacy MLS byte encoding".into()))?;
+            *bytes = serde_json::Value::String(encoded);
+        }
+    }
+    IncomingEnvelope::from_canonical_entry(&entry, conversation)
+}
+
 fn prepared_http_request(
     http: &reqwest::Client,
     method: reqwest::Method,
@@ -174,7 +204,7 @@ impl MLSAPIClient for CliApiClient {
         let after_seq_str = cursor.unwrap_or("0");
         let limit_str = (limit.clamp(1, 100)).to_string();
 
-        let resp: serde_json::Value = self
+        let mut resp: serde_json::Value = self
             .service
             .xrpc_query(
                 "blue.catbird.chat.getEntries",
@@ -191,9 +221,9 @@ impl MLSAPIClient for CliApiClient {
         let mut envelopes = Vec::new();
         let mut next_cursor = None;
 
-        if let Some(items) = resp.get("entries").and_then(|v| v.as_array()) {
-            for item in items {
-                if let Some(envelope) = IncomingEnvelope::from_canonical_entry(item, &convo_uuid)? {
+        if let Some(items) = resp.get_mut("entries").and_then(|v| v.as_array_mut()) {
+            for item in items.drain(..) {
+                if let Some(envelope) = decode_history_entry(item, &convo_uuid)? {
                     envelopes.push(envelope);
                 }
             }
@@ -549,6 +579,9 @@ mod welcome_inventory_tests {
         let entry = |kind: &str, seq: u64, field: &str, bytes: &[u8]| {
             let epoch = if seq < 4 { 2 } else { 3 };
             let mut body = serde_json::json!({"actorDid": "did:plc:alice", "prior": {"conversationId": conversation, "epoch": if field == "commit" { epoch-1 } else { epoch }}, "next": {"conversationId": conversation, "epoch": epoch}});
+            if seq == 5 {
+                body["$type"] = serde_json::json!("blue.catbird.chat.defs#applicationSendBody");
+            }
             body[field] = serde_json::json!({"bytes": {"$bytes": BASE64.encode(bytes)}});
             serde_json::json!({
                 "$type": kind, "conversationId": conversation,
@@ -556,6 +589,9 @@ mod welcome_inventory_tests {
                 "signedRequest": {"body": body}, "receivedAt": "2026-09-05T00:00:00.000Z",
             })
         };
+        let mut malformed = entry(APPLICATION_ENTRY_KIND, 3, "applicationMessage", &after_add.ciphertext);
+        malformed["signedRequest"]["body"]["applicationMessage"]["bytes"]["extra"] = serde_json::json!(true);
+        assert!(decode_history_entry(malformed, conversation).is_err());
         let response = serde_json::json!({"entries": [
             entry(LEAF_RECOVERY_FULFILLMENT_ENTRY_KIND, 2, "commit", &add.commit_data),
             entry(APPLICATION_ENTRY_KIND, 3, "applicationMessage", &after_add.ciphertext),

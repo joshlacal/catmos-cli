@@ -1,28 +1,46 @@
-//! Jacquard-backed credential session for app-password auth.
-//!
-//! Wraps `MemoryCredentialSession` so that we own the in-memory session store
-//! and can read refreshed tokens back out to persist them in the local DB.
-//! All catmos-cli code goes through this for app-password bearer tokens.
+//! App-password sessions use Petrel for identity discovery and token rotation.
+//! SQLCipher retains the existing session keys so users can reopen old profiles.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use jacquard::client::credential_session::{CredentialSession, SessionKey};
-use jacquard::client::AtpSession;
-use jacquard_common::deps::fluent_uri::Uri;
-use jacquard_common::session::{MemorySessionStore, SessionStore};
-use jacquard_common::types::string::{Did, Handle};
-use jacquard_common::{AuthorizationToken, SmolStr};
-use super::renewal::{ObservedResolver, RefreshDiagnostics};
+use petrel::{
+    account::AccountManager,
+    auth::LegacyPasswordStrategy,
+    identity::{HickoryResolver, IdentityOptions, IdentityResolver},
+    net::{ReqwestTransport, SharedTransport},
+    oauth::{OAuthIdentityAdapter, OAuthIdentityResolver},
+    storage::{MemorySecretStore, SessionStore},
+};
+use petrel_api::generated::com::atproto::server::create_session;
+use petrel_core::{Did, Handle};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::RwLock;
+use url::Url;
 
 use crate::error::{AuthRenewalFailure, CatmosError, Result};
 use crate::storage::db::Database;
 
-/// Session label inside the jacquard store. A single session per catmos account.
-const SESSION_ID: &str = "catmos";
-type ObservedCredentialSession = CredentialSession<MemorySessionStore<SessionKey, AtpSession>, ObservedResolver>;
+type SessionSnapshot = std::collections::HashMap<String, String>;
+
+/// Storage attempts made inside one renewal before serving rotated tokens
+/// from memory and retrying on the next use.
+const PERSIST_ATTEMPTS: u32 = 3;
+const PERSIST_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+enum PersistOutcome {
+    Stored,
+    /// Another writer replaced the durable session since the baseline read.
+    Superseded,
+    Failed,
+}
+
 pub(crate) const APP_PASSWORD_SESSION_KEYS: &[&str] = &[
-    "auth_method", "handle", "did", "access_jwt", "refresh_jwt", "pds_url",
+    "auth_method",
+    "handle",
+    "did",
+    "access_jwt",
+    "refresh_jwt",
+    "pds_url",
 ];
 
 /// A live app-password session that handles token refresh automatically.
@@ -31,18 +49,24 @@ pub(crate) const APP_PASSWORD_SESSION_KEYS: &[&str] = &[
 /// background tasks that make XRPC calls.
 #[derive(Clone)]
 pub struct TokenSession {
-    session: Arc<ObservedCredentialSession>,
-    refresh_diagnostics: RefreshDiagnostics,
-    store: Arc<MemorySessionStore<SessionKey, AtpSession>>,
+    transport: SharedTransport,
+    credentials: Arc<RwLock<create_session::Output>>,
     did: Did,
     handle: String,
     pds_url: String,
-    refresh_persist_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes refresh and persistence. Holds the durable snapshot that
+    /// in-memory credentials were rotated from while they remain unsaved: the
+    /// PDS has consumed that snapshot's refresh token, so memory is
+    /// authoritative until a save succeeds or another writer supersedes it.
+    refresh_persist_lock: Arc<tokio::sync::Mutex<Option<SessionSnapshot>>>,
     invalidated: Arc<AtomicBool>,
+    /// Test-only count of storage attempts to fail before touching SQLite.
+    #[cfg(test)]
+    pub(crate) persist_faults: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Cancellation drops futures without visiting their error branches. Once a
-/// refresh can mutate SDK memory, keep every clone unusable unless this call
+/// refresh can mutate session memory, keep every clone unusable unless this call
 /// observes durable commit or restores a validated durable snapshot.
 struct RefreshCancellationGuard {
     invalidated: Arc<AtomicBool>,
@@ -51,7 +75,10 @@ struct RefreshCancellationGuard {
 
 impl RefreshCancellationGuard {
     fn new(invalidated: Arc<AtomicBool>) -> Self {
-        Self { invalidated, armed: true }
+        Self {
+            invalidated,
+            armed: true,
+        }
     }
 
     fn disarm(&mut self) {
@@ -80,50 +107,65 @@ impl TokenSession {
         &self.pds_url
     }
 
-    /// Start a fresh session via `com.atproto.server.createSession`.
-    pub async fn login(handle: &str, app_password: &str) -> Result<Self> {
-        let store: Arc<MemorySessionStore<SessionKey, AtpSession>> =
-            Arc::new(MemorySessionStore::default());
-        let refresh_diagnostics = RefreshDiagnostics::default();
-        let resolver = Arc::new(ObservedResolver::new(refresh_diagnostics.clone()));
-        let session: ObservedCredentialSession = CredentialSession::new(store.clone(), resolver);
-
-        let atp = session
-            .login(
-                handle,
-                app_password,
-                Some(SESSION_ID),
-                None,
-                None,
-                None,
-            )
-            .await
-            .map_err(|e| CatmosError::AuthFailed(format!("login failed: {e}")))?;
-
-        let key = session
-            .session_info()
-            .await
-            .ok_or_else(|| CatmosError::AuthFailed("no session after login".into()))?;
-        let did = key.did.clone();
-        let pds_url = session.endpoint().await.as_str().trim_end_matches('/').to_string();
-
-        Ok(Self {
-            session: Arc::new(session),
-            refresh_diagnostics,
-            store,
-            did,
-            handle: atp.handle.to_string(),
-            pds_url,
-            refresh_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
-            invalidated: Arc::new(AtomicBool::new(false)),
-        })
+    fn network() -> Result<(SharedTransport, Arc<dyn OAuthIdentityResolver>)> {
+        let dns = HickoryResolver::system()
+            .map_err(|_| CatmosError::AuthFailed("cannot initialize DNS resolver".into()))?;
+        let transport: SharedTransport =
+            Arc::new(ReqwestTransport::with_dns(dns.clone()).map_err(|_| {
+                CatmosError::AuthFailed("cannot initialize Petrel transport".into())
+            })?);
+        let identity = IdentityResolver::new(transport.clone(), dns, IdentityOptions::default());
+        Ok((transport, Arc::new(OAuthIdentityAdapter::new(identity))))
     }
 
-    /// Rebuild a session from tokens that were previously persisted.
-    ///
-    /// No network calls — seeds the in-memory store with the stored
-    /// `AtpSession` and activates it. The next XRPC call will use the stored
-    /// access token; if it has expired, `refresh` will swap it for a new one.
+    pub async fn login(handle: &str, app_password: &str) -> Result<Self> {
+        let (transport, identity) = Self::network()?;
+        Self::login_with_network(handle, app_password, transport, identity).await
+    }
+
+    async fn login_with_network(
+        handle: &str,
+        app_password: &str,
+        transport: SharedTransport,
+        identity: Arc<dyn OAuthIdentityResolver>,
+    ) -> Result<Self> {
+        let store = SessionStore::new(Arc::new(MemorySecretStore::new()), "catmos")
+            .map_err(|_| CatmosError::AuthFailed("cannot initialize session store".into()))?;
+        let strategy = Arc::new(
+            LegacyPasswordStrategy::new(
+                Arc::new(AccountManager::new(store)),
+                transport.clone(),
+                identity,
+                Url::parse("https://bsky.social").expect("valid default PDS origin"),
+            )
+            .with_loopback_development(cfg!(test)),
+        );
+        let login = strategy
+            .login_with_password(handle, app_password, None)
+            .await
+            .map_err(|_| CatmosError::AuthFailed("app-password sign-in failed".into()))?;
+        let handle = login
+            .handle
+            .ok_or_else(|| CatmosError::AuthFailed("missing account handle".into()))?;
+        let tokens = strategy
+            .get_session(&login.did)
+            .await
+            .map_err(|_| CatmosError::AuthFailed("cannot read Petrel session".into()))?
+            .ok_or_else(|| CatmosError::AuthFailed("app-password session is missing".into()))?;
+        let credentials = create_session::Output::new(
+            tokens.access_jwt().to_owned(),
+            tokens.refresh_jwt().to_owned(),
+            handle,
+            login.did,
+        );
+        Ok(Self::from_credentials(
+            transport,
+            credentials,
+            login.pds_url.origin().ascii_serialization(),
+        ))
+    }
+
+    /// Reopen an existing database session without resolving or contacting its PDS.
     pub async fn restore(
         handle: String,
         did_str: String,
@@ -131,128 +173,187 @@ impl TokenSession {
         refresh_jwt: String,
         pds_url: String,
     ) -> Result<Self> {
-        let did = Did::new_owned(&did_str).map_err(|e| {
-            CatmosError::AuthFailed(format!("invalid did in stored session: {e:?}"))
-        })?;
-        let handle_parsed = Handle::new_owned(&handle).map_err(|e| {
-            CatmosError::AuthFailed(format!("invalid handle in stored session: {e:?}"))
-        })?;
-
-        let pds_uri = Uri::parse(pds_url.clone()).ok();
-        let atp = AtpSession {
-            access_jwt: SmolStr::from(access_jwt),
-            refresh_jwt: SmolStr::from(refresh_jwt),
-            did: did.clone(),
-            handle: handle_parsed,
-            pds: pds_uri,
-        };
-
-        let store: Arc<MemorySessionStore<SessionKey, AtpSession>> =
-            Arc::new(MemorySessionStore::default());
-        let key = SessionKey::new(did.clone(), SESSION_ID);
-        store
-            .set(key.clone(), atp)
-            .await
-            .map_err(|e| CatmosError::AuthFailed(format!("store set failed: {e}")))?;
-
-        let refresh_diagnostics = RefreshDiagnostics::default();
-        let resolver = Arc::new(ObservedResolver::new(refresh_diagnostics.clone()));
-        let session: ObservedCredentialSession = CredentialSession::new(store.clone(), resolver);
-
-        session
-            .restore(did.clone(), SESSION_ID)
-            .await
-            .map_err(|e| CatmosError::AuthFailed(format!("restore failed: {e}")))?;
-
-        // `restore` may resolve the PDS via DID doc; override with the cached
-        // value to save a round-trip when we already know it.
-        if let Ok(uri) = Uri::parse(pds_url.clone()) {
-            session.set_endpoint(uri).await;
+        let did = Did::parse(&did_str)
+            .map_err(|_| CatmosError::AuthFailed("invalid saved DID".into()))?;
+        let handle = Handle::parse(&handle)
+            .map_err(|_| CatmosError::AuthFailed("invalid saved handle".into()))?;
+        let origin = Url::parse(&pds_url)
+            .map_err(|_| CatmosError::AuthFailed("invalid saved PDS".into()))?;
+        petrel::net::policy::validate_url_with_development(&origin, cfg!(test))
+            .map_err(|_| CatmosError::AuthFailed("invalid saved PDS".into()))?;
+        if !matches!(origin.scheme(), "http" | "https")
+            || origin.path() != "/"
+            || origin.query().is_some()
+            || access_jwt.is_empty()
+            || refresh_jwt.is_empty()
+        {
+            return Err(CatmosError::AuthFailed("invalid saved credentials".into()));
         }
+        let (transport, _) = Self::network()?;
+        let credentials = create_session::Output::new(access_jwt, refresh_jwt, handle, did);
+        Ok(Self::from_credentials(transport, credentials, pds_url))
+    }
 
-        Ok(Self {
-            session: Arc::new(session),
-            refresh_diagnostics,
-            store,
-            did,
-            handle,
+    fn from_credentials(
+        transport: SharedTransport,
+        credentials: create_session::Output,
+        pds_url: String,
+    ) -> Self {
+        Self {
+            transport,
+            did: credentials.did.clone(),
+            handle: credentials.handle.to_string(),
+            credentials: Arc::new(RwLock::new(credentials)),
             pds_url,
-            refresh_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
+            refresh_persist_lock: Arc::new(tokio::sync::Mutex::new(None)),
             invalidated: Arc::new(AtomicBool::new(false)),
-        })
+            #[cfg(test)]
+            persist_faults: Default::default(),
+        }
     }
 
     /// Return the current access token as a raw bearer string.
     pub async fn current_bearer(&self) -> Result<String> {
         let _guard = self.refresh_persist_lock.lock().await;
         self.require_valid_session()?;
-        let token = self
-            .session
-            .access_token()
-            .await
-            .ok_or_else(|| CatmosError::AuthFailed("no access token in session".into()))?;
-        Ok(bearer_string(token))
+        Ok(self.credentials.read().await.access_jwt.clone())
+    }
+
+    /// Return the current access token after one attempt to save rotated
+    /// tokens that an earlier renewal could not persist.
+    pub async fn current_bearer_persisting(&self, db: &Database) -> Result<String> {
+        let mut pending = self.refresh_persist_lock.lock().await;
+        self.require_valid_session()?;
+        if pending.is_some() {
+            // A superseding writer's pair is adopted (or the session is
+            // invalidated) inside; either way memory now reflects that.
+            let _ = self.persist_rotation(db, &mut pending, 1).await;
+            self.require_valid_session()?;
+        }
+        Ok(self.credentials.read().await.access_jwt.clone())
     }
 
     /// Force a `com.atproto.server.refreshSession` call and return the new bearer.
-    /// Persists the refreshed tokens to `db`.
+    /// Persists the refreshed tokens to `db`; if storage keeps failing, the
+    /// rotated tokens are served from memory and saved on a later use.
     pub async fn refresh(&self, db: &Database) -> Result<String> {
-        let _guard = self.refresh_persist_lock.lock().await;
+        let mut pending = self.refresh_persist_lock.lock().await;
         self.require_valid_session()?;
-        let expected = db.get_session_values(APP_PASSWORD_SESSION_KEYS).await
+        let expected = db
+            .get_session_values(APP_PASSWORD_SESSION_KEYS)
+            .await
             .map_err(|_| AuthRenewalFailure::ReadSnapshot)?;
-        if let Err(error) = self.adopt_durable_snapshot(&expected).await {
-            self.invalidated.store(true, Ordering::Release);
-            return Err(error);
+        if pending.as_ref() != Some(&expected) {
+            // Nothing unsaved, or another writer replaced the consumed
+            // snapshot: the durable session is authoritative.
+            *pending = None;
+            if let Err(error) = self.adopt_durable_snapshot(&expected).await {
+                self.invalidated.store(true, Ordering::Release);
+                return Err(error);
+            }
         }
         // Declared after the serialization guard so Drop invalidates memory
         // before another clone can acquire the session lock on cancellation.
         let mut cancellation = RefreshCancellationGuard::new(self.invalidated.clone());
-        self.refresh_diagnostics.reset();
-        let token = match self.session.refresh().await {
-            Ok(token) => token,
+        let refresh = self.credentials.read().await.refresh_jwt.clone();
+        let atp = match super::renewal::refresh(&self.transport, &self.pds_url, &refresh).await {
+            Ok(atp) => atp,
             Err(error) => {
-                if self.restore_current_or_invalidate(db).await.is_ok() {
+                // With unsaved rotated tokens, the durable refresh token is
+                // already consumed; keep memory rather than re-adopt it.
+                if pending.is_some() || self.restore_current_or_invalidate(db).await.is_ok() {
                     cancellation.disarm();
                 }
-                return Err(self.refresh_diagnostics.classify(&error).into());
+                return Err(error.into());
             }
         };
-        let bearer = bearer_string(token);
-        let key = SessionKey::new(self.did.clone(), SESSION_ID);
-        let atp = match self.store.get(&key).await {
-            Some(atp) => atp,
-            None => {
-                self.invalidated.store(true, Ordering::Release);
-                return Err(AuthRenewalFailure::MemoryState.into());
-            }
-        };
+        let bearer = atp.access_jwt.clone();
         if atp.did != self.did {
             self.invalidated.store(true, Ordering::Release);
             return Err(AuthRenewalFailure::IdentityMismatch.into());
         }
-        let saved = db.compare_and_store_session_values(&expected, &[
-            ("auth_method", "app_password"), ("handle", atp.handle.as_str()),
-            ("did", self.did.as_str()), ("access_jwt", atp.access_jwt.as_str()),
-            ("refresh_jwt", atp.refresh_jwt.as_str()), ("pds_url", &self.pds_url),
-        ]).await;
-        match saved {
-            Ok(true) => cancellation.disarm(),
-            Ok(false) => {
-                self.restore_current_or_invalidate(db).await?;
-                cancellation.disarm();
-                return Err(CatmosError::AuthSessionChanged);
-            }
-            Err(_) => {
-                // Do not expose an unpersisted token to other clones after a
-                // storage failure. A later retry may require normal login.
-                if self.restore_current_or_invalidate(db).await.is_ok() {
-                    cancellation.disarm();
-                }
-                return Err(AuthRenewalFailure::PersistSnapshot.into());
-            }
+        *self.credentials.write().await = create_session::Output::new(
+            atp.access_jwt.clone(),
+            atp.refresh_jwt.clone(),
+            atp.handle.clone(),
+            atp.did.clone(),
+        );
+        *pending = Some(expected);
+        let stored = self
+            .persist_rotation(db, &mut pending, PERSIST_ATTEMPTS)
+            .await;
+        // Every outcome leaves memory consistent: saved, superseded and
+        // re-adopted, unsaved but authoritative, or invalidated.
+        cancellation.disarm();
+        if !stored? {
+            tracing::warn!(
+                "renewed session could not be saved; serving it from memory and retrying on next use"
+            );
         }
         Ok(bearer)
+    }
+
+    /// Save the in-memory rotation against its consumed baseline snapshot.
+    /// Returns `Ok(false)` while storage keeps failing (memory stays
+    /// authoritative) and `AuthSessionChanged` after adopting a newer pair
+    /// that another writer stored.
+    async fn persist_rotation(
+        &self,
+        db: &Database,
+        pending: &mut Option<SessionSnapshot>,
+        attempts: u32,
+    ) -> Result<bool> {
+        let Some(expected) = pending.clone() else {
+            return Ok(true);
+        };
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                tokio::time::sleep(PERSIST_RETRY_DELAY * attempt).await;
+            }
+            match self.store_rotated(db, &expected).await {
+                PersistOutcome::Stored => {
+                    *pending = None;
+                    return Ok(true);
+                }
+                PersistOutcome::Superseded => {
+                    *pending = None;
+                    self.restore_current_or_invalidate(db).await?;
+                    return Err(CatmosError::AuthSessionChanged);
+                }
+                PersistOutcome::Failed => {}
+            }
+        }
+        Ok(false)
+    }
+
+    async fn store_rotated(&self, db: &Database, expected: &SessionSnapshot) -> PersistOutcome {
+        #[cfg(test)]
+        if self
+            .persist_faults
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return PersistOutcome::Failed;
+        }
+        let atp = self.credentials.read().await;
+        let saved = db
+            .compare_and_store_session_values(
+                expected,
+                &[
+                    ("auth_method", "app_password"),
+                    ("handle", atp.handle.as_str()),
+                    ("did", self.did.as_str()),
+                    ("access_jwt", atp.access_jwt.as_str()),
+                    ("refresh_jwt", atp.refresh_jwt.as_str()),
+                    ("pds_url", &self.pds_url),
+                ],
+            )
+            .await;
+        match saved {
+            Ok(true) => PersistOutcome::Stored,
+            Ok(false) => PersistOutcome::Superseded,
+            Err(_) => PersistOutcome::Failed,
+        }
     }
 
     fn require_valid_session(&self) -> Result<()> {
@@ -273,54 +374,60 @@ impl TokenSession {
         result
     }
 
-    async fn adopt_durable_snapshot(&self, snapshot: &std::collections::HashMap<String, String>) -> Result<()> {
-        let value = |key: &str| snapshot.get(key).filter(|value| !value.is_empty()).map(String::as_str);
-        if value("auth_method") != Some("app_password") || value("did") != Some(self.did.as_str())
+    async fn adopt_durable_snapshot(
+        &self,
+        snapshot: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let value = |key: &str| {
+            snapshot
+                .get(key)
+                .filter(|value| !value.is_empty())
+                .map(String::as_str)
+        };
+        if value("auth_method") != Some("app_password")
+            || value("did") != Some(self.did.as_str())
             || value("pds_url") != Some(self.pds_url.as_str())
         {
             return Err(CatmosError::AuthSessionChanged);
         }
-        let access = value("access_jwt").ok_or_else(|| CatmosError::AuthRenewal(AuthRenewalFailure::InvalidSnapshot))?;
-        let refresh = value("refresh_jwt").ok_or_else(|| CatmosError::AuthRenewal(AuthRenewalFailure::InvalidSnapshot))?;
-        let handle = value("handle").ok_or_else(|| CatmosError::AuthRenewal(AuthRenewalFailure::InvalidSnapshot))?;
-        let handle = Handle::new_owned(handle).map_err(|_| CatmosError::AuthRenewal(AuthRenewalFailure::InvalidSnapshot))?;
-        let pds = Uri::parse(self.pds_url.clone()).map_err(|_| CatmosError::AuthRenewal(AuthRenewalFailure::InvalidSnapshot))?;
-        self.store.set(SessionKey::new(self.did.clone(), SESSION_ID), AtpSession {
-            access_jwt: SmolStr::from(access), refresh_jwt: SmolStr::from(refresh),
-            did: self.did.clone(), handle, pds: Some(pds),
-        }).await.map_err(|_| CatmosError::AuthRenewal(AuthRenewalFailure::InvalidSnapshot))?;
+        let access = value("access_jwt")
+            .ok_or_else(|| CatmosError::AuthRenewal(AuthRenewalFailure::InvalidSnapshot))?;
+        let refresh = value("refresh_jwt")
+            .ok_or_else(|| CatmosError::AuthRenewal(AuthRenewalFailure::InvalidSnapshot))?;
+        let handle = value("handle")
+            .ok_or_else(|| CatmosError::AuthRenewal(AuthRenewalFailure::InvalidSnapshot))?;
+        let handle = Handle::parse(handle).map_err(|_| AuthRenewalFailure::InvalidSnapshot)?;
+        *self.credentials.write().await = create_session::Output::new(
+            access.to_owned(),
+            refresh.to_owned(),
+            handle,
+            self.did.clone(),
+        );
         Ok(())
     }
 
     /// Write the session's current access/refresh JWTs into the DB session table.
     pub async fn persist(&self, db: &Database) -> Result<()> {
-        let _guard = self.refresh_persist_lock.lock().await;
+        let mut pending = self.refresh_persist_lock.lock().await;
         self.require_valid_session()?;
-        self.persist_unlocked(db).await
+        self.persist_unlocked(db).await?;
+        *pending = None;
+        Ok(())
     }
 
     async fn persist_unlocked(&self, db: &Database) -> Result<()> {
-        let key = SessionKey::new(self.did.clone(), SESSION_ID);
-        let atp = self
-            .store
-            .get(&key)
-            .await
-            .ok_or_else(|| CatmosError::AuthFailed("session missing from store".into()))?;
+        let atp = self.credentials.read().await;
 
         db.store_session_values(&[
-            ("auth_method", "app_password"), ("handle", atp.handle.as_str()),
-            ("did", self.did.as_str()), ("access_jwt", atp.access_jwt.as_str()),
-            ("refresh_jwt", atp.refresh_jwt.as_str()), ("pds_url", &self.pds_url),
-        ]).await?;
+            ("auth_method", "app_password"),
+            ("handle", atp.handle.as_str()),
+            ("did", self.did.as_str()),
+            ("access_jwt", atp.access_jwt.as_str()),
+            ("refresh_jwt", atp.refresh_jwt.as_str()),
+            ("pds_url", &self.pds_url),
+        ])
+        .await?;
         Ok(())
-    }
-}
-
-fn bearer_string(token: AuthorizationToken) -> String {
-    match token {
-        AuthorizationToken::Bearer(s) => s.to_string(),
-        AuthorizationToken::Dpop(s) => s.to_string(),
-        AuthorizationToken::Delegation(s) => s.to_string(),
     }
 }
 
@@ -333,6 +440,57 @@ mod tests {
 
     const DID: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     const HANDLE: &str = "actor.catbird.blue";
+
+    struct LocalIdentity(Url);
+
+    impl OAuthIdentityResolver for LocalIdentity {
+        fn resolve_identity<'a>(
+            &'a self,
+            _: &'a petrel_core::AtIdentifier,
+            _: bool,
+        ) -> petrel::rt::BoxFuture<
+            'a,
+            std::result::Result<petrel::oauth::OAuthIdentity, petrel::oauth::OAuthIdentityError>,
+        > {
+            Box::pin(async move {
+                Ok(petrel::oauth::OAuthIdentity {
+                    did: "did:plc:z72i7hdynmk6r22z27h6tvur".parse().unwrap(),
+                    handle: Some("alice.test".parse().unwrap()),
+                    pds: self.0.clone(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn app_password_login_uses_resolved_pds_and_petrel_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pds = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/xrpc/com.atproto.server.createSession",
+            post(|Json(input): Json<serde_json::Value>| async move {
+                assert_eq!(input["identifier"], "alice.test");
+                assert_eq!(input["password"], "fixture-only");
+                Json(
+                    serde_json::json!({"did": "did:plc:z72i7hdynmk6r22z27h6tvur",
+                    "handle": "alice.test", "accessJwt": "from-pds", "refreshJwt": "refresh"}),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (transport, _) = TokenSession::network().unwrap();
+        let session = TokenSession::login_with_network(
+            "alice.test",
+            "fixture-only",
+            transport,
+            Arc::new(LocalIdentity(pds.parse().unwrap())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.pds_url(), pds);
+        assert_eq!(session.current_bearer().await.unwrap(), "from-pds");
+        server.abort();
+    }
 
     #[tokio::test]
     async fn cancelled_refresh_after_mint_invalidates_clones_and_preserves_durable_pair() {
@@ -363,11 +521,11 @@ mod tests {
         release.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                let atp = sibling.store.get(&SessionKey::new(sibling.did.clone(), SESSION_ID)).await.unwrap();
+                let atp = sibling.credentials.read().await;
                 if atp.access_jwt.as_str() == "unpersisted-access" { break; }
                 tokio::task::yield_now().await;
             }
-        }).await.expect("SDK never installed the refreshed in-memory token");
+        }).await.expect("session never installed the refreshed in-memory token");
         pending.abort();
         assert!(pending.await.unwrap_err().is_cancelled());
         writer.rollback().await.unwrap();
@@ -534,7 +692,7 @@ mod tests {
         });
         for _ in 0..60 {
             let restored = crate::auth::app_password::AppPasswordAuth::load(&db).await.unwrap().unwrap();
-            let atp = restored.session.store.get(&SessionKey::new(restored.session.did.clone(), SESSION_ID)).await.unwrap();
+            let atp = restored.session.credentials.read().await;
             assert_eq!(atp.access_jwt.strip_prefix("access-"), atp.refresh_jwt.strip_prefix("refresh-"));
         }
         writer.await.unwrap();

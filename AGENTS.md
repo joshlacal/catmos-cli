@@ -19,9 +19,9 @@ A Cargo workspace (`resolver = "2"`) with three members:
 | `catmos-tui` | `catmos-tui/` | lib | `ratatui` + `crossterm` terminal UI: app/event loop, keybinds, sidebar/messages/members/input/status-bar/avatar widgets. Entered via `catmos_tui::run()`. |
 
 Path deps to sibling repos (declared in workspace `Cargo.toml`):
-- `catbird-mls = { path = "../catbird-mls", package = "catbird_mls" }`
-- `catbird-atproto = { path = "../catbird-atproto", features = ["streaming"] }`
-- `jacquard` / `jacquard-common` / `jacquard-identity` `0.9` (ATProto codegen + identity)
+- `catbird-mls = { path = "../catbird-mls", package = "catbird_mls", features = ["legacy-orchestrator"] }`
+- `../Petrel/rust` provides the SDK, identity and core AT Protocol Lexicons.
+- `../PetrelCatbird/rust/petrel-catbird` provides the generated Catbird routes and subscription events.
 
 `catmos-core` module roots: `auth/`, `chat/`, `mls/`, `recovery/`, `storage/`, `types`, `error`.
 
@@ -71,7 +71,7 @@ catmos (bin: clap dispatch, tracing)
   ├─ catmos-tui  (ratatui TUI: catmos_tui::run())
   └─ catmos-core (ChatService, MlsManager, auth, storage)
         └─ catbird-mls  (OpenMLS orchestrator — used DIRECTLY, no FFI)
-        └─ catbird-atproto / jacquard  (ATProto types + identity)
+        └─ Petrel / PetrelCatbird  (ATProto types + identity)
               ↓ XRPC
         nest (OAuth BFF)  +  mls-ds (chat.catbird.blue)
 ```
@@ -94,7 +94,7 @@ Default endpoints (`storage/config.rs`, overridable via `config.toml`):
 ## Relationship to catbird-mls
 
 - This is the only client that uses `mls-orchestrator` as a **native Rust path dependency** — no UniFFI (iOS), no WASM (web), no Tauri command bridge (desktop). Calls go straight into `catbird_mls`.
-- Because of the path dep, **edits to `../catbird-atproto` or `../catbird-mls` immediately affect this build.** In particular, adding/removing/renaming a field on a generated Jacquard struct breaks the `Foo { .. }` literal sites in `catmos-core` (see `project_jacquard_struct_evolution_break.md` in session memory). When a sibling regen lands, reconcile `catmos-core/src/chat/service.rs` (and any other consumer) before assuming a build failure here is local.
+- Changes to the shared MLS API and generated Petrel types affect the CLI. Check the pinned sibling revisions with `scripts/check-canonical-sibling-provenance.sh`.
 - OpenMLS crypto / recovery policy / sync logic live in `catbird-mls`; this workspace owns CLI/TUI UX, storage coordination, auth, and config.
 
 ## Storage & Logs
@@ -115,7 +115,6 @@ On **macOS**, `dirs::config_dir()` and `dirs::data_dir()` both resolve to `~/Lib
 
 ## Known Issues / Gotchas
 
-- **Workspace may fail to compile against a freshly-regenerated `catbird-atproto`.** Jacquard struct-evolution drift surfaces as literal-init errors in `catmos-core/src/chat/service.rs` (e.g. `CreateConvo`/`BootstrapResetGroup` gaining or losing fields like `metadata` / `metadata_blob_locator` / `metadata_version`). This is **not** a CMake/env problem — the CMake export still works (the `audiopus_sys` C build succeeds); it just gets you *to* these Rust errors, not past them. Reconcile the literal initializers with the current generated structs in `../catbird-atproto`.
 - **MLS group-joining blocker (Apr 2026, runtime-unverified).** Session memory `project_catmos_cli_status.md` records a "cannot join group" history. The join path is in `catmos-core/src/mls/onboarding.rs` (base64 Welcome processing + external-commit join + auto-join on device registration). Do **not** assert it's fixed or still broken without running it; pull that memory rather than re-diagnosing from scratch.
 - **`catmos` vs top-level `catmos/`** — don't confuse the bin crate (`catmos-cli/catmos/`) with the desktop Tauri app (`../catmos/`).
 - **No `Cargo.lock` / no `.env` committed** (`.gitignore` excludes `Cargo.lock`); config is `config.toml`, not env vars (except `RUST_LOG` and the CMake var).
@@ -126,5 +125,5 @@ On **macOS**, `dirs::config_dir()` and `dirs::data_dir()` both resolve to `~/Lib
 
 - Standard Rust: run `cargo fmt` + `cargo clippy --all-targets` before committing.
 - Commit prefix convention (workspace-wide): scoped imperative, e.g. `catmos-cli: Fix convo create after CreateConvo regen`.
-- Don't hand-edit generated ATProto types — fix the lexicon/Jacquard source in `catbird-atproto` and regenerate, then reconcile consumers here.
+- Don't hand-edit generated ATProto types — fix the canonical Petrel or PetrelCatbird lexicon source and regenerate, then reconcile consumers here.
 - This is a jj-colocated git repo (`cd catmos-cli` before any VCS op); prefer `jj` for routine work, `git` for hooks/signing.
